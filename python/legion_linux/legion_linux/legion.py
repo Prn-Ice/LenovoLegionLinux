@@ -779,7 +779,10 @@ class FanCurveIO(Feature):
     @staticmethod
     def _read_file(file_path):
         with open(file_path, "r", encoding=DEFAULT_ENCODING) as filepointer:
-            return int(filepointer.read())
+            content = filepointer.read().strip()
+            if not content:
+                return 0
+            return int(content)
 
     @staticmethod
     def _read_file_or(file_path, default):
