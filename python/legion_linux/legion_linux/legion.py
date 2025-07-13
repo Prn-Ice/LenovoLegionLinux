@@ -778,11 +778,13 @@ class FanCurveIO(Feature):
 
     @staticmethod
     def _read_file(file_path):
-        with open(file_path, "r", encoding=DEFAULT_ENCODING) as filepointer:
-            content = filepointer.read()
-            if not content:
-                return 0
-            return int(content)
+        try:
+            with open(file_path, "r", encoding=DEFAULT_ENCODING) as filepointer:
+                return int(filepointer.read())
+        except IOError as err:
+            # log.error('Feature %s reading error %s', self.name(), str(err))
+            log.error('Error reading file %s: %s', file_path, err)
+            return 0
 
     @staticmethod
     def _read_file_or(file_path, default):
