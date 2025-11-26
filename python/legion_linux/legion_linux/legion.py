@@ -1511,7 +1511,12 @@ class LegionModelFacade:
             return img_width, img_height, img_format
 
     def get_boot_logo_status(self):
-        data = self._read_file(LBLDESP_FILE)
+        try:
+            data = self._read_file(LBLDESP_FILE)
+        except (IOError, OSError) as e:
+            log.warning(f"Could not read LBLDESP_FILE ({LBLDESP_FILE}): {e}")
+            return False, 0, 0
+
         if len(data) < 13:
             log.warning("LBLDESP data is unexpectedly short.")
             return False, 0, 0

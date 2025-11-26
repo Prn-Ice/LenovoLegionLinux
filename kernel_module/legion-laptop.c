@@ -1381,6 +1381,15 @@ static const struct dmi_system_id optimistic_allowlist[] = {
 		},
 		.driver_data = (void *)&model_nzcn
 	},
+	{
+		// e.g. Legion Pro 5 16IRX9 (83DF)
+		.ident = "N0CN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_BIOS_VERSION, "N0CN"),
+		},
+		.driver_data = (void *)&model_g8cn
+	},
 	{}
 };
 
