@@ -14,18 +14,30 @@ POWER_STATE get_powerstate()
 	fp = fopen(ac_path, "r");
 	if (fp == NULL)
 		fp = fopen(ac_path_alt, "r");
+	
+	if (fp == NULL) {
+		printf("failed to open AC power status file\n");
+		return P_ERROR_AC;
+	}
 
 	int ac_state;
 	if (fscanf(fp, "%d", &ac_state) != 1) {
 		printf("failed to get AC status\n");
+		fclose(fp);
 		return P_ERROR_AC;
 	}
 	fclose(fp);
 
 	fp = fopen(profile_path, "r");
+	if (fp == NULL) {
+		printf("failed to open power profile file\n");
+		return P_ERROR_PROFILE;
+	}
+	
 	char profile[30];
 	if (fscanf(fp, "%s", profile) != 1) {
 		printf("failed to get power_profile\n");
+		fclose(fp);
 		return P_ERROR_PROFILE;
 	}
 	fclose(fp);
