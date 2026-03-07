@@ -627,6 +627,11 @@ class IOPortLight(BoolFileFeature):
         super().__init__("/sys/class/leds/platform::ioport/brightness")
 
 
+class WhiteKeyboardBacklightFeature(BoolFileFeature):
+    def __init__(self):
+        super().__init__("/sys/class/leds/platform::kbd_backlight/brightness")
+
+
 class NVIDIAGPUIsRunning(BoolFileFeature):
     def __init__(self):
         super().__init__('/sys/bus/pci/devices/0000:01:00.0/power/runtime_status')
@@ -1444,6 +1449,7 @@ class LegionModelFacade:
         # light
         self.ylogo_light = YLogoLight()
         self.ioport_light = IOPortLight()
+        self.white_keyboard_backlight = WhiteKeyboardBacklightFeature()
 
         # services
         self.power_profiles_deamon_service = PowerProfilesDeamonService()
