@@ -6,6 +6,7 @@ import argparse
 import logging
 import sys
 import os
+import subprocess
 # Make it possible to run without installationimport
 # pylint: disable=# pylint: disable=wrong-import-position
 sys.path.insert(0, os.path.dirname(__file__) + "/..")
@@ -441,6 +442,13 @@ def create_argparser()->argparse.ArgumentParser:
     status_parser = bootlogo_sub.add_parser('status', help='View status')
     status_parser.set_defaults(func=lambda legion, **kw: boot_logo_status(legion, **kw))
 
+    dgpu_parser = subcommands.add_parser('dgpu', help='Discrete GPU management')
+    dgpu_sub = dgpu_parser.add_subparsers(dest='dgpu_cmd')
+    dgpu_kill_parser = dgpu_sub.add_parser('kill-processes', help='Kill compute processes using the GPU')
+    dgpu_kill_parser.set_defaults(func=lambda legion, **kw: dgpu_kill_processes(**kw))
+    dgpu_restart_parser = dgpu_sub.add_parser('restart-pci', help='Remove and rescan GPU PCI device')
+    dgpu_restart_parser.set_defaults(func=lambda legion, **kw: dgpu_restart_pci(**kw))
+
     return parser, subcommands
 
 def boot_logo_enable(legion: LegionModelFacade, image_path: str, **kwargs) -> int:
@@ -465,6 +473,76 @@ def boot_logo_status(legion: LegionModelFacade, **kwargs) -> int:
     is_on, w, h = legion.get_boot_logo_status()
     print(f"Current Boot Logo status: {'ON' if is_on else 'OFF'}; Required image dimensions: {w} x {h}")
     return 0
+
+
+def _find_nvidia_pci_address():
+    """Return the PCI address string of the NVIDIA discrete GPU, or None."""
+    import glob
+    for vendor_path in glob.glob('/sys/bus/pci/devices/*/vendor'):
+        try:
+            with open(vendor_path) as f:
+                if f.read().strip() != '0x10de':
+                    continue
+            class_path = vendor_path.replace('vendor', 'class')
+            with open(class_path) as f:
+                device_class = int(f.read().strip(), 16)
+            if (device_class >> 16) == 0x03:  # Display controller
+                return vendor_path.split('/')[-2]
+        except (IOError, ValueError):
+            continue
+    return None
+
+
+def dgpu_kill_processes(**kwargs) -> int:
+    """Kill all compute processes using the NVIDIA GPU (requires root)."""
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            print(f"nvidia-smi failed: {result.stderr.strip()}")
+            return 1
+        pids = [line.strip() for line in result.stdout.strip().splitlines() if line.strip().isdigit()]
+        if not pids:
+            print("No compute processes found on GPU.")
+            return 0
+        import signal
+        for pid_str in pids:
+            try:
+                os.kill(int(pid_str), signal.SIGKILL)
+                print(f"Killed PID {pid_str}")
+            except (ProcessLookupError, PermissionError) as e:
+                print(f"Could not kill PID {pid_str}: {e}")
+        return 0
+    except FileNotFoundError:
+        print("nvidia-smi not found. Is the NVIDIA driver installed?")
+        return 1
+    except Exception as e:
+        print(f"Error killing GPU processes: {e}")
+        return 1
+
+
+def dgpu_restart_pci(**kwargs) -> int:
+    """Remove the NVIDIA GPU from the PCI tree and rescan to reinitialise it (requires root)."""
+    addr = _find_nvidia_pci_address()
+    if not addr:
+        print("Could not find NVIDIA GPU PCI address.")
+        return 1
+    try:
+        remove_path = f"/sys/bus/pci/devices/{addr}/remove"
+        with open(remove_path, 'w') as f:
+            f.write('1')
+        print(f"Removed PCI device {addr}")
+        rescan_path = "/sys/bus/pci/rescan"
+        with open(rescan_path, 'w') as f:
+            f.write('1')
+        print("PCI bus rescanned — device should reappear.")
+        return 0
+    except (IOError, PermissionError) as e:
+        print(f"PCI operation failed: {e}")
+        return 1
+
 
 def main():
     parser, subcommands = create_argparser()
