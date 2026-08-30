@@ -1,5 +1,5 @@
 SHELL := /bin/bash
-KERNELVERSION  ?= $(shell uname --kernel-release)
+KERNELVERSION  ?= $(shell uname -r)
 KSRC := /lib/modules/$(KERNELVERSION)/build
 
 #install dir for kernel drivers
@@ -22,15 +22,15 @@ clean:
 	make -C $(KSRC) M=$(shell pwd) clean
 
 install: all
-	@rm --force --verbose $(INSTALLDIR)/legion-laptop.ko
-	@mkdir --parent --verbose $(MODDESTDIR)
-	@install --preserve-timestamps -D --mode=644 *.ko $(INSTALLDIR)
-	@depmod --all $(KVER)
+	@rm -fv $(INSTALLDIR)/legion-laptop.ko
+	@mkdir -pv $(MODDESTDIR)
+	@install -p -D -m 644 *.ko $(INSTALLDIR)
+	@depmod -a $(KVER)
 	@printf "%s\n" "Installion finished."
 
 uninstall:
 	@rm -f $(INSTALLDIR)/legion-laptop.ko
-	@depmod --all
+	@depmod -a
 	@printf "%s\n" "Uninstall finished."
 
 install_forcereload:
@@ -38,48 +38,59 @@ install_forcereload:
 	make forcereloadmodule
 	bash -c "./issue-warning.sh"
 
+# insmod does not resolve module dependencies (wmi, platform_profile,
+# led-class, ... vary per kernel) - load them explicitly before inserting.
+define load_deps
+	@for m in $$(modinfo -F depends legion-laptop.ko 2>/dev/null | tr ',' ' '); do modprobe $$m 2>/dev/null || true; done
+endef
+
 reloadmodule:
-	rmmod legion-laptop.ko || true
-	insmod legion-laptop.ko
-	dmesg --ctime
+	rmmod legion_laptop 2>/dev/null || true
+	$(load_deps)
+	insmod legion-laptop.ko || { dmesg | tail -15; exit 1; }
+	@dmesg | grep -i legion | tail -5 || true
 	bash -c "./issue-warning.sh"
 
 forcereloadmodule:
-	rmmod legion-laptop.ko || true
-	insmod legion-laptop.ko force=1
-	dmesg --ctime
+	rmmod legion_laptop 2>/dev/null || true
+	$(load_deps)
+	insmod legion-laptop.ko force=1 || { dmesg | tail -15; exit 1; }
+	@dmesg | grep -i legion | tail -5 || true
 	bash -c "./issue-warning.sh"
 
 forcereloadmodulereadonly:
-	rmmod legion-laptop.ko || true
-	insmod legion-laptop.ko force=1 ec_readonly=1
-	dmesg --ctime
+	rmmod legion_laptop 2>/dev/null || true
+	$(load_deps)
+	insmod legion-laptop.ko force=1 ec_readonly=1 || { dmesg | tail -15; exit 1; }
+	@dmesg | grep -i legion | tail -5 || true
 	bash -c "./issue-warning.sh"
 
 reloadmodule_disableplatformprofile:
-	rmmod legion-laptop.ko || true
-	insmod legion-laptop.ko enable_platformprofile=0
-	dmesg --ctime
+	rmmod legion_laptop 2>/dev/null || true
+	$(load_deps)
+	insmod legion-laptop.ko enable_platformprofile=0 || { dmesg | tail -15; exit 1; }
+	@dmesg | grep -i legion | tail -5 || true
 	bash -c "./issue-warning.sh"
 
 forcereloadmodule_disableplatformprofile:
-	rmmod legion-laptop.ko || true
-	insmod legion-laptop.ko force=1 enable_platformprofile=0
-	dmesg --ctime
+	rmmod legion_laptop 2>/dev/null || true
+	$(load_deps)
+	insmod legion-laptop.ko force=1 enable_platformprofile=0 || { dmesg | tail -15; exit 1; }
+	@dmesg | grep -i legion | tail -5 || true
 	bash -c "./issue-warning.sh"
 
 dkms: all
 	if [ -d $(DKMSDIR) ]; then\
-    	rm --recursive $(DKMSDIR)/*;\
-        cp --recursive * $(DKMSDIR)/;\
+    	rm -r $(DKMSDIR)/*;\
+        cp -r * $(DKMSDIR)/;\
 	else \
-		mkdir --verbose $(DKMSDIR);\
-        cp --recursive * $(DKMSDIR);\
+		mkdir -v $(DKMSDIR);\
+        cp -r * $(DKMSDIR);\
 		dkms add -m LenovoLegionLinux -v 1.0.0;\
 	fi
 	dkms build LenovoLegionLinux --force -v 1.0.0
 	dkms install LenovoLegionLinux --force -v 1.0.0
 	printf "%s\n" "Loading module"
 	modprobe legion_laptop
-	dmesg --ctime | grep legion_laptop
+	dmesg | grep legion_laptop
 	bash -c "./issue-warning.sh"
