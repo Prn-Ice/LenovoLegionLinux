@@ -39,7 +39,9 @@ def get_dmesg(only_tail=False, filter_log=True):
             cmd = "dmesg | grep legion | tail -n 20" if only_tail else "dmesg | grep legion"
         else:
             cmd = "dmesg | tail -n 20" if only_tail else "dmesg"
-        with subprocess.Popen(["bash", "-c", cmd], stdout=subprocess.PIPE) as process:
+        with subprocess.Popen(
+            ["bash", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        ) as process:
             out, _ = process.communicate(timeout=1)
             out_str = out.decode(DEFAULT_ENCODING)
             return out_str
@@ -1639,7 +1641,8 @@ class LegionModelFacade:
     # pylint: disable=too-many-statements
     def __init__(self, expect_hwmon=True, use_legion_cli_to_write=False, config_dir=DEFAULT_CONFIG_DIR):
         Feature.default_use_legion_cli_to_write = use_legion_cli_to_write
-        log.info(get_dmesg())
+        if log.isEnabledFor(logging.INFO):
+            log.info(get_dmesg())
         self.fancurve_io = FanCurveIO(expect_hwmon=expect_hwmon)
         self.fancurve_repo = FanCurveRepository(preset_dir=config_dir)
         self.fan_curve = FanCurve(
