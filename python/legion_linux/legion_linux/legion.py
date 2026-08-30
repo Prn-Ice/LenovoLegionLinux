@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_ENCODING = "utf8"
 DEFAULT_CONFIG_DIR = "/etc/legion_linux"
-LEGION_SYS_BASEPATH = '/sys/module/legion_laptop/drivers/platform:legion/PNP0C09:00'
+LEGION_SYS_BASEPATH = '/sys/module/legion_laptop/drivers/platform:legion/*'
 IDEAPAD_SYS_BASEPATH = '/sys/bus/platform/drivers/ideapad_acpi/VPC2004:00'
 LBLDVC_FILE = "/sys/firmware/efi/efivars/LBLDVC-871455d1-5576-4fb8-9865-af0824463c9f"
 LBLDESP_FILE = "/sys/firmware/efi/efivars/LBLDESP-871455d0-5576-4fb8-9865-af0824463b9e"
@@ -482,6 +482,138 @@ class OverdriveFeature(BoolFileFeature):
 class GsyncFeature(BoolFileFeature):
     def __init__(self):
         super().__init__(os.path.join(LEGION_SYS_BASEPATH, 'gsync'))
+
+
+class IGPUModeFeature(IntFileFeature):
+    def __init__(self):
+        super().__init__(os.path.join(LEGION_SYS_BASEPATH, 'igpumode'), 0, 2)
+
+
+class GraphicsModeFeature(Feature):
+    HYBRID = 'hybrid'
+    HYBRID_IGPU_ONLY = 'hybrid-igpu-only'
+    HYBRID_AUTO = 'hybrid-auto'
+    DISCRETE = 'discrete'
+
+    def __init__(self, gsync: GsyncFeature):
+        super().__init__()
+        self.gsync = gsync
+        self.gsync_support = IntFileFeature(
+            os.path.join(LEGION_SYS_BASEPATH, 'issupportgsync'))
+        self.igpu_mode = IGPUModeFeature()
+        self.igpu_mode_support = IntFileFeature(
+            os.path.join(LEGION_SYS_BASEPATH, 'issupportigpumode'))
+
+    @staticmethod
+    def _is_supported(feature: IntFileFeature) -> bool:
+        try:
+            return feature.exists() and feature.get() > 0
+        except (IOError, ValueError):
+            return False
+
+    def _gsync_supported(self) -> bool:
+        return self.gsync.exists() and self._is_supported(self.gsync_support)
+
+    def _igpu_mode_supported(self) -> bool:
+        return self.igpu_mode.exists() and self._is_supported(
+            self.igpu_mode_support)
+
+    def exists(self):
+        return self._gsync_supported() or self._igpu_mode_supported()
+
+    def choices(self) -> List[str]:
+        choices = []
+        if self._gsync_supported() or self._igpu_mode_supported():
+            choices.append(self.HYBRID)
+        if self._igpu_mode_supported():
+            choices.extend([self.HYBRID_IGPU_ONLY, self.HYBRID_AUTO])
+        if self._gsync_supported():
+            choices.append(self.DISCRETE)
+        return choices
+
+    def get(self) -> str:
+        if not self.exists():
+            raise FileNotFoundError('Graphics mode is not supported')
+
+        if self._gsync_supported() and not self.gsync.get():
+            return self.DISCRETE
+
+        if not self._igpu_mode_supported():
+            return self.HYBRID
+
+        igpu_mode = self.igpu_mode.get()
+        modes = {
+            0: self.HYBRID,
+            1: self.HYBRID_IGPU_ONLY,
+            2: self.HYBRID_AUTO,
+        }
+        if igpu_mode not in modes:
+            raise ValueError(f'Firmware returned invalid iGPU mode {igpu_mode}')
+        return modes[igpu_mode]
+
+    def _apply_raw_state(self, gsync_enabled: Optional[bool],
+                         igpu_mode: Optional[int]):
+        # Restore Default before entering Discrete; enter Hybrid before applying
+        # either live dGPU-ejection policy.
+        if gsync_enabled is False:
+            if igpu_mode is not None and self.igpu_mode.get() != igpu_mode:
+                self.igpu_mode.set(igpu_mode)
+            if self.gsync.get():
+                self.gsync.set(False)
+            return
+
+        if gsync_enabled is True and not self.gsync.get():
+            self.gsync.set(True)
+        if igpu_mode is not None and self.igpu_mode.get() != igpu_mode:
+            self.igpu_mode.set(igpu_mode)
+
+    def _verify_raw_state(self, gsync_enabled: Optional[bool],
+                          igpu_mode: Optional[int]):
+        mismatches = []
+        if gsync_enabled is not None and self.gsync.get() != gsync_enabled:
+            mismatches.append('Hybrid/MUX state')
+        if igpu_mode is not None and self.igpu_mode.get() != igpu_mode:
+            mismatches.append('iGPU mode')
+        if mismatches:
+            raise IOError(f'Raw graphics mode mismatch: {", ".join(mismatches)}')
+
+    def set(self, mode: str):
+        choices = self.choices()
+        if mode not in choices:
+            raise ValueError(
+                f'Unsupported graphics mode {mode}; choices: {", ".join(choices)}')
+
+        gsync_supported = self._gsync_supported()
+        igpu_mode_supported = self._igpu_mode_supported()
+        previous_gsync = self.gsync.get() if gsync_supported else None
+        previous_igpu_mode = (
+            self.igpu_mode.get() if igpu_mode_supported else None)
+
+        requested_gsync = False if mode == self.DISCRETE else (
+            True if gsync_supported else None)
+        requested_igpu_mode = {
+            self.HYBRID: 0,
+            self.HYBRID_IGPU_ONLY: 1,
+            self.HYBRID_AUTO: 2,
+            self.DISCRETE: 0,
+        }[mode] if igpu_mode_supported else None
+
+        try:
+            self._apply_raw_state(requested_gsync, requested_igpu_mode)
+            self._verify_raw_state(requested_gsync, requested_igpu_mode)
+            current = self.get()
+            if current != mode:
+                raise IOError(
+                    f'Graphics mode readback mismatch: requested {mode}, got {current}')
+        except Exception as error:
+            try:
+                self._apply_raw_state(previous_gsync, previous_igpu_mode)
+                self._verify_raw_state(previous_gsync, previous_igpu_mode)
+            except Exception as rollback_error:
+                raise IOError(
+                    f'Graphics mode change failed ({error}); rollback also failed '
+                    f'({rollback_error})') from error
+            raise
 
 
 class AlwaysOnUSBChargingFeature(BoolFileFeature):
@@ -1425,6 +1557,7 @@ class LegionModelFacade:
         self.camera_power = CameraPowerFeature()
         self.overdrive = OverdriveFeature()
         self.gsync = GsyncFeature()
+        self.graphics_mode = GraphicsModeFeature(self.gsync)
         self.platform_profile = PlatformProfileFeature()
         self.on_power_supply = IsOnPowerSupplyFeature()
         self.always_on_usb_charging = AlwaysOnUSBChargingFeature()
