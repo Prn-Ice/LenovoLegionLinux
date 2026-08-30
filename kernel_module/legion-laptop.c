@@ -3403,7 +3403,7 @@ static int get_simple_wmi_attribute(struct legion_private *priv,
 	}
 	err = wmi_exec_noarg_int(guid, instance, method_id, &state);
 	if (err)
-		return -EINVAL;
+		return err;
 
 	// TODO: remove later
 	pr_debug("%swith raw value: %ld\n", __func__, state);
@@ -5262,8 +5262,10 @@ static int store_simple_wmi_attribute(struct device *dev,
 	err = kstrtouint(buf, 0, &state);
 	if (err)
 		return err;
+	mutex_lock(&priv->fancurve_mutex);
 	err = set_simple_wmi_attribute(priv, guid, instance, method_id, invert,
 				       scale, state);
+	mutex_unlock(&priv->fancurve_mutex);
 	if (err)
 		return err;
 	return count;
@@ -5537,22 +5539,90 @@ static ssize_t isacfitforoc_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(isacfitforoc);
 
+static int get_igpumode(struct legion_private *priv, unsigned long *mode)
+{
+	int err;
+
+	err = get_simple_wmi_attribute(priv, LEGION_WMI_GAMEZONE_GUID, 0,
+				       WMI_METHOD_ID_GETIGPUMODESTATUS, false, 1,
+				       mode);
+	if (!err && *mode > IGPUState_auto)
+		return -EIO;
+
+	return err;
+}
+
+static int igpumode_is_supported(struct legion_private *priv, bool *supported)
+{
+	unsigned long value;
+	int err;
+
+	err = get_simple_wmi_attribute(priv, LEGION_WMI_GAMEZONE_GUID, 0,
+				       WMI_METHOD_ID_ISSUPPORTIGPUMODE, false, 1,
+				       &value);
+	if (!err)
+		*supported = value != 0;
+
+	return err;
+}
+
 static ssize_t igpumode_show(struct device *dev, struct device_attribute *attr,
 			     char *buf)
 {
-	return show_simple_wmi_attribute(dev, attr, buf,
-					 LEGION_WMI_GAMEZONE_GUID, 0,
-					 WMI_METHOD_ID_GETIGPUMODESTATUS, false,
-					 1);
+	struct legion_private *priv = dev_get_drvdata(dev);
+	unsigned long mode;
+	int err;
+
+	mutex_lock(&priv->fancurve_mutex);
+	err = get_igpumode(priv, &mode);
+	mutex_unlock(&priv->fancurve_mutex);
+	if (err)
+		return err;
+
+	return sysfs_emit(buf, "%lu\n", mode);
 }
 
 static ssize_t igpumode_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-	return store_simple_wmi_attribute(dev, attr, buf, count,
-					  LEGION_WMI_GAMEZONE_GUID, 0,
-					  WMI_METHOD_ID_SETIGPUMODESTATUS,
-					  false, 1);
+	struct legion_private *priv = dev_get_drvdata(dev);
+	unsigned long current_mode;
+	unsigned int requested_mode;
+	bool supported;
+	int err;
+
+	err = kstrtouint(buf, 0, &requested_mode);
+	if (err)
+		return err;
+	if (requested_mode > IGPUState_auto)
+		return -EINVAL;
+
+	mutex_lock(&priv->fancurve_mutex);
+	err = igpumode_is_supported(priv, &supported);
+	if (err)
+		goto out;
+	if (!supported) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+
+	err = get_igpumode(priv, &current_mode);
+	if (err || current_mode == requested_mode)
+		goto out;
+
+	err = set_simple_wmi_attribute(priv, LEGION_WMI_GAMEZONE_GUID, 0,
+				       WMI_METHOD_ID_SETIGPUMODESTATUS, false, 1,
+				       requested_mode);
+	if (err)
+		goto out;
+
+	err = get_igpumode(priv, &current_mode);
+	if (!err && current_mode != requested_mode)
+		err = -EIO;
+
+out:
+	mutex_unlock(&priv->fancurve_mutex);
+	return err ? err : count;
 }
 
 static DEVICE_ATTR_RW(igpumode);
@@ -5561,10 +5631,28 @@ static ssize_t notify_dgpu_store(struct device *dev,
 				 struct device_attribute *attr, const char *buf,
 				 size_t count)
 {
-	return store_simple_wmi_attribute(dev, attr, buf, count,
-					  LEGION_WMI_GAMEZONE_GUID, 0,
-					  WMI_METHOD_ID_NOTIFYDGPUSTATUS, false,
-					  1);
+	struct legion_private *priv = dev_get_drvdata(dev);
+	unsigned int status;
+	bool supported;
+	int err;
+
+	err = kstrtouint(buf, 0, &status);
+	if (err)
+		return err;
+	if (status > 1)
+		return -EINVAL;
+
+	mutex_lock(&priv->fancurve_mutex);
+	err = igpumode_is_supported(priv, &supported);
+	if (!err && !supported)
+		err = -EOPNOTSUPP;
+	if (!err)
+		err = set_simple_wmi_attribute(priv, LEGION_WMI_GAMEZONE_GUID, 0,
+					       WMI_METHOD_ID_NOTIFYDGPUSTATUS,
+					       false, 1, status);
+	mutex_unlock(&priv->fancurve_mutex);
+
+	return err ? err : count;
 }
 
 static DEVICE_ATTR_WO(notify_dgpu);
@@ -6523,6 +6611,20 @@ static bool legion_wmi3_power_limit_supported(struct legion_private *priv,
 	return true;
 }
 
+static bool legion_gamezone_feature_supported(struct legion_private *priv,
+					      u32 support_method_id)
+{
+	unsigned long value;
+	int err;
+
+	mutex_lock(&priv->fancurve_mutex);
+	err = get_simple_wmi_attribute(priv, LEGION_WMI_GAMEZONE_GUID, 0,
+				       support_method_id, false, 1, &value);
+	mutex_unlock(&priv->fancurve_mutex);
+
+	return !err && value != 0;
+}
+
 static umode_t legion_sysfs_is_visible(struct kobject *kobj,
 				       struct attribute *attr, int idx)
 {
@@ -6534,6 +6636,17 @@ static umode_t legion_sysfs_is_visible(struct kobject *kobj,
 
 	if (attr == &dev_attr_rapidcharge.attr)
 		return legion_rapidcharge_is_supported(priv) ? attr->mode : 0;
+
+	if (attr == &dev_attr_gsync.attr &&
+	    !legion_gamezone_feature_supported(
+		    priv, WMI_METHOD_ID_ISSUPPORTGSYNC))
+		return 0;
+
+	if ((attr == &dev_attr_igpumode.attr ||
+	     attr == &dev_attr_notify_dgpu.attr) &&
+	    !legion_gamezone_feature_supported(
+		    priv, WMI_METHOD_ID_ISSUPPORTIGPUMODE))
+		return 0;
 
 	if (legion_power_limit_attribute(attr) &&
 	    (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3 ||

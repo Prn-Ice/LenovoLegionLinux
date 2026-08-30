@@ -378,7 +378,48 @@ def set_feature(legion: LegionModelFacade, name, values, **_) -> int:
     return -2
 
 
-def create_argparser() -> argparse.ArgumentParser:
+def graphics_mode_status(legion: LegionModelFacade, **_) -> int:
+    try:
+        if not legion.graphics_mode.exists():
+            print("Graphics mode is not supported.")
+            return 1
+        print(legion.graphics_mode.get())
+    except (IOError, ValueError) as error:
+        print(f"Failed to read graphics mode: {error}")
+        return 1
+    return 0
+
+
+def graphics_mode_choices(legion: LegionModelFacade, **_) -> int:
+    try:
+        choices = legion.graphics_mode.choices()
+    except (IOError, ValueError) as error:
+        print(f"Failed to read graphics mode choices: {error}")
+        return 1
+    if not choices:
+        print("Graphics mode is not supported.")
+        return 1
+    print("\n".join(choices))
+    return 0
+
+
+def graphics_mode_set(legion: LegionModelFacade, mode: str, **_) -> int:
+    try:
+        legion.graphics_mode.set(mode)
+    except (FileNotFoundError, IOError, ValueError) as error:
+        print(error)
+        return 1
+
+    if mode == legion.graphics_mode.DISCRETE:
+        print("Graphics mode set to discrete. Reboot is required.")
+    elif mode in (legion.graphics_mode.HYBRID_IGPU_ONLY, legion.graphics_mode.HYBRID_AUTO):
+        print(f"Graphics mode set to {mode}. Live dGPU availability may change.")
+    else:
+        print("Graphics mode set to hybrid. A MUX change may require reboot.")
+    return 0
+
+
+def create_argparser() -> argparse.ArgumentParser:  # pylint: disable=too-many-statements
     parser = argparse.ArgumentParser(description="Legion CLI")
     parser.add_argument(
         "--donotexpecthwmon", action="store_true", help="Do not check hwmon dir when not needed", default=False
@@ -453,6 +494,20 @@ def create_argparser() -> argparse.ArgumentParser:
     restore_parser.set_defaults(func=boot_logo_restore)
     status_parser = bootlogo_sub.add_parser("status", help="View status")
     status_parser.set_defaults(func=boot_logo_status)
+
+    graphics_mode_parser = subcommands.add_parser("graphics-mode", help="Read or set the combined GPU working mode")
+    graphics_mode_sub = graphics_mode_parser.add_subparsers(dest="graphics_mode_cmd", required=True)
+    graphics_mode_status_parser = graphics_mode_sub.add_parser(
+        "status", help="Print the authoritative current graphics mode"
+    )
+    graphics_mode_status_parser.set_defaults(func=graphics_mode_status)
+    graphics_mode_choices_parser = graphics_mode_sub.add_parser(
+        "choices", help="Print the graphics modes supported by firmware"
+    )
+    graphics_mode_choices_parser.set_defaults(func=graphics_mode_choices)
+    graphics_mode_set_parser = graphics_mode_sub.add_parser("set", help="Set a supported graphics mode")
+    graphics_mode_set_parser.add_argument("mode", choices=["hybrid", "hybrid-igpu-only", "hybrid-auto", "discrete"])
+    graphics_mode_set_parser.set_defaults(func=graphics_mode_set)
 
     return parser, subcommands
 
