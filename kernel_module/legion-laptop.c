@@ -2342,6 +2342,7 @@ static int wmi_exec_arg(const char *guid, u8 instance, u32 method_id, void *arg,
 			size_t arg_size)
 {
 	struct acpi_buffer params;
+	struct acpi_buffer out_buffer = { ACPI_ALLOCATE_BUFFER, NULL };
 	acpi_status status;
 
 	params.length = arg_size;
@@ -2349,7 +2350,9 @@ static int wmi_exec_arg(const char *guid, u8 instance, u32 method_id, void *arg,
 	if (!wmi_has_guid(guid))
 		return -ENODEV;
 
-	status = wmi_evaluate_method(guid, instance, method_id, &params, NULL);
+	status = wmi_evaluate_method(guid, instance, method_id, &params,
+				     &out_buffer);
+	kfree(out_buffer.pointer);
 
 	if (ACPI_FAILURE(status))
 		return -EIO;
