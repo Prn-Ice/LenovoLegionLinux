@@ -268,6 +268,12 @@ struct model_config {
 	bool wmi_fancurve_speed_only;
 	bool require_unlocked_fan_controller;
 	bool has_pl_coupling;
+	/* Firmware silently ignores SetFeatureValue power-limit writes outside
+	 * the custom thermal mode (M1CN gates on GZ44 == 3). Models with this
+	 * flag get an explicit driver-side check so stores fail with -EPERM
+	 * instead of pretending to succeed.
+	 */
+	bool power_writes_custom_only;
 	/* Lift the firmware-imposed fan ceiling via WMAA(0, 0x0D, arg) on the
 	 * GameZone WMI GUID. Only validated firmwares (e.g. KWCN54WW on the
 	 * Legion Pro 7 16IRX8H) set this; on models without the sub-command the
@@ -841,6 +847,15 @@ static const struct model_config model_m1cn = {
 	.access_method_temperature = ACCESS_METHOD_WMI3,
 	.access_method_fancurve = ACCESS_METHOD_WMI3,
 	.access_method_fanfullspeed = ACCESS_METHOD_WMI,
+	/* M1CN48WW: the legacy CPU/GPU WMI methods (WMAC/WMAD) are firmware
+	 * stubs that always return 0; power limits are only served by the
+	 * "other method" GetFeatureValue/SetFeatureValue (verified against the
+	 * DSDT and live DFAN reads: CPU 54/54/65 W, cross-load 45 W, GPU
+	 * cTGP 60 W, temperature limits 100/87 C). APU SPPT and CPU L1 tau
+	 * are unsupported (hard 0) and get hidden by visibility probing.
+	 */
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
+	.power_writes_custom_only = true,
 	.acpi_check_dev = false,
 	.ramio_physical_start = 0xFE0B0400,
 	.ramio_size = 0x600
@@ -3391,7 +3406,7 @@ static int get_simple_wmi_attribute(struct legion_private *priv,
 		return -EINVAL;
 
 	// TODO: remove later
-	pr_info("%swith raw value: %ld\n", __func__, state);
+	pr_debug("%swith raw value: %ld\n", __func__, state);
 
 	state = state * scale;
 
@@ -5623,6 +5638,17 @@ static ssize_t wmi_common_method_other_store(struct legion_private *priv,
 	if (err)
 		return err;
 
+	if (priv->conf->power_writes_custom_only) {
+		int powermode;
+
+		err = read_powermode(priv, &powermode);
+		if (err || powermode != LEGION_WMI_POWERMODE_CUSTOM) {
+			pr_info("Rejecting power-limit write: custom power mode required (current mode: %d, read err: %d)\n",
+				powermode, err);
+			return -EPERM;
+		}
+	}
+
 	mutex_lock(&priv->fancurve_mutex);
 	err = wmi_other_method_set_value(feature_id, value, &output);
 	mutex_unlock(&priv->fancurve_mutex);
@@ -6434,6 +6460,69 @@ static bool legion_attribute_uses_gpu_wmi(const struct attribute *attr)
 	       attr == &dev_attr_gpu_boost_clock.attr;
 }
 
+/* Power-limit attributes exposed through the "other method"
+ * GetFeatureValue/SetFeatureValue WMI interface. Returns 0 for attributes
+ * that only exist on the legacy CPU/GPU WMI methods.
+ */
+static int legion_wmi3_power_feature(const struct attribute *attr)
+{
+	if (attr == &dev_attr_cpu_shortterm_powerlimit.attr)
+		return OtherMethodFeature_CPU_SHORT_TERM_POWER_LIMIT;
+	if (attr == &dev_attr_cpu_longterm_powerlimit.attr)
+		return OtherMethodFeature_CPU_LONG_TERM_POWER_LIMIT;
+	if (attr == &dev_attr_cpu_peak_powerlimit.attr)
+		return OtherMethodFeature_CPU_PEAK_POWER_LIMIT;
+	if (attr == &dev_attr_cpu_temperature_limit.attr)
+		return OtherMethodFeature_CPU_TEMPERATURE_LIMIT;
+	if (attr == &dev_attr_cpu_apu_sppt_powerlimit.attr)
+		return OtherMethodFeature_APU_PPT_POWER_LIMIT;
+	if (attr == &dev_attr_cpu_cross_loading_powerlimit.attr)
+		return OtherMethodFeature_CPU_CROSS_LOAD_POWER_LIMIT;
+	if (attr == &dev_attr_cpu_l1_tau.attr)
+		return OtherMethodFeature_CPU_L1_TAU;
+	if (attr == &dev_attr_gpu_ppab_powerlimit.attr)
+		return OtherMethodFeature_GPU_POWER_BOOST;
+	if (attr == &dev_attr_gpu_ctgp_powerlimit.attr)
+		return OtherMethodFeature_GPU_cTGP;
+	if (attr == &dev_attr_gpu_temperature_limit.attr)
+		return OtherMethodFeature_GPU_TEMPERATURE_LIMIT;
+	if (attr == &dev_attr_gpu_power_target_offset.attr)
+		return OtherMethodFeature_GPU_POWER_TARGET_ON_AC_OFFSET_FROM_BASELINE;
+	return 0;
+}
+
+static bool legion_power_limit_attribute(const struct attribute *attr)
+{
+	return legion_wmi3_power_feature(attr) != 0 ||
+	       attr == &dev_attr_cpu_default_powerlimit.attr ||
+	       attr == &dev_attr_gpu_ctgp2_powerlimit.attr ||
+	       attr == &dev_attr_gpu_default_ppab_ctrgp_powerlimit.attr ||
+	       attr == &dev_attr_gpu_boost_clock.attr;
+}
+
+/* For models using the WMI3 power-limit access method, only advertise what
+ * the firmware actually serves: hide legacy-only attributes (their WMI
+ * methods may be unimplemented stubs returning 0) and hide GetFeatureValue
+ * features that fail or report 0 (e.g. M1CN48WW hard-zeros APU SPPT and
+ * CPU L1 tau). Zero is a legitimate value only for the AC power-target
+ * offset, which is therefore never probed.
+ */
+static bool legion_wmi3_power_limit_supported(struct legion_private *priv,
+					      const struct attribute *attr)
+{
+	int feature_id = legion_wmi3_power_feature(attr);
+	int value;
+
+	if (!feature_id)
+		return false;
+	if (feature_id ==
+	    OtherMethodFeature_GPU_POWER_TARGET_ON_AC_OFFSET_FROM_BASELINE)
+		return true;
+	if (wmi_other_method_get_value(feature_id, &value) || value == 0)
+		return false;
+	return true;
+}
+
 static umode_t legion_sysfs_is_visible(struct kobject *kobj,
 				       struct attribute *attr, int idx)
 {
@@ -6445,6 +6534,14 @@ static umode_t legion_sysfs_is_visible(struct kobject *kobj,
 
 	if (attr == &dev_attr_rapidcharge.attr)
 		return legion_rapidcharge_is_supported(priv) ? attr->mode : 0;
+
+	if (legion_power_limit_attribute(attr) &&
+	    (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3 ||
+	     priv->conf->access_method_powerlimits ==
+		     ACCESS_METHOD_WMI3_CLAMPED) &&
+	    !legion_wmi3_power_limit_supported(priv, attr))
+		return 0;
+
 	if (legion_attribute_uses_cpu_wmi(attr) &&
 	    !wmi_has_guid(WMI_GUID_LENOVO_CPU_METHOD))
 		return 0;
