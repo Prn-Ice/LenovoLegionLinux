@@ -6249,6 +6249,10 @@ static ssize_t gpu_temperature_limit_store(struct device *dev,
 		return wmi_clamped_store(priv, buf, count,
 					 OtherMethodFeature_GPU_TEMPERATURE_LIMIT);
 
+	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
+		return wmi_common_method_other_store(priv, buf, count,
+						     OtherMethodFeature_GPU_TEMPERATURE_LIMIT);
+
 	return store_simple_wmi_attribute(
 		dev, attr, buf, count, WMI_GUID_LENOVO_GPU_METHOD, 0,
 		WMI_METHOD_ID_GPU_SET_TEMPERATURE_LIMIT, false, 1);
