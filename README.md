@@ -1007,6 +1007,33 @@ cat /sys/devices/pci0000\:00/0000\:00\:01.1/power_state
 ```
 - Run `nvidia-smi`, which powers the GPU up for some time. Check the `power_state` again. It should go to `D0` and then go to `D3cold` after some time. Compared to `nvidia-smi`, running `cat /sys/devices/pci0000\:00/0000\:00\:01.1/power_state ` does not seem to wake up the GPU.
 
+Runtime D3 power management is different from firmware iGPU-only ejection. A
+small Xorg allocation can be acceptable for runtime D3, but **every** open
+NVIDIA or NVIDIA DRM device handle blocks safe PCI ejection, including handles
+from compositors, Xwayland, Electron applications, monitoring tools, games, and
+CUDA applications.
+
+On firmware that advertises iGPU mode support, use the combined graphics-mode
+transaction instead of writing `gsync`, `igpumode`, or `notify_dgpu` directly:
+
+```bash
+legion_cli --donotexpecthwmon graphics-mode status --json
+sudo legion_cli --donotexpecthwmon graphics-mode set hybrid-igpu-only
+sudo legion_cli --donotexpecthwmon graphics-mode reconcile
+```
+
+The selected firmware policy and effective PCI topology are separate. For
+example, `hybrid-igpu-only` can persist across reboot while the NVIDIA device is
+attached again. Structured status reports both states. Ejection-capable writes
+inspect open device handles before changing the selector and exit with status 2
+without writing when clients are active or inspection is incomplete.
+
+Reconciliation reports the dGPU's observed availability to firmware and waits
+for topology convergence. It never sends a caller-selected target to
+`notify_dgpu`, and there is no force bypass. A selected policy can remain
+pending if firmware does not converge; raw selector rollback is reserved for
+selector write or readback failures.
+
 
 ```bash
 sudo cat /proc/driver/nvidia/gpus/0000:01:00.0/power

@@ -1038,6 +1038,31 @@ cat /sys/devices/pci0000\:00/0000\:00\:01.1/power_state
 ```
 - 运行 `nvidia-smi`，GPU 会被唤醒一段时间。再次检查 `power_state`，应先变为 `D0`，稍等后会回到 `D3cold`。与 `nvidia-smi` 不同，`cat /sys/devices/pci0000\:00/0000\:00\:01.1/power_state` 不会唤醒 GPU。
 
+运行时 D3 电源管理与固件的 iGPU-only 弹出机制不同。少量 Xorg
+显存占用对于运行时 D3 可能是正常的，但安全弹出 PCI 设备前，必须关闭
+**所有** NVIDIA 或 NVIDIA DRM 设备句柄，包括合成器、Xwayland、Electron
+应用、监控工具、游戏和 CUDA 应用持有的句柄。
+
+在固件声明支持 iGPU 模式的机型上，请使用组合图形模式事务，不要直接
+写入 `gsync`、`igpumode` 或 `notify_dgpu`：
+
+```bash
+legion_cli --donotexpecthwmon graphics-mode status --json
+sudo legion_cli --donotexpecthwmon graphics-mode set hybrid-igpu-only
+sudo legion_cli --donotexpecthwmon graphics-mode reconcile
+```
+
+固件中选定的策略与实际 PCI 拓扑是两个独立状态。例如，
+`hybrid-igpu-only` 可在重启后继续保持选中，但 NVIDIA 设备可能已重新
+连接。结构化状态会同时报告两者。可能弹出 dGPU 的写入会先检查打开的
+设备句柄；若仍有客户端或无法完整检查，则不会写入选择器并以状态码 2
+退出。
+
+协调操作会把实际观察到的 dGPU 可用状态通知给固件，并等待拓扑收敛。
+它不会把调用者指定的目标值直接写入 `notify_dgpu`，也不提供强制绕过。
+若固件未收敛，已选策略可能保持待处理；只有选择器写入或回读失败时才
+回滚原始选择器。
+
 ```bash
 sudo cat /proc/driver/nvidia/gpus/0000:01:00.0/power
 ```

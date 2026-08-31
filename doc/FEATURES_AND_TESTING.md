@@ -187,13 +187,21 @@ sudo sh -c "echo '1' > /sys/devices/system/cpu/cpufreq/boost"
 #define WMI_METHOD_ID_GSYNCSTATUSGET 0x29 
 #define WMI_METHOD_ID_GSYNCSTATUSSET 0x2A
 
-#define WMI_METHOD_ID_IGPUMODESTATUSGET 0x0
-#define WMI_METHOD_ID_IGPUMODESTATUSSET 0x0
+#define WMI_METHOD_ID_ISSUPPORTIGPUMODE 63
+#define WMI_METHOD_ID_GETIGPUMODESTATUS 64
+#define WMI_METHOD_ID_SETIGPUMODESTATUS 65
+#define WMI_METHOD_ID_NOTIFYDGPUSTATUS 66
 enum IGPUState{
 	IGPUState_default=0,
 	IGPUState_iGPUOnly=1,
 	IGPUState_auto=2
 };
+
+// GETIGPUMODESTATUS is the selected persistent policy, not effective PCI
+// topology. NOTIFYDGPUSTATUS accepts observed availability: 1 when the dGPU is
+// enumerated, 0 when absent. It is not a requested target. Userspace must check
+// every NVIDIA and associated DRM device handle before ejection, then verify
+// topology after firmware settles.
 
 // overdrive
 // ODStatusGet, ODStatusSet

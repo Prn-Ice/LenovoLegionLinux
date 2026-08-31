@@ -6,6 +6,7 @@ import argparse
 import logging
 import sys
 import os
+import json
 
 # Make it possible to run without installationimport
 # pylint: disable=# pylint: disable=wrong-import-position
@@ -306,12 +307,12 @@ class HybridMode(CLIFeatureCommand):
 
     def command_enable(self, **_) -> int:
         print("Changes will only apply after a reboot.")
-        self.model.gsync.set(True)
+        self.model.graphics_mode.set(self.model.graphics_mode.HYBRID)
         return 0
 
     def command_disable(self, **_) -> int:
         print("Changes will only apply after a reboot.")
-        self.model.gsync.set(False)
+        self.model.graphics_mode.set(self.model.graphics_mode.DISCRETE)
         return 0
 
 
@@ -378,12 +379,15 @@ def set_feature(legion: LegionModelFacade, name, values, **_) -> int:
     return -2
 
 
-def graphics_mode_status(legion: LegionModelFacade, **_) -> int:
+def graphics_mode_status(legion: LegionModelFacade, json_output=False, **_) -> int:
     try:
         if not legion.graphics_mode.exists():
             print("Graphics mode is not supported.")
             return 1
-        print(legion.graphics_mode.get())
+        if json_output:
+            print(json.dumps(legion.graphics_mode.status(), sort_keys=True))
+        else:
+            print(legion.graphics_mode.get())
     except (IOError, ValueError) as error:
         print(f"Failed to read graphics mode: {error}")
         return 1
@@ -403,20 +407,48 @@ def graphics_mode_choices(legion: LegionModelFacade, **_) -> int:
     return 0
 
 
-def graphics_mode_set(legion: LegionModelFacade, mode: str, **_) -> int:
+def graphics_mode_reconcile(legion: LegionModelFacade, json_output=False, **_) -> int:
     try:
-        legion.graphics_mode.set(mode)
+        result = legion.graphics_mode.reconcile()
+        if json_output:
+            print(json.dumps(result, sort_keys=True))
+        else:
+            print(result["reconciliation"])
+        if result["reconciliation"] == "settled":
+            return 0
+        if result["reconciliation"] == "blocked":
+            return 2
+        return 3
+    except (FileNotFoundError, IOError, ValueError) as error:
+        print(f"Failed to reconcile graphics mode: {error}")
+        return 1
+
+
+def graphics_mode_set(legion: LegionModelFacade, mode: str, json_output=False, **_) -> int:
+    try:
+        result = legion.graphics_mode.set(mode)
+    except legion_linux.legion.GraphicsModeBusyError as error:
+        print(error)
+        return 2
+    except legion_linux.legion.GraphicsModePowerStateError as error:
+        print(error)
+        return 2
+    except legion_linux.legion.GraphicsModeReconciliationError as error:
+        print(error)
+        return 3
     except (FileNotFoundError, IOError, ValueError) as error:
         print(error)
         return 1
 
-    if mode == legion.graphics_mode.DISCRETE:
+    if json_output:
+        print(json.dumps(result, sort_keys=True))
+    elif mode == legion.graphics_mode.DISCRETE:
         print("Graphics mode set to discrete. Reboot is required.")
     elif mode in (legion.graphics_mode.HYBRID_IGPU_ONLY, legion.graphics_mode.HYBRID_AUTO):
         print(f"Graphics mode set to {mode}. Live dGPU availability may change.")
     else:
         print("Graphics mode set to hybrid. A MUX change may require reboot.")
-    return 0
+    return 0 if result["reconciliation"] == "settled" else 3
 
 
 def create_argparser() -> argparse.ArgumentParser:  # pylint: disable=too-many-statements
@@ -498,15 +530,20 @@ def create_argparser() -> argparse.ArgumentParser:  # pylint: disable=too-many-s
     graphics_mode_parser = subcommands.add_parser("graphics-mode", help="Read or set the combined GPU working mode")
     graphics_mode_sub = graphics_mode_parser.add_subparsers(dest="graphics_mode_cmd", required=True)
     graphics_mode_status_parser = graphics_mode_sub.add_parser(
-        "status", help="Print the authoritative current graphics mode"
+        "status", help="Print the selected firmware graphics policy"
     )
+    graphics_mode_status_parser.add_argument("--json", dest="json_output", action="store_true")
     graphics_mode_status_parser.set_defaults(func=graphics_mode_status)
+    graphics_mode_reconcile_parser = graphics_mode_sub.add_parser("reconcile", help="Reconcile effective dGPU state")
+    graphics_mode_reconcile_parser.add_argument("--json", dest="json_output", action="store_true")
+    graphics_mode_reconcile_parser.set_defaults(func=graphics_mode_reconcile)
     graphics_mode_choices_parser = graphics_mode_sub.add_parser(
         "choices", help="Print the graphics modes supported by firmware"
     )
     graphics_mode_choices_parser.set_defaults(func=graphics_mode_choices)
     graphics_mode_set_parser = graphics_mode_sub.add_parser("set", help="Set a supported graphics mode")
     graphics_mode_set_parser.add_argument("mode", choices=["hybrid", "hybrid-igpu-only", "hybrid-auto", "discrete"])
+    graphics_mode_set_parser.add_argument("--json", dest="json_output", action="store_true")
     graphics_mode_set_parser.set_defaults(func=graphics_mode_set)
 
     return parser, subcommands

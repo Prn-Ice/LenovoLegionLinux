@@ -81,6 +81,10 @@ jobs:
         if: always()
         run: ./tests/test_python_cli.sh
         shell: bash
+      - name: Test python library
+        if: always()
+        run: ./tests/test_python_unit.sh
+        shell: bash
           #- name: Test python GUI
           #if: always()
           #run: ./tests/test_python_gui.sh

@@ -2429,6 +2429,7 @@ static int wmi_exec_arg(const char *guid, u8 instance, u32 method_id, void *arg,
 #define WMI_METHOD_ID_ISSUPPORTIGPUMODE 63
 #define WMI_METHOD_ID_GETIGPUMODESTATUS 64
 #define WMI_METHOD_ID_SETIGPUMODESTATUS 65
+// Notify observed dGPU availability: 1=enumerated, 0=absent.
 #define WMI_METHOD_ID_NOTIFYDGPUSTATUS 66
 enum IGPUState {
 	IGPUState_default = 0,
@@ -5635,14 +5636,14 @@ static ssize_t notify_dgpu_store(struct device *dev,
 				 size_t count)
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
-	unsigned int status;
+	unsigned int available;
 	bool supported;
 	int err;
 
-	err = kstrtouint(buf, 0, &status);
+	err = kstrtouint(buf, 0, &available);
 	if (err)
 		return err;
-	if (status > 1)
+	if (available > 1)
 		return -EINVAL;
 
 	mutex_lock(&priv->fancurve_mutex);
@@ -5652,7 +5653,7 @@ static ssize_t notify_dgpu_store(struct device *dev,
 	if (!err)
 		err = set_simple_wmi_attribute(priv, LEGION_WMI_GAMEZONE_GUID, 0,
 					       WMI_METHOD_ID_NOTIFYDGPUSTATUS,
-					       false, 1, status);
+					       false, 1, available);
 	mutex_unlock(&priv->fancurve_mutex);
 
 	return err ? err : count;

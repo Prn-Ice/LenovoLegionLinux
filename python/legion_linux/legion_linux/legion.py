@@ -1,6 +1,8 @@
 # pylint: disable=too-many-lines
 import os
 import glob
+import errno
+import stat
 from dataclasses import asdict, dataclass
 import shutil
 import time
@@ -39,9 +41,7 @@ def get_dmesg(only_tail=False, filter_log=True):
             cmd = "dmesg | grep legion | tail -n 20" if only_tail else "dmesg | grep legion"
         else:
             cmd = "dmesg | tail -n 20" if only_tail else "dmesg"
-        with subprocess.Popen(
-            ["bash", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        ) as process:
+        with subprocess.Popen(["bash", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
             out, _ = process.communicate(timeout=1)
             out_str = out.decode(DEFAULT_ENCODING)
             return out_str
@@ -526,18 +526,255 @@ class IGPUModeFeature(IntFileFeature):
         super().__init__(os.path.join(LEGION_SYS_BASEPATH, "igpumode"), 0, 2)
 
 
+class GraphicsModeBusyError(RuntimeError):
+    """Changing GPU policy is unsafe while clients, or inspection, are present."""
+
+    def __init__(self, clients=None, inspection_complete=True):
+        self.clients = clients or []
+        self.inspection_complete = inspection_complete
+        if self.clients:
+            holders = ", ".join(f"{client['comm']} (PID {client['pid']})" for client in self.clients)
+            message = f"Graphics mode change blocked by active dGPU clients: {holders}"
+        else:
+            message = "Graphics mode change blocked because dGPU client inspection is incomplete"
+        super().__init__(message)
+
+
+class GraphicsModeReconciliationError(RuntimeError):
+    """The selector was accepted but effective topology could not be reconciled."""
+
+
+class GraphicsModePowerStateError(RuntimeError):
+    """Auto mode cannot be changed safely when external power is unknown."""
+
+
+class GraphicsTopology:
+    """Small, injectable view of effective NVIDIA topology and dGPU users."""
+
+    def __init__(
+        self,
+        *,
+        pci_root="/sys/bus/pci/devices",
+        power_root="/sys/class/power_supply",
+        proc_root="/proc",
+        dev_root="/dev",
+        listdir=os.listdir,
+        stat_func=os.stat,
+        readlink=os.readlink,
+        glob_func=glob.glob,
+    ):
+        self.pci_root = pci_root
+        self.power_root = power_root
+        self.proc_root = proc_root
+        self.dev_root = dev_root
+        self.listdir = listdir
+        self.stat = stat_func
+        self.readlink = readlink
+        self.glob = glob_func
+
+    def _pci_functions(self):
+        functions = []
+        try:
+            entries = self.listdir(self.pci_root)
+        except (OSError, IOError):
+            return None
+        for entry in entries:
+            base = os.path.join(self.pci_root, entry)
+            try:
+                with open(os.path.join(base, "vendor"), encoding=DEFAULT_ENCODING) as f:
+                    vendor = f.read().strip().lower()
+                with open(os.path.join(base, "class"), encoding=DEFAULT_ENCODING) as f:
+                    device_class = f.read().strip().lower()
+                if vendor == "0x10de" and device_class.startswith("0x03"):
+                    functions.append((entry, base, os.path.exists(os.path.join(base, "driver"))))
+            except (OSError, IOError):
+                return None
+        return functions
+
+    def effective_state(self):
+        functions = self._pci_functions()
+        if functions is None:
+            return "unknown"
+        if not functions:
+            return "detached"
+        if any(not bound for _, _, bound in functions):
+            return "partial"
+        if any(bound for _, _, bound in functions):
+            return "attached"
+        return "partial"
+
+    def power_state(self):
+        """Return ac, battery, or unknown, using all available power supplies."""
+        try:
+            supplies = self.listdir(self.power_root)
+        except (OSError, IOError):
+            return "unknown"
+        values = []
+        external_types = {
+            "Mains",
+            "USB",
+            "USB_C",
+            "USB_CDP",
+            "USB_DCP",
+            "USB_PD",
+            "USB_PD_DRP",
+            "Wireless",
+        }
+        for supply in supplies:
+            try:
+                with open(os.path.join(self.power_root, supply, "type"), encoding=DEFAULT_ENCODING) as f:
+                    supply_type = f.read().strip()
+                if supply_type not in external_types:
+                    continue
+                with open(os.path.join(self.power_root, supply, "online"), encoding=DEFAULT_ENCODING) as f:
+                    values.append(f.read().strip())
+            except (OSError, IOError):
+                return "unknown"
+        if not values:
+            return "unknown"
+        if any(value == "1" for value in values):
+            return "ac"
+        if all(value == "0" for value in values):
+            return "battery"
+        return "unknown"
+
+    def expected_state(self, selected_mode):
+        if selected_mode in ("hybrid", "discrete"):
+            return "attached"
+        if selected_mode == "hybrid-igpu-only":
+            return "detached"
+        if selected_mode == "hybrid-auto":
+            power = self.power_state()
+            return {"ac": "attached", "battery": "detached"}.get(power, "unknown")
+        return "unknown"
+
+    def _device_paths(self, pci_functions):
+        complete = True
+        paths = self.glob(os.path.join(self.dev_root, "nvidia*"))
+        caps_root = os.path.join(self.dev_root, "nvidia-caps")
+        try:
+            paths.extend(os.path.join(caps_root, name) for name in self.listdir(caps_root))
+        except (OSError, IOError):
+            if os.path.exists(caps_root):
+                complete = False
+
+        # Only DRM nodes belonging to an NVIDIA PCI function count. Do not
+        # infer ownership from a card number or from the presence of /dev/dri.
+        for _, pci_path, _ in pci_functions:
+            drm_path = os.path.join(pci_path, "drm")
+            try:
+                drm_names = self.listdir(drm_path)
+            except (OSError, IOError):
+                complete = False
+                continue
+            for name in drm_names:
+                paths.append(os.path.join(self.dev_root, "dri", name))
+        return paths, complete
+
+    def _device_ids(self, paths):
+        complete = True
+        nvidia_rdevs = set()
+        for path in paths:
+            try:
+                device_stat = self.stat(path)
+                if stat.S_ISCHR(device_stat.st_mode):
+                    nvidia_rdevs.add(device_stat.st_rdev)
+            except FileNotFoundError:
+                continue
+            except (PermissionError, OSError):
+                complete = False
+        return nvidia_rdevs, complete
+
+    def _client_for_pid(self, pid, nvidia_rdevs):
+        complete = True
+        fd_root = os.path.join(self.proc_root, pid, "fd")
+        try:
+            fds = self.listdir(fd_root)
+        except (FileNotFoundError, ProcessLookupError):
+            return None, complete
+        except (PermissionError, OSError):
+            return None, False
+
+        matched = []
+        for fd in fds:
+            try:
+                fd_path = os.path.join(fd_root, fd)
+                target = self.readlink(fd_path)
+                # Stat the fd itself, not the racy target path.
+                if self.stat(fd_path).st_rdev in nvidia_rdevs:
+                    matched.append(target)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except OSError as error:
+                if error.errno not in (errno.ENOENT, errno.ESRCH):
+                    complete = False
+        if not matched:
+            return None, complete
+
+        try:
+            with open(os.path.join(self.proc_root, pid, "comm"), encoding=DEFAULT_ENCODING) as filepointer:
+                comm = filepointer.read().strip()
+        except (FileNotFoundError, ProcessLookupError):
+            return None, complete
+        except (PermissionError, OSError):
+            complete = False
+            comm = "?"
+        return {"pid": int(pid), "comm": comm, "devices": sorted(set(matched))}, complete
+
+    def active_clients(self):
+        """Find open NVIDIA/DRM handles; incomplete inspection is deliberately fail-closed."""
+        pci_functions = self._pci_functions()
+        if pci_functions is None:
+            return [], False
+
+        paths, complete = self._device_paths(pci_functions)
+        nvidia_rdevs, devices_complete = self._device_ids(paths)
+        complete = complete and devices_complete
+        if pci_functions and not nvidia_rdevs:
+            complete = False
+
+        clients = []
+        try:
+            pids = self.listdir(self.proc_root)
+        except (OSError, IOError):
+            return [], False
+        for pid in pids:
+            if not pid.isdigit():
+                continue
+            client, process_complete = self._client_for_pid(pid, nvidia_rdevs)
+            complete = complete and process_complete
+            if client:
+                clients.append(client)
+        return clients, complete
+
+
 class GraphicsModeFeature(Feature):
     HYBRID = "hybrid"
     HYBRID_IGPU_ONLY = "hybrid-igpu-only"
     HYBRID_AUTO = "hybrid-auto"
     DISCRETE = "discrete"
 
-    def __init__(self, gsync: GsyncFeature):
+    def __init__(
+        self,
+        gsync: GsyncFeature,
+        *,
+        topology=None,
+        sleep=time.sleep,
+        notify_path=None,
+        notify_writer=None,
+        reconcile_attempts=5,
+        reconcile_delay=5,
+    ):
         super().__init__()
         self.gsync = gsync
         self.gsync_support = IntFileFeature(os.path.join(LEGION_SYS_BASEPATH, "issupportgsync"))
         self.igpu_mode = IGPUModeFeature()
         self.igpu_mode_support = IntFileFeature(os.path.join(LEGION_SYS_BASEPATH, "issupportigpumode"))
+        self.topology = topology or GraphicsTopology()
+        self._sleep = sleep
+        self.notify = GraphicsDGPUNotify(notify_path, notify_writer)
+        self.reconcile_attempts = reconcile_attempts
+        self.reconcile_delay = reconcile_delay
 
     @staticmethod
     def _is_supported(feature: IntFileFeature) -> bool:
@@ -585,7 +822,74 @@ class GraphicsModeFeature(Feature):
             raise ValueError(f"Firmware returned invalid iGPU mode {igpu_mode}")
         return modes[igpu_mode]
 
-    def _apply_raw_state(self, gsync_enabled: Optional[bool], igpu_mode: Optional[int]):
+    def status(self):
+        selected = self.get()
+        clients, complete = self.topology.active_clients()
+        effective = self.topology.effective_state()
+        expected = self.topology.expected_state(selected)
+        if "unknown" in (effective, expected):
+            reconciliation = "unknown"
+        elif effective == expected:
+            reconciliation = "settled"
+        elif expected == "detached" and (clients or not complete):
+            reconciliation = "blocked"
+        else:
+            reconciliation = "needed"
+        return {
+            "schema_version": 1,
+            "selected_mode": selected,
+            "effective_dgpu_state": effective,
+            "expected_dgpu_state": expected,
+            "available_modes": self.choices(),
+            "reconciliation": reconciliation,
+            "client_inspection_complete": complete,
+            "active_clients": clients,
+        }
+
+    def reconcile(self):
+        selected = self.get()
+        attempts = 0
+        while attempts < self.reconcile_attempts:
+            if self.get() != selected:
+                result = self.status()
+                result["reconciliation_error"] = "selected mode changed during reconciliation"
+                result["reconciliation_attempts"] = attempts
+                return result
+
+            result = self.status()
+            if result["reconciliation"] == "unknown":
+                result["reconciliation_attempts"] = attempts
+                return result
+            if result["reconciliation"] == "blocked":
+                result["reconciliation_attempts"] = attempts
+                return result
+
+            if result["reconciliation"] == "settled":
+                if attempts == 0:
+                    self.notify.write(result["effective_dgpu_state"] != "detached")
+                    attempts = 1
+                result["reconciliation_attempts"] = attempts
+                return result
+
+            attempts += 1
+            self.notify.write(result["effective_dgpu_state"] != "detached")
+            self._sleep(self.reconcile_delay)
+
+        result = self.status()
+        result["reconciliation_attempts"] = attempts
+        return result
+
+    def _preflight_ejection(self):
+        clients, complete = self.topology.active_clients()
+        if clients or not complete:
+            raise GraphicsModeBusyError(clients, complete)
+
+    def _apply_raw_state(
+        self,
+        gsync_enabled: Optional[bool],
+        igpu_mode: Optional[int],
+        preflight_ejection=False,
+    ):
         # Restore Default before entering Discrete; enter Hybrid before applying
         # either live dGPU-ejection policy.
         if gsync_enabled is False:
@@ -598,6 +902,10 @@ class GraphicsModeFeature(Feature):
         if gsync_enabled is True and not self.gsync.get():
             self.gsync.set(True)
         if igpu_mode is not None and self.igpu_mode.get() != igpu_mode:
+            if preflight_ejection:
+                # Minimize the userspace TOCTOU window by checking again
+                # immediately before the firmware write.
+                self._preflight_ejection()
             self.igpu_mode.set(igpu_mode)
 
     def _verify_raw_state(self, gsync_enabled: Optional[bool], igpu_mode: Optional[int]):
@@ -631,8 +939,19 @@ class GraphicsModeFeature(Feature):
             else None
         )
 
+        requested_effective = self.topology.expected_state(mode)
+        if mode == self.HYBRID_AUTO and requested_effective == "unknown":
+            raise GraphicsModePowerStateError("Graphics mode change blocked because external power state is unknown")
+        ejection_requested = mode == self.HYBRID_IGPU_ONLY or (
+            mode == self.HYBRID_AUTO and requested_effective == "detached"
+        )
+        if ejection_requested:
+            self._preflight_ejection()
+
+        # Reconciliation is intentional even when the selected policy is unchanged.
+        # It happens only after the raw transaction, so raw failures retain rollback.
         try:
-            self._apply_raw_state(requested_gsync, requested_igpu_mode)
+            self._apply_raw_state(requested_gsync, requested_igpu_mode, preflight_ejection=ejection_requested)
             self._verify_raw_state(requested_gsync, requested_igpu_mode)
             current = self.get()
             if current != mode:
@@ -646,6 +965,30 @@ class GraphicsModeFeature(Feature):
                     f"Graphics mode change failed ({error}); rollback also failed " f"({rollback_error})"
                 ) from error
             raise
+        try:
+            return self.reconcile()
+        except (OSError, IOError) as error:
+            raise GraphicsModeReconciliationError(
+                f"Graphics mode {mode} was selected, but effective topology reconciliation failed: {error}"
+            ) from error
+
+
+class GraphicsDGPUNotify:
+    """Private write-only wrapper: its value is observed PCI availability."""
+
+    def __init__(self, path=None, writer=None):
+        self.path = path or FileFeature._find_by_file_pattern(os.path.join(LEGION_SYS_BASEPATH, "notify_dgpu"))
+        self.writer = writer
+
+    def write(self, available):
+        value = "1" if available else "0"
+        if self.writer is not None:
+            self.writer(available)
+            return
+        if self.path is None:
+            raise FileNotFoundError("notify_dgpu is not available")
+        with open(self.path, "w", encoding=DEFAULT_ENCODING) as filepointer:
+            filepointer.write(value)
 
 
 class AlwaysOnUSBChargingFeature(BoolFileFeature):
