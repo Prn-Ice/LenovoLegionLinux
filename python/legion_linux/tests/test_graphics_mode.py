@@ -171,8 +171,29 @@ class GraphicsModeFeatureTest(unittest.TestCase):
 
         result = self.feature.set("hybrid-igpu-only")
 
-        self.assertEqual([True], self.notifications)
+        self.assertEqual([True, False], self.notifications)
         self.assertEqual("detached", result["effective_dgpu_state"])
+        self.assertEqual("settled", result["reconciliation"])
+        self.assertEqual(2, result["reconciliation_attempts"])
+
+    def test_already_detached_policy_reports_final_absence(self):
+        self.write("igpumode", 1)
+        self.topology.effective = "detached"
+
+        result = self.feature.reconcile()
+
+        self.assertEqual([False], self.notifications)
+        self.assertEqual("settled", result["reconciliation"])
+        self.assertEqual(1, result["reconciliation_attempts"])
+
+    def test_reattachment_reports_observed_transition(self):
+        self.write("igpumode", 1)
+        self.topology.effective = "detached"
+
+        result = self.feature.set("hybrid")
+
+        self.assertEqual([False, True], self.notifications)
+        self.assertEqual("attached", result["effective_dgpu_state"])
         self.assertEqual("settled", result["reconciliation"])
 
     def test_reconciliation_timeout_keeps_selected_policy(self):
@@ -190,6 +211,28 @@ class GraphicsModeFeatureTest(unittest.TestCase):
         self.assertEqual("1", self.read("igpumode"))
         self.assertEqual([True, True], self.notifications)
         self.assertEqual("needed", result["reconciliation"])
+
+    def test_final_allowed_attempt_reports_converged_absence(self):
+        self.feature = legion.GraphicsModeFeature(
+            legion.GsyncFeature(),
+            topology=self.topology,
+            sleep=lambda _: None,
+            notify_writer=self.notifications.append,
+            reconcile_attempts=1,
+            reconcile_delay=0,
+        )
+
+        def notify(available):
+            self.notifications.append(available)
+            self.topology.effective = "detached"
+
+        self.feature.notify = legion.GraphicsDGPUNotify(writer=notify)
+
+        result = self.feature.set("hybrid-igpu-only")
+
+        self.assertEqual([True, False], self.notifications)
+        self.assertEqual("settled", result["reconciliation"])
+        self.assertEqual(2, result["reconciliation_attempts"])
 
     def test_notify_failure_keeps_selected_policy(self):
         def fail_notify(_):
@@ -265,16 +308,20 @@ class GraphicsTopologyTest(unittest.TestCase):
         os.makedirs(self.proc)
         os.makedirs(self.dev)
 
-    def add_gpu(self, bound):
-        gpu = os.path.join(self.pci, "0000:01:00.0")
-        os.makedirs(gpu)
-        for name, value in (("vendor", "0x10de"), ("class", "0x030000")):
-            with open(os.path.join(gpu, name), "w", encoding=legion.DEFAULT_ENCODING) as filepointer:
+    def add_nvidia_function(self, address, device_class, bound):
+        function = os.path.join(self.pci, address)
+        os.makedirs(function)
+        for name, value in (("vendor", "0x10de"), ("class", device_class)):
+            with open(os.path.join(function, name), "w", encoding=legion.DEFAULT_ENCODING) as filepointer:
                 filepointer.write(value)
         if bound:
             driver = os.path.join(self.temp_dir.name, "driver")
             os.makedirs(driver, exist_ok=True)
-            os.symlink(driver, os.path.join(gpu, "driver"))
+            os.symlink(driver, os.path.join(function, "driver"))
+        return function
+
+    def add_gpu(self, bound):
+        return self.add_nvidia_function("0000:01:00.0", "0x030000", bound)
 
     def test_effective_topology_distinguishes_detached_partial_and_attached(self):
         topology = legion.GraphicsTopology(pci_root=self.pci, power_root=self.power)
@@ -283,6 +330,19 @@ class GraphicsTopologyTest(unittest.TestCase):
         self.assertEqual("partial", topology.effective_state())
         os.symlink(self.temp_dir.name, os.path.join(self.pci, "0000:01:00.0", "driver"))
         self.assertEqual("attached", topology.effective_state())
+
+    def test_effective_topology_is_partial_while_nvidia_audio_remains(self):
+        self.add_nvidia_function("0000:01:00.1", "0x040300", True)
+        topology = legion.GraphicsTopology(pci_root=self.pci, power_root=self.power)
+
+        self.assertEqual("partial", topology.effective_state())
+
+    def test_effective_topology_is_partial_when_a_sibling_is_unbound(self):
+        self.add_gpu(True)
+        self.add_nvidia_function("0000:01:00.1", "0x040300", False)
+        topology = legion.GraphicsTopology(pci_root=self.pci, power_root=self.power)
+
+        self.assertEqual("partial", topology.effective_state())
 
     def test_auto_expected_state_uses_enumerated_power_supply(self):
         ac = os.path.join(self.power, "AC")
@@ -342,6 +402,33 @@ class GraphicsTopologyTest(unittest.TestCase):
         self.assertTrue(complete)
         self.assertEqual(2903, clients[0]["pid"])
         self.assertEqual("code", clients[0]["comm"])
+
+    def test_active_client_detection_includes_nvidia_audio_nodes(self):
+        gpu = self.add_gpu(True)
+        os.makedirs(os.path.join(gpu, "drm"))
+        audio = self.add_nvidia_function("0000:01:00.1", "0x040300", True)
+        card = os.path.join(audio, "sound", "card0")
+        os.makedirs(card)
+        os.makedirs(os.path.join(self.dev, "snd"))
+        os.symlink("/dev/null", os.path.join(self.dev, "snd", "controlC0"))
+        os.symlink("/dev/null", os.path.join(card, "controlC0"))
+        process = os.path.join(self.proc, "2903")
+        os.makedirs(os.path.join(process, "fd"))
+        with open(os.path.join(process, "comm"), "w", encoding=legion.DEFAULT_ENCODING) as filepointer:
+            filepointer.write("pipewire\n")
+        os.symlink(os.path.join(self.dev, "snd", "controlC0"), os.path.join(process, "fd", "18"))
+        topology = legion.GraphicsTopology(
+            pci_root=self.pci,
+            power_root=self.power,
+            proc_root=self.proc,
+            dev_root=self.dev,
+        )
+
+        clients, complete = topology.active_clients()
+
+        self.assertTrue(complete)
+        self.assertEqual(2903, clients[0]["pid"])
+        self.assertEqual("pipewire", clients[0]["comm"])
 
     def test_unreadable_pci_function_makes_topology_unknown(self):
         gpu = os.path.join(self.pci, "0000:01:00.0")

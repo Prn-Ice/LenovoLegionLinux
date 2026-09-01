@@ -1040,8 +1040,8 @@ cat /sys/devices/pci0000\:00/0000\:00\:01.1/power_state
 
 运行时 D3 电源管理与固件的 iGPU-only 弹出机制不同。少量 Xorg
 显存占用对于运行时 D3 可能是正常的，但安全弹出 PCI 设备前，必须关闭
-**所有** NVIDIA 或 NVIDIA DRM 设备句柄，包括合成器、Xwayland、Electron
-应用、监控工具、游戏和 CUDA 应用持有的句柄。
+**所有** NVIDIA、NVIDIA DRM 或 NVIDIA HDMI 音频设备句柄，包括合成器、
+Xwayland、Electron 应用、音频服务、监控工具、游戏和 CUDA 应用持有的句柄。
 
 在固件声明支持 iGPU 模式的机型上，请使用组合图形模式事务，不要直接
 写入 `gsync`、`igpumode` 或 `notify_dgpu`：
@@ -1058,10 +1058,11 @@ sudo legion_cli --donotexpecthwmon graphics-mode reconcile
 设备句柄；若仍有客户端或无法完整检查，则不会写入选择器并以状态码 2
 退出。
 
-协调操作会把实际观察到的 dGPU 可用状态通知给固件，并等待拓扑收敛。
-它不会把调用者指定的目标值直接写入 `notify_dgpu`，也不提供强制绕过。
-若固件未收敛，已选策略可能保持待处理；只有选择器写入或回读失败时才
-回滚原始选择器。
+协调操作会把实际观察到的 dGPU 可用状态通知给固件，并等待所有 NVIDIA
+PCI 功能收敛。收敛后会再次报告最终观察状态，以符合固件的可用状态通知
+约定。它不会把调用者指定的目标值直接写入 `notify_dgpu`，也不提供强制
+绕过。若固件未收敛，已选策略可能保持待处理；只有选择器写入或回读失败
+时才回滚原始选择器。
 
 ```bash
 sudo cat /proc/driver/nvidia/gpus/0000:01:00.0/power

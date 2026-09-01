@@ -6754,9 +6754,10 @@ static void legion_wmi_notify(struct wmi_device *wdev, union acpi_object *data)
 
 	mutex_lock(&legion_shared_mutex);
 	priv = legion_shared;
-	if ((!priv) && (priv->loaded)) {
+	if (!priv || !priv->loaded) {
 		pr_info("Received WMI event while not initialized!\n");
-		goto unlock;
+		mutex_unlock(&legion_shared_mutex);
+		return;
 	}
 
 	wpriv = dev_get_drvdata(&wdev->dev);
@@ -6772,18 +6773,23 @@ static void legion_wmi_notify(struct wmi_device *wdev, union acpi_object *data)
 			wpriv->event, data->type, ACPI_TYPE_INTEGER);
 		break;
 	}
-
-unlock:
 	mutex_unlock(&legion_shared_mutex);
 	// todo; fix that!
 	// problem: we get an event just before the powermode change (from the key?),
 	// so if we notify too early, it will read the old power mode/platform profile
 	msleep(500);
+
+	mutex_lock(&legion_shared_mutex);
+	if (legion_shared != priv || !priv->loaded) {
+		mutex_unlock(&legion_shared_mutex);
+		return;
+	}
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
 	legion_platform_profile_notify(priv->ppdev);
 #else
 	legion_platform_profile_notify();
 #endif
+	mutex_unlock(&legion_shared_mutex);
 }
 
 static int legion_wmi_probe(struct wmi_device *wdev, const void *context)

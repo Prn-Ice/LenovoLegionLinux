@@ -585,8 +585,8 @@ class GraphicsTopology:
                     vendor = f.read().strip().lower()
                 with open(os.path.join(base, "class"), encoding=DEFAULT_ENCODING) as f:
                     device_class = f.read().strip().lower()
-                if vendor == "0x10de" and device_class.startswith("0x03"):
-                    functions.append((entry, base, os.path.exists(os.path.join(base, "driver"))))
+                if vendor == "0x10de":
+                    functions.append((entry, base, device_class, os.path.exists(os.path.join(base, "driver"))))
             except (OSError, IOError):
                 return None
         return functions
@@ -597,11 +597,10 @@ class GraphicsTopology:
             return "unknown"
         if not functions:
             return "detached"
-        if any(not bound for _, _, bound in functions):
+        display_functions = [function for function in functions if function[2].startswith("0x03")]
+        if not display_functions or any(not bound for _, _, _, bound in functions):
             return "partial"
-        if any(bound for _, _, bound in functions):
-            return "attached"
-        return "partial"
+        return "attached"
 
     def power_state(self):
         """Return ac, battery, or unknown, using all available power supplies."""
@@ -660,15 +659,33 @@ class GraphicsTopology:
 
         # Only DRM nodes belonging to an NVIDIA PCI function count. Do not
         # infer ownership from a card number or from the presence of /dev/dri.
-        for _, pci_path, _ in pci_functions:
-            drm_path = os.path.join(pci_path, "drm")
-            try:
-                drm_names = self.listdir(drm_path)
-            except (OSError, IOError):
-                complete = False
-                continue
-            for name in drm_names:
-                paths.append(os.path.join(self.dev_root, "dri", name))
+        for _, pci_path, device_class, bound in pci_functions:
+            if device_class.startswith("0x03"):
+                drm_path = os.path.join(pci_path, "drm")
+                try:
+                    drm_names = self.listdir(drm_path)
+                except (OSError, IOError):
+                    complete = False
+                    continue
+                for name in drm_names:
+                    paths.append(os.path.join(self.dev_root, "dri", name))
+            elif device_class.startswith("0x04"):
+                sound_path = os.path.join(pci_path, "sound")
+                try:
+                    sound_cards = self.listdir(sound_path)
+                except (OSError, IOError):
+                    if bound:
+                        complete = False
+                    continue
+                for card in sound_cards:
+                    if not card.startswith("card"):
+                        continue
+                    try:
+                        sound_nodes = self.listdir(os.path.join(sound_path, card))
+                    except (OSError, IOError):
+                        complete = False
+                        continue
+                    paths.extend(os.path.join(self.dev_root, "snd", name) for name in sound_nodes)
         return paths, complete
 
     def _device_ids(self, paths):
@@ -865,9 +882,8 @@ class GraphicsModeFeature(Feature):
                 return result
 
             if result["reconciliation"] == "settled":
-                if attempts == 0:
-                    self.notify.write(result["effective_dgpu_state"] != "detached")
-                    attempts = 1
+                self.notify.write(result["effective_dgpu_state"] != "detached")
+                attempts += 1
                 result["reconciliation_attempts"] = attempts
                 return result
 
@@ -876,6 +892,9 @@ class GraphicsModeFeature(Feature):
             self._sleep(self.reconcile_delay)
 
         result = self.status()
+        if result["reconciliation"] == "settled":
+            self.notify.write(result["effective_dgpu_state"] != "detached")
+            attempts += 1
         result["reconciliation_attempts"] = attempts
         return result
 

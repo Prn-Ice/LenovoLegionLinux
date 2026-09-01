@@ -199,9 +199,12 @@ enum IGPUState{
 
 // GETIGPUMODESTATUS is the selected persistent policy, not effective PCI
 // topology. NOTIFYDGPUSTATUS accepts observed availability: 1 when the dGPU is
-// enumerated, 0 when absent. It is not a requested target. Userspace must check
-// every NVIDIA and associated DRM device handle before ejection, then verify
-// topology after firmware settles.
+// enumerated, 0 when absent. It is not a requested target. On this firmware,
+// reporting 1 while iGPU-only is selected invokes DGHP(0) to eject; reporting
+// the final 0 stores completed absence without reattaching. Userspace must check
+// every NVIDIA, associated DRM, and HDMI-audio device handle before ejection,
+// then verify every NVIDIA PCI function and report final availability after
+// firmware settles.
 
 // overdrive
 // ODStatusGet, ODStatusSet

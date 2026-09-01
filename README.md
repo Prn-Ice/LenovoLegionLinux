@@ -1009,9 +1009,9 @@ cat /sys/devices/pci0000\:00/0000\:00\:01.1/power_state
 
 Runtime D3 power management is different from firmware iGPU-only ejection. A
 small Xorg allocation can be acceptable for runtime D3, but **every** open
-NVIDIA or NVIDIA DRM device handle blocks safe PCI ejection, including handles
-from compositors, Xwayland, Electron applications, monitoring tools, games, and
-CUDA applications.
+NVIDIA, NVIDIA DRM, or NVIDIA HDMI-audio device handle blocks safe PCI ejection,
+including handles from compositors, Xwayland, Electron applications, audio
+services, monitoring tools, games, and CUDA applications.
 
 On firmware that advertises iGPU mode support, use the combined graphics-mode
 transaction instead of writing `gsync`, `igpumode`, or `notify_dgpu` directly:
@@ -1029,10 +1029,12 @@ inspect open device handles before changing the selector and exit with status 2
 without writing when clients are active or inspection is incomplete.
 
 Reconciliation reports the dGPU's observed availability to firmware and waits
-for topology convergence. It never sends a caller-selected target to
-`notify_dgpu`, and there is no force bypass. A selected policy can remain
-pending if firmware does not converge; raw selector rollback is reserved for
-selector write or readback failures.
+for every NVIDIA PCI function to converge. It reports the final observed state
+again after convergence, matching firmware's availability-notification
+contract. It never sends a caller-selected target to `notify_dgpu`, and there
+is no force bypass. A selected policy can remain pending if firmware does not
+converge; raw selector rollback is reserved for selector write or readback
+failures.
 
 
 ```bash
