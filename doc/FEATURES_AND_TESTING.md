@@ -1642,3 +1642,8 @@ Class Name: LENOVO_MEMORY_METHOD
 Class GUID: {03607fce-0d83-4612-8a6e-4a4ef0415ea9}
 Description: Set Memory OC Data
 Implemented: True
+# Firmware power-default diagnostics
+
+The read-only, versioned `power_defaults_v1` capability-cache export and its
+limitations are documented in [POWER_DEFAULTS.md](POWER_DEFAULTS.md). It does
+not certify a complete restore preset or read live power-limit values.

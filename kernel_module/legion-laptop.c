@@ -2542,14 +2542,7 @@ enum OtherMethodFeature {
 
 #define LEGION_WMI_CAPDATA01_GUID "7A8F5407-CB67-4D6E-B547-39B3BE018154"
 
-struct capdata01 {
-	u32 id;
-	u32 supported;
-	u32 default_value;
-	u32 step;
-	u32 min_value;
-	u32 max_value;
-};
+#include "power-defaults.h"
 
 #define MAX_CAPDATA_ENTRIES 80
 
@@ -3345,6 +3338,7 @@ struct legion_private {
 
 	struct capdata01 capdata[MAX_CAPDATA_ENTRIES];
 	int capdata_count;
+	bool capdata_complete;
 	int current_powermode;
 
 	struct discrete_feature discrete_features[MAX_DISCRETE_FEATURES];
@@ -6481,7 +6475,45 @@ static ssize_t powermode_store(struct device *dev,
 
 static DEVICE_ATTR_RW(powermode);
 
+/* Diagnostic firmware records only; no live WMI getter is called here. */
+static ssize_t power_defaults_v1_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	static const u32 features[] = {
+		0x01010000, 0x01020000, 0x01030000, 0x01040000,
+		0x01050000, 0x01060000, 0x01070000, 0x02010000,
+		0x02020000, 0x02030000, 0x02040000,
+	};
+	static const u32 modes[] = { 1, 2, 3, 224, 255 };
+	static const char * const statuses[] = {
+		"missing", "unsupported", "valid", "invalid"
+	};
+	struct legion_private *priv = dev_get_drvdata(dev);
+	ssize_t count = 0;
+	size_t i, j;
+
+	for (i = 0; i < ARRAY_SIZE(features); i++) {
+		for (j = 0; j < ARRAY_SIZE(modes); j++) {
+			u32 value = 0;
+			enum capdata_default_status status;
+
+			status = capdata_default_lookup(priv->capdata,
+				priv->capdata_count, priv->capdata_complete,
+				features[i], modes[j], &value);
+			if (status == CAPDATA_VALID)
+				count += sysfs_emit_at(buf, count, "%08x %u %s %u\n",
+					features[i], modes[j], statuses[status], value);
+			else
+				count += sysfs_emit_at(buf, count, "%08x %u %s -\n",
+					features[i], modes[j], statuses[status]);
+		}
+	}
+	return count;
+}
+static DEVICE_ATTR_RO(power_defaults_v1);
+
 static struct attribute *legion_sysfs_attributes[] = {
+	&dev_attr_power_defaults_v1.attr,
 	&dev_attr_powermode.attr,
 	&dev_attr_lockfancontroller.attr,
 	&dev_attr_fan_unlock.attr,
@@ -8332,16 +8364,22 @@ static int legion_add(struct platform_device *pdev)
 			int idx;
 			int loaded = 0;
 
+			priv->capdata_complete = instances <= MAX_CAPDATA_ENTRIES;
+
 			for (idx = 0; idx < instances && loaded < MAX_CAPDATA_ENTRIES; idx++) {
 				union acpi_object *obj;
 				struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
 
 				if (ACPI_FAILURE(wmi_query_block(LEGION_WMI_CAPDATA01_GUID,
-								 idx, &out)))
+								 idx, &out))) {
+					priv->capdata_complete = false;
 					continue;
+				}
 				obj = out.pointer;
 				if (!obj || obj->type != ACPI_TYPE_BUFFER ||
+				    !obj->buffer.pointer ||
 				    obj->buffer.length < sizeof(struct capdata01)) {
+					priv->capdata_complete = false;
 					ACPI_FREE(obj);
 					continue;
 				}

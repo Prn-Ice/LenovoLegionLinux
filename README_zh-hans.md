@@ -9,6 +9,8 @@
     <strong> 联想拯救者 Linux 支持 </strong>
 </h1>
 
+固件功率默认值记录仅供只读诊断，不构成完整的恢复预设。详见[接口说明](doc/POWER_DEFAULTS.md)。
+
 [![构建状态](https://github.com/johnfanv2/LenovoLegionLinux/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/johnfanv2/LenovoLegionLinux/actions/workflows/build.yml)
 [![加入Discord](https://img.shields.io/discord/761178912230473768?label=拯救者系列Discord)](https://discord.com/invite/legionseries)
 [![Reddit社区](https://img.shields.io/static/v1?label=Reddit&message=LenovoLegion&color=green)](https://www.reddit.com/r/LenovoLegion/)

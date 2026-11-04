@@ -9,6 +9,9 @@
     <strong> Lenovo Legion Linux Support </strong>
 </h1>
 
+Firmware power-default records are available as read-only diagnostics; they are
+not a complete restore preset. See [the contract](doc/POWER_DEFAULTS.md).
+
 [![Build](https://github.com/johnfanv2/LenovoLegionLinux/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/johnfanv2/LenovoLegionLinux/actions/workflows/build.yml)
 [![Join Discord](https://img.shields.io/discord/761178912230473768?label=Legion%20Series%20Discord)](https://discord.com/invite/legionseries)
 [![Check Reddit](https://img.shields.io/static/v1?label=Reddit&message=LenovoLegion&color=green)](https://www.reddit.com/r/LenovoLegion/)

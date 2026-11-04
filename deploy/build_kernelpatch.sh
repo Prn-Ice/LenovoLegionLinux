@@ -32,6 +32,7 @@ if grep -q '^config LEGION_LAPTOP$' "${DRIVER_DIR}/Kconfig"; then
 fi
 
 cp "${REPODIR}/kernel_module/legion-laptop.c" "${DRIVER_DIR}/legion-laptop.c"
+cp "${REPODIR}/kernel_module/power-defaults.h" "${DRIVER_DIR}/power-defaults.h"
 cat >> "${DRIVER_DIR}/Kconfig" <<'EOF'
 
 config LEGION_LAPTOP
