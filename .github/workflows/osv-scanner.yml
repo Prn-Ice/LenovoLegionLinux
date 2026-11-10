@@ -1,0 +1,52 @@
+name: OSV-Scanner
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '30 12 * * 1'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  resolve-python-dependencies:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Resolve Python dependencies
+        run: |
+          python3 -m pip install --dry-run --ignore-installed --report pip-report.json ./python/legion_linux
+          python3 - <<'PY'
+          import json
+
+          with open('pip-report.json', encoding='utf-8') as report:
+              packages = json.load(report)['install']
+          with open('requirements-osv.txt', 'w', encoding='utf-8') as requirements:
+              for package in packages:
+                  if not package['is_direct']:
+                      metadata = package['metadata']
+                      requirements.write(f"{metadata['name']}=={metadata['version']}\n")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: osv-python-dependencies
+          path: requirements-osv.txt
+          if-no-files-found: error
+
+  scan:
+    needs: resolve-python-dependencies
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+    with:
+      download-artifact: osv-python-dependencies
+      scan-args: '--lockfile=requirements.txt:requirements-osv.txt'
+      upload-sarif: false
