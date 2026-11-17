@@ -1290,7 +1290,7 @@ static const struct model_config model_m1cn = {
 	.access_method_keyboard = ACCESS_METHOD_WMI,
 	.access_method_fanspeed = ACCESS_METHOD_WMI3,
 	.access_method_temperature = ACCESS_METHOD_WMI3,
-	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_EC,
 	.access_method_fanfullspeed = ACCESS_METHOD_WMI,
 	/* M1CN48WW: the legacy CPU/GPU WMI methods (WMAC/WMAD) are firmware
 	 * stubs that always return 0; power limits are only served by the
