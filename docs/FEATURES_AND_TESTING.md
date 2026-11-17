@@ -1,0 +1,3410 @@
+## Features and Testing
+
+## Legion Slim 5 16AHP9 (83DH, NRCN)
+
+Tested on BIOS NRCN20WW, EC ID 0x8227, and Debian kernel 6.12.111+deb13-amd64.
+
+On this BIOS, `WMAB` supports fan table methods 5 and 6 only.
+Full-speed control uses `WMAE` methods 17 and 18 with feature `0x04020000`.
+These methods read and write the EC `FFON` bit.
+
+Full speed requires Custom mode (`powermode=255`). In Balanced mode, the
+firmware accepts the bit change but does not increase fan speed.
+The driver rejects enable requests outside Custom mode. The driver accepts
+disable requests in all modes.
+
+To check the control:
+
+1. Save the values of `powermode` and `fan_fullspeed`.
+2. Set `powermode` to 255 for Custom mode.
+3. Set `fan_fullspeed` to 1.
+4. Use `sensors` to check both fan speeds for at least 15 seconds.
+5. Restore the saved value of `fan_fullspeed`.
+6. Restore the saved value of `powermode`.
+
+With this fix applied to v0.0.34, both fans rose from 3500 RPM to about
+5000 RPM. Full-speed readback changed from 0 to 1 and returned to 0 after
+the test. The control did not need raw EC writes.
+
+Other BIOS versions and fan curve writes were not tested.
+
+On NRCN25WW (issue #516) the firmware fan table reads
+`1 2 3 5 6 7 8 9 10 10`, which are speed levels, not percent. Older module
+versions treated the table as percent, so the GUI sent values above 10. That
+is the likely cause of the `Operation not supported` write failure in that
+issue. The module now reports `fancurve_speed_unit` as
+`level` and exposes only the fan 1 speed points. The EC bytes for
+minifancurve and the fan controller lock hold other data on this firmware,
+so the module no longer reads or writes them.
+
+No level write has been checked on this model, so fan curve writes fail
+with `EPERM` unless the module is loaded with `allow_unvalidated_fancurve=1`.
+To check a write:
+
+1. Run `sudo cat /sys/kernel/debug/legion/fancurve` and save the table.
+2. Load the module with `allow_unvalidated_fancurve=1`.
+3. Write one point at or above its saved level through the `legion_hwmon`
+   device. A pwm value is rounded to the nearest level (`level * 255 / 10`),
+   so level 6 is pwm 153: `echo 153 | sudo tee /sys/class/hwmon/hwmonN/pwm1_auto_point5_pwm`.
+4. Read the table again and check `sensors` for a fan speed change.
+
+## GUI without fan curve support
+
+On a model whose fan curve access method is `ACCESS_METHOD_NO_ACCESS` (e.g.
+the Yoga Pro 7 14AHP9 with NCCN firmware; the Legion 5 15IRX10/QNCN before
+its fan table was enabled), start `legion_gui` with the module
+loaded. Verify that the window opens, fan curve Read/Apply buttons are disabled,
+and the notice explains that custom fan curves are unsupported. Check that
+`sensors` still reports fan RPM and temperatures. No fan curve write is needed.
+
+Run `QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests -p
+'test_gui_startup.py'` for the startup regression tests.
+
+## Fan curve on Legion Zone v3 firmware (level indices)
+
+On `model_kwcn` (Legion Pro 5 16IRX8, BIOS KWCN54WW) `Fan_Set_Table` takes ten level
+indices 0-10, not percentages; `LENOVO_FAN_TABLE_DATA.FanTable_Data` maps level n to an
+RPM (fan 1 on the 16IRX8: 1700, 1900, 2100, 2300, 2500, 2900, 3400, 3700, 4400, 5400).
+The driver uses `FAN_SPEED_UNIT_LEVEL` (debugfs `u` = 5): hwmon pwm 0-255 maps to
+level `round(pwm * 10 / 255)`, a write below the per-point minimum 1,1,1,1,1,1,1,1,3,5
+returns `EOPNOTSUPP`, and an all-zero (never written) table is sent as 1..10.
+
+Test (custom power mode, `stress-ng` + `watch sensors` running):
+
+```bash
+H=$(grep -l legion_hwmon /sys/class/hwmon/hwmon*/name | xargs dirname)
+echo 255 | sudo tee $H/pwm1_auto_point10_pwm   # level 10
+sudo cat /sys/kernel/debug/legion/fancurve      # WMI block: u = 5, speed1 = 10
+sensors                                         # fan 1 should reach FanTable_Data[9]
+echo 204 | sudo tee $H/pwm1_auto_point10_pwm   # level 8 -> FanTable_Data[7]
+echo 25  | sudo tee $H/pwm1_auto_point10_pwm   # EOPNOTSUPP: point 10 minimum is 5
+```
+
+Measured on a Legion Pro 5 16IRX8 (KWCN54WW), first from Windows with the same WMI calls and then
+on Linux through this driver's hwmon interface: entering custom mode seeds an empty table with
+1,2,3,4,5,6,7,8,8,8; level 9 on every point gave 4400 / 4600 RPM (fan 1 / fan 2) and level 10 gave
+5400 / 5400 RPM, matching FanTable_Data, within 15 s from a warm fan and about 30 s from an idle
+2100 RPM (the EC ramps at roughly 100 RPM/s). The DSDT's Fan_Set_Table handler copies the ten bytes
+to EC RAM F9F0..F9F9 (`ecmemoryram` offset 0x1F0) and ignores the FSTM/FSID/FSTL header, so the
+`Fan_Get_Table` readback and that block are the same bytes.
+The Python tools (`legion_cli`, `legion_gui`, `legiond` presets) map RPM to the nearest
+level and clamp to the per-point minimum; the per-level RPM ladders they use are not
+hardcoded but read at runtime from `fan1_level_rpm_table`/`fan2_level_rpm_table` on
+the platform device, which the driver fills from the firmware's
+`LENOVO_FAN_TABLE_DATA` WMI data block for the current power mode:
+
+```bash
+D=/sys/bus/platform/drivers/legion/legion
+cat $D/fan1_level_rpm_table   # e.g. 1700 1900 2100 2300 2500 2900 3400 3700 4400 5400
+```
+
+The same table row also carries the fan's real maximum (`current_fan_max_speed`),
+which the driver reports through hwmon `fan1_max`/`fan2_max` on these models instead
+of a per-model hardcoded value. `fan_maxspeed` (Fan Method ids 3/4) is hidden on
+`model_kwcn`, `model_q7cn`, `model_rlcn` and `model_qncn` (`skip_fan_maxspeed`): their `WMAB` implements
+only ids 5/6, so the attribute cannot work (on KWCN the read returned a meaningless 0 and a
+write was a no-op; Q7CN/RLCN/QNCN follow from their DSDTs); `fan_control.sh` skips the attribute
+when it is absent.
+On the Legion Pro 7 16IRX8H with the same BIOS the EC resets the table to 1..10 when
+mode 0xE0 is entered and ignores later writes (issue #429); use mode 255 and check
+`/sys/kernel/debug/legion/ecmemory` offset 0x1F0..0x1F9 after a write.
+
+## Legion Pro 7 16IAX10H (83F5, Q7CN)
+
+BIOS Q7CN78WW, EC 0x5508 (fw 1.78), Intel Arrow Lake-HX + RTX 50. DMI entry
+`Q7CN` is qualified on product name `83F5`; config `model_q7cn` in
+`kernel_module/legion-laptop.c` (the header comment cites the DSDT lines).
+
+- Everything goes through WMI: power mode via GameZone `WMAA` 0x2C/0x2D,
+  fan RPM / CPU+GPU temperature / fan full speed via Other Method `WMAE`
+  (the third fan is firmware fan 4, feature id 0x04030004 = EC `FASF` * 100,
+  exposed as hwmon `fan3`; at idle it settles at 2300 RPM, the bottom of its
+  own ladder, while fans 1/2 sit at 1600/1700),
+  fan table via Fan Method `WMAB` 5/6. The CPU Method GUID is an empty
+  stub, so the limit attributes that stay visible (`cpu_temperature_limit`,
+  `cpu_l1_tau`, `gpu_power_target_offset`) use `ACCESS_METHOD_WMI3_CLAMPED`;
+  the CPU/GPU power-limit and OC attributes are hidden (`skip_oc_controls`),
+  use the in-tree `lenovo_wmi_other` firmware-attributes for PL1/PL2/tau/cTGP.
+  Those read the power mode through `lenovo_wmi_gamezone`, and return
+  `EINVAL` for every `current_value` while that driver has no device, so
+  `model_q7cn` sets `leave_gamezone_wmi_unbound`: `legion_wmi` declines the
+  GameZone method block (887B54E3, an `object_id` block with no notify id,
+  so binding it never delivered events; the methods are still called by
+  GUID) and the mainline driver binds it in any load order. Verified with
+  `legion_laptop` loaded first: dmesg "Leaving GameZone WMI to
+  lenovo-wmi-gamezone", `ppt_pl1_spl` 90, `ppt_pl2_sppt` 125, `gpu_nv_ctgp`
+  95 readable, both platform-profile providers offering the same five
+  choices; on AC, `custom` via the `lenovo-wmi-gamezone` profile device,
+  `ppt_pl1_spl` 80 written and read back, then restored to 90 (the
+  power-button LED shows purple/pink while in custom mode).
+- CPU package power in the non-custom modes: the enforced limit is MMIO RAPL
+  (`intel-rapl-mmio:0`), which the BIOS sets to 30/30 W at boot. The WMAE
+  power-limit setters store their value but update the EC's live limits
+  (`CLTP`/`CSTP`) only when `ODV1 == 3` (custom), and `ROOS()` signals the
+  other modes to Intel DTT (`Notify(IETM, 0x88)`, mode in `ODV1` = `odvp1`),
+  whose data-vault targets are selected through software-OEM conditions that
+  thermald cannot evaluate. So quiet/balanced/performance/extreme ran at 30 W
+  (24-thread load: ~1.2 GHz, 54 °C) until custom mode was entered once. The
+  driver exports the capdata01 per-mode defaults in
+  `cpu_longterm_powerlimit_defaults` (`low-power:55 balanced:90
+  performance:145 max-power:160 custom:90`) and
+  `cpu_shortterm_powerlimit_defaults` (`65 125 190 205 125`), and legiond's
+  `cpu_powerlimit_sync` writes them to MMIO RAPL on each profile change
+  (verified: 55/65 W → ~2.7 GHz, 63 °C; 90/125 W → ~3.6 GHz, 87 °C on the
+  same load).
+  thermald's power-limit control must not run alongside it: `thermald
+  --adaptive` writes its PPCC maximum (PL1 150 W) to the same MMIO limit in
+  every mode. `lenovo-wmi-other`'s `ppt_pl1_spl` / `ppt_pl2_sppt` hold the
+  custom-mode values (the WMAE setters only apply them when ODV1 == 3), so
+  outside custom mode they can differ from the enforced MMIO limit.
+- GPU (RTX 5090 Laptop, NVIDIA 615.71): without `nvidia-powerd` the enforced
+  GPU power limit is 95 W in every mode (max 175 W). With
+  `systemctl enable --now nvidia-powerd` it follows the mode: 95 W in quiet
+  and balanced, 150 W in performance and extreme at idle, and 175 W under GPU
+  load with Dynamic Boost (a CUDA FMA burn drew 174.5 W at ~2.73 GHz, limited
+  by "SW Power Cap"). For the first ~20 s of a new load the driver holds
+  1507 MHz / ~51 W with the clock reason "Reliability", then releases it.
+  The firmware also has CPU "Double" targets for combined load (DPTF vault:
+  performance PL1 145 → 75 W once sensors SEN3/SEN4, thermal zones 3/4, pass
+  ~54/74 °C). legiond applies them with the `double_*` keys of
+  `[cpu_powerlimit]` (example values in `legiond.ini`). Under a 60 s CPU+GPU
+  load in performance, SEN3/SEN4 went from 43/43 °C to 54/76 °C at ~40 s
+  while the CPU package was at 100–103 °C at the 90 W balanced limit and the
+  GPU drew ~150 W (Dynamic Boost's extra 25 W needs a lightly loaded CPU).
+- The fan table is the level-index kind described in "Fan curve on Legion
+  Zone v3 firmware" above (`FAN_SPEED_UNIT_LEVEL`, one table for all fans,
+  temperature axis fixed by the EC). `LENOVO_FAN_TABLE_DATA` on this firmware
+  (`WQA3`, switched on the `GSKU` EC field) maps level 1..10 to
+  1600..5200 RPM (fan 1 / sensor 0x01, CPU fan), 1700..5400 (fan 2 /
+  sensor 0x05, GPU fan) and 2300..6500 (fan 4 / sensor 0x04, the small
+  third fan) on SKUs 0x02/0x0B; SKUs 0x03/0x0C and the default case use
+  1600..5100 / 1600..5100 / 1600..6500. The firmware has no (fan 1,
+  sensor 0x04) row, so the driver takes fan 1's ladder from the sensor
+  0x01 row, as Lenovo Legion Toolkit does. Fans 1 and 2 are what the driver's
+  `fan1_level_rpm_table`/`fan2_level_rpm_table` attributes expose for the
+  Python tools, so RPM presets round to the right level; they also give hwmon
+  `fan1_max` its real value (5200) instead of the generic fallback. The EC applies the table
+  only in custom mode (`powermode` 0xFF) on AC; on battery the firmware parks
+  the custom-mode request while `powermode` still reads back 0xFF. The one
+  table drives all three fans: with every point at pwm 127 (level 5) they
+  settled at 2400/2400/3200 RPM (the level-5 entries of the fan 1/2/4
+  ladders), and at pwm 204 they ramped toward 3700/3800/5000. The EC's idle
+  fan-stop still applies in every mode, custom included. At idle the fans switch off below
+  about CPU 46 °C and restart at about 51 °C, so `fan*_input` reading 0 at
+  idle is normal.
+  `Fan_Get_Table` returns a static 1..10 placeholder in extreme mode, so read
+  the table in another mode. Writing the table as percent (older driver
+  builds: 100 into a 1..10 byte) matches the thermal shutdowns reported for
+  this model.
+- Only `pwm1_auto_point*_pwm` is writable in the point table
+  (`wmi_fancurve_speed_only`); `minifancurve` and `lockfancontroller` are hidden because the EC does not
+  declare those bytes (new `skip_lockfancontroller`).
+- Keyboard and lid lighting are USB-HID ITE devices (048d:c197); the WMI light
+  methods do not drive them, so there is no keyboard, Y-logo or IO-port light
+  control.
+- Rapid charge / battery conservation go through `VPC0.GBMD`/`VPC0.SBMC`;
+  enabling rapid charge clears conservation mode in firmware, but enabling
+  conservation left rapid charge on, and ideapad-laptop's `charge_types` then
+  failed with -EINVAL ("both [Fast] and [Long_Life] are enabled"). The driver
+  now switches rapid charge off before enabling conservation, like
+  ideapad-laptop. Verified: conservation on → rapid 0, `charge_types`
+  `[Long_Life]`, battery "Not charging"; off → `[Standard]`; rapid on →
+  conservation cleared, `[Fast]`; no charge_types errors.
+- Display overdrive: every GameZone overdrive method (WMAA 0x31 IsSupportOD,
+  0x32 get, 0x33 set) is gated on `PANT & 0x02` (panel supports overdrive);
+  on this unit's Samsung ATNA60HU01-0 OLED the bit is clear, IsSupportOD
+  returns 0 and a written 1 reads back 0. The driver now hides `overdrive`
+  when IsSupportOD succeeds and returns 0 (kept visible if the query fails),
+  so it disappears here but stays on 83F5 units with an overdrive-capable
+  panel.
+- Suspend/resume (S3, 2026-09-30): custom mode, the MMIO RAPL limit
+  (90/125 W), the GPU limit, the GameZone binding and the battery/Instant
+  Boot settings survive. The **fan table does not fully**: on resume the EC
+  raises every point to at least the mode's default level (per-point floor).
+  All points at level 5 came back as `5 5 5 5 5 6 7 8 8 8` (EC `F9F0..`,
+  `ecmemoryram` 0x180) against the default `1 2 3 4 5 6 7 8 8 8`, while all
+  points at level 8 survived unchanged. A curve quieter than the default is
+  therefore lost after suspend until it is written again. The driver now
+  re-applies the last table written through hwmon 3 s after resume
+  (`restore_fancurve_on_resume`, Q7CN only), if the power mode is still the
+  one it was written in; legiond's `legiond-onresume.service` also
+  re-applies its preset. Verified: an all-level-5 custom table survived S3
+  ("Re-applied the fan curve written before suspend: 0", EC `05` × 10).
+- The floor is applied whenever the EC processes an entry into custom mode,
+  not only on resume: an all-level-5 table settled in custom mode stayed
+  `05` × 10 after a switch to balanced and became `05 05 05 05 05 06 07 08
+  08 08` ~1 s after switching back to custom. The processing runs ~1 s after
+  the switch, so table writes made right after entering custom mode can be
+  floored as well (reproduced once in three attempts with writes finishing
+  0.6 s after the switch). Write a custom table at least ~2 s after entering
+  custom mode. There is no per-point range check: with custom mode settled,
+  every point accepted every level down to the driver's own
+  `fancurve_level_min` (1 1 1 1 1 1 1 1 3 5).
+- Instant Boot: `instant_boot_ac` / `instant_boot_usb_pd` (`has_instant_boot`)
+  use WMAE feature ids 0x03010001 / 0x03010002. Get returns EC `EACS` /
+  `ETCS`; set calls `WSMI(7)`/`WSMI(8)` (AC on/off) or `WSMI(9)`/`WSMI(0xA)`
+  (USB-PD on/off) and updates the EC flag. The capability table (`WQA9`,
+  capdata00) flags both ids 0x07. Reads verified (both 0 by default); to
+  verify a write, enable it, shut down, unplug and replug the charger: the
+  laptop should power on by itself.
+
+Validated on Linux 7.2.4 next to the in-tree `lenovo_wmi_*` drivers with
+`enable_platformprofile=0` (see the KDE/coexistence entry in the [FAQ](faq.md)):
+`ecmemory`, `ecmemoryram` and the ACPI EC I/O space are byte-identical; the
+WMI table read `1,2,3,4,5,6,7,8,8,8` matches EC RAM `F9F0..F9F9`
+(`ecmemoryram` offset 0x180); `powermode` 3/2/3 and custom mode were
+reflected by the EC `SPMO` byte (0x11/0x10/0x13); writing point 10 to level 9
+set EC byte 0x189 to 09 and restoring level 8 set it back.
+
+Verify: `sudo dmesg | grep -i legion` (no "not in allowlist", EC id 0x5508),
+`sensors` shows `legion_hwmon` temps and fan RPM, and
+`sudo cat /sys/kernel/debug/legion/fancurve` prints `u` = 5 with speed1 in 1..10,
+and `dmesg` logs "fan table data: fan 1 has 10 levels, 1600..5200 RPM" (and
+1700..5400 for fan 2) with `fan1_level_rpm_table` readable (verified on
+Q7CN78WW, Linux 7.2.7).
+
+## Legion Pro 5 16ADR10 (83LT, RLCN)
+
+BIOS RLCN31WW, EC 0x5508, AMD + RTX 50 (Legion Pro 5 16ADR10; the R9000P
+2025 83LV shares the RLCN BIOS line but is a different chassis and needs
+its own validation). DMI entry `RLCN` is qualified on product name `83LT`;
+config `model_rlcn` in `kernel_module/legion-laptop.c` (the header comment
+cites the DSDT lines from issue #445).
+
+Same firmware layout as the Q7CN (83F5) above, on the AMD chassis:
+
+- Everything goes through WMI: power mode via GameZone `WMAA` 0x2C/0x2D,
+  fan RPM / CPU+GPU temperature / fan full speed via Other Method `WMAE`,
+  fan table via Fan Method `WMAB` 5/6 with the same `F9F0..F9F9` +
+  `LECR(0xD0,1,1,2)` semantics; `FAN_SPEED_UNIT_LEVEL`, one table for all
+  fans, temperature axis fixed by the EC, static 1..10 placeholder in
+  extreme mode (read the table in another mode). `LENOVO_FAN_TABLE_DATA`
+  (WQA3) maps level 1..10 to 1700..5100 RPM on fan 1, so
+  `fan1_level_rpm_table`/`fan2_level_rpm_table` are available.
+- The keyboard backlight and the Y-logo light are driven by the
+  KBBACKLIGHT WMI methods (`WMAF`); the IO-port light ID is
+  unimplemented on this firmware and the attribute is skipped
+  automatically.
+- `fan_fullspeed` (WMAE `0x04020000` -> EC `FNST`, set and clear) is
+  exposed but writes require custom power mode; on this unit a
+  full-speed write through the wrong WMI method (old fallback config)
+  wedged the fans at ~18000 RPM until reboot, so validate with care and
+  be ready to reboot.
+- Power-limit/OC attributes stay hidden (`skip_oc_controls`); only
+  `cpu_temperature_limit`, `cpu_l1_tau` and `gpu_power_target_offset`
+  are visible, as on Q7CN. Rapid charge uses `VPC0.GBMD`/`SBMC`.
+- `minifancurve` and `lockfancontroller` are hidden (undeclared EC
+  bytes on the 0x5508 generation); the EC RAM window (`ERAX @0xFEEC2400`,
+  len 0xFF) is only used for the read-only `ecmemoryram` debugfs dump.
+
+Validation status: the general EC/fan configuration here was derived from
+the DSDT in issue #445 (RLCN31WW); validation of those features is separate
+and remains in progress. The GPU boot-mode switch was verified in both
+directions on an 83LT with RLCN20WW (see GSync below). To verify other
+features locally, use
+`sudo dmesg | grep -i legion` (no "not in allowlist", EC id 0x5508),
+`sensors`, and `sudo cat /sys/kernel/debug/legion/fancurve` (`u` = 5,
+speed1 in 1..10).
+
+## Legion 5 15AHP10 (83M0, RGCN)
+
+BIOS RGCN27WW/RGCN35WW/RGCN36WW (issue #373), EC 0x5508, AMD Ryzen 7 260
++ RTX 5060. DMI entry `RGCN` is qualified on product name `83M0`; config
+`model_rgcn` in `kernel_module/legion-laptop.c` (the header comment cites
+the DSDT lines from the RGCN35WW dsdt.dsl attached in issue #373).
+
+Same firmware layout as the RLCN (83LT) above, on the Legion 5 chassis:
+
+- Everything goes through WMI: power mode via GameZone `WMAA` 0x2C/0x2D,
+  fan RPM / CPU+GPU temperature / fan full speed via Other Method `WMAE`,
+  fan table via Fan Method `WMAB` 5/6 with the same `F9F0..F9F9` +
+  `LECR(0xD0,1,1,2)` semantics; `FAN_SPEED_UNIT_LEVEL`, one table for all
+  fans, temperature axis fixed by the EC, static 1..10 placeholder in
+  extreme mode (ODV1 == 4; read the table in another mode).
+  `LENOVO_FAN_TABLE_DATA` (WQA3) maps level 1..10 to 1800..4600 RPM on
+  both fans, so `fan1_level_rpm_table`/`fan2_level_rpm_table` are
+  available.
+- The keyboard backlight is driven by the KBBACKLIGHT WMI methods
+  (`WMAF`, LECR 0xDA); the reporters' units have no lid/logo and no
+  IO-port lights (issue #373 report), so both light attributes are
+  skipped.
+- `fan_fullspeed` (WMAE `0x04020000` -> EC `FNST`, set and clear) is
+  exposed but writes require custom power mode, as on Q7CN/RLCN.
+- Power-limit/OC attributes stay hidden (`skip_oc_controls`); only
+  `cpu_temperature_limit`, `cpu_l1_tau` and `gpu_power_target_offset`
+  are visible, as on Q7CN/RLCN. Rapid charge uses `VPC0.GBMD`/`SBMC`.
+- `minifancurve` and `lockfancontroller` are hidden (undeclared EC
+  bytes on the 0x5508 generation); the EC RAM window (`ERAX @0xFEEC2400`,
+  len 0xFF) is only used for the read-only `ecmemoryram` debugfs dump.
+
+Validation status: config derived from the DSDT analysis in issue #373
+(RGCN35WW dsdt.dsl; the WMI fan-table readback in the original report
+shows the static 1..10 placeholder, i.e. that unit was in extreme mode).
+Runtime validation on the reporters' units is in progress - check the
+issue for the results, and verify locally with
+`sudo dmesg | grep -i legion` (no "not in allowlist", EC id 0x5508),
+`sensors`, and `sudo cat /sys/kernel/debug/legion/fancurve` (`u` = 5,
+speed1 in 1..10).
+
+## Legion 5 16IAX10 (83NX, Q6CN)
+
+BIOS Q6CN32WW (also confirmed on Q6CN79WW after a BIOS update), EC 0x5508,
+Intel Core Ultra 9 275HX + RTX 5060 Max-Q. DMI entry `Q6CN` is qualified on
+product name `83NX`, since the BIOS prefix is also shared by the 83LU
+Legion Pro 5 16IAX10H (own entry and `model_q6cn_lu` below, issue #337)
+and the 83F3 sibling - different chassis (different
+`ramio_physical_start`, no minifancurve). Config `model_q6cn` in
+`kernel_module/legion-laptop.c` is a copy of `model_rxcn` (Legion 7
+16IAX10, 83KY, same EC/ramio generation) that additionally enables WMI3
+power limits.
+
+- Raw EC reads are garbage on this chassis (fan RPM exceeding the reported
+  max, EC values unrelated to real sensors) and the ACPI path failed
+  outright before upstream's ACPI EC companion-device fix; WMI3 is used
+  for all fan/temp/power-limit operations, matching `model_rxcn`.
+- `cpu_temperature_limit` (103), `cpu_l1_tau` (56),
+  `gpu_power_target_offset` (55), `cpu_longterm_powerlimit` (70 W) and
+  `cpu_shortterm_powerlimit` (125 W) are all gated by
+  `access_method_powerlimits = ACCESS_METHOD_WMI3` (as on `model_q8cn`/
+  `model_nmcn`/`model_lpcn`/`model_lzcn`) and reproduced identically
+  across five reloads, a `main` merge, and a BIOS update.
+- After upstream's ACPI EC companion-device fix landed (dmesg switched
+  from "No ACPI handle, will use FQN paths" to "Using ACPI device
+  PNP0C09:00 for EC methods"), the ACPI-path diagnostic reads started
+  succeeding too and independently agree with WMI3 (CPU/GPU temp, fan
+  RPM); raw EC reads are still garbage, confirming the EC-offset mismatch
+  is a real, ACPI-independent quirk of this chassis.
+- Write-path round trips confirmed working: `winkey`, `touchpad`,
+  keyboard-backlight brightness (flip, verify, restore).
+- `fan_fullspeed` writes are accepted and read back correctly (0 -> 1 ->
+  0) but produced no observed RPM change in testing; `fan_maxspeed` reads
+  0 throughout - untested/unexplained, not chased further.
+- The WMI fan table is the level-index speed-only kind shared across the
+  0x5508 generation (issue #491): the speed column matches the EC
+  `F9F0..F9F9` level bytes, and every `*_min_temp`/`*_max_temp` column
+  reads 0 because the firmware carries no temperature fields. The config
+  therefore exposes only the speed attributes (`wmi_fancurve_speed_only`)
+  and treats them as levels 1..10 (`FAN_SPEED_UNIT_LEVEL`), like
+  `model_q7cn`/`model_rlcn` - writing percent values into the level bytes
+  matches the thermal-shutdown reports for this generation. The table
+  initially read all-zero in balanced mode; after a BIOS update and
+  setting fan control to custom, the speed column populates with the live
+  levels.
+
+Known gaps:
+
+- `cpu_default_powerlimit` and `cpumaxfrequency` still read `0`/garbage
+  regardless of model config - these sysfs handlers call
+  `WMI_GUID_LENOVO_CPU_METHOD`/GameZone methods unconditionally, not
+  gated by `model_config`, so this looks like an unrelated firmware quirk
+  on this generation rather than an allowlist problem.
+- Custom power mode does not activate via the driver's own write path
+  (`EINVAL` on `SetSmartFanMode(255)`), reproducible across a BIOS update
+  and independent of fan-curve state; root cause not yet identified.
+- No fan-curve or power-limit writes attempted, per `AGENTS.md`'s
+  guidance that these are the highest-risk hardware writes; left for a
+  maintainer or a follow-up session.
+
+Validated on Linux 7.0.0-30-generic / 7.0.0-31-generic (Ubuntu 26.04.1
+LTS) across five module reloads, a `main` merge, and a BIOS update
+(Q6CN32WW -> Q6CN79WW). Re-confirmed with a clean 20-cycle
+`tests/test_kernel_reload.sh` run (no `force=1`): every reload matched
+through the real DMI allowlist and loaded successfully, with no "not in
+allowlist" rejection. Verify: `sudo dmesg | grep -i legion` (no "not in
+allowlist", EC id 0x5508), `sensors`, and
+`sudo cat /sys/kernel/debug/legion/fancurve`.
+
+## Legion Pro 5 16IAX10H (83LU, Q6CN)
+
+BIOS Q6CN26WW (issue #337), EC 0x5508 (fw 2b0), Intel Core Ultra 9 275HX
++ RTX 5070 Ti. DMI entry `Q6CN 83LU` is qualified on product name `83LU`;
+config `model_q6cn_lu` in `kernel_module/legion-laptop.c` (the header
+comment cites the DSDT lines from issue #337).
+
+Same firmware layout as the Q7CN (83F5) above, on the Legion Pro 5
+chassis; the Q6CN BIOS prefix is shared with the Legion 5 (83NX) above,
+which is a different chassis and keeps its own entry:
+
+- Everything goes through WMI: power mode via GameZone `WMAA` 0x2C/0x2D,
+  fan RPM / CPU+GPU temperature / fan full speed via Other Method `WMAE`,
+  fan table via Fan Method `WMAB` 5/6 with the same `F9F0..F9F9` +
+  `LECR(0xD0,1,1,2)` semantics; `FAN_SPEED_UNIT_LEVEL`, one table for all
+  fans, temperature axis fixed by the EC, static 1..10 placeholder in
+  extreme mode (read the table in another mode). `LENOVO_FAN_TABLE_DATA`
+  (WQA3) is present in the `_WDG`, so `fan1_level_rpm_table`/
+  `fan2_level_rpm_table` are available.
+- `0x05010000` is the CPU socket temperature (`CPUS`), not a labeled IC
+  sensor, so the IC temperature attribute is hidden (`skip_ic_temp`).
+- Only `pwm1_auto_point*_pwm` is writable in the point table
+  (`wmi_fancurve_speed_only`); `minifancurve`, `lockfancontroller` and `fan_maxspeed` are hidden (the
+  EC does not declare those bytes and `WMAB` implements neither
+  max-speed method).
+- The white keyboard backlight (off/medium/bright) is driven by the
+  KBBACKLIGHT WMI methods (`WMAF`); the chassis has no Y-logo or
+  IO-port lights (issue #337 report), so both light attributes are
+  skipped.
+- `fan_fullspeed` (WMAE `0x04020000` -> EC `FNST`, set and clear) is
+  exposed but writes require custom power mode, as on Q7CN/RLCN.
+- Power-limit/OC attributes stay hidden (`skip_oc_controls`); only
+  `cpu_temperature_limit`, `cpu_l1_tau` and `gpu_power_target_offset`
+  are visible, as on Q7CN/RLCN. Rapid charge uses `VPC0.GBMD`/`SBMC`.
+  PL1/PL2 come from the in-tree `lenovo-wmi-other` firmware-attributes
+  instead (see below).
+- The GameZone WMI block is left to `lenovo-wmi-gamezone`
+  (`leave_gamezone_wmi_unbound`, as on Q7CN/QNCN). While LLL held it,
+  `lenovo-wmi-gamezone` had no device and every `lenovo-wmi-other`
+  `current_value` (`ppt_pl1_spl`, `ppt_pl2_sppt`, ...) returned `EINVAL`.
+- The EC RAM window (`ERAX @0xFE500400`, `F9FT`/`ECB2` at +0x100/+0x200,
+  `ramio_size` 0x300) is only used for the read-only `ecmemoryram`
+  debugfs dump; raw EC reads return garbage on this generation (issue
+  #491); the ACPI-path reads agree with the WMI3 ones (the DSDT wires
+  both to the same EC fields), only direct EC/ramio reads are misaligned.
+
+Hardware validation of the GameZone/power-limit handling on an 83LU
+(Q6CN79WW, kernel 7.3, on AC):
+
+- Binding `legion_wmi` to the GameZone block (887B54E3) fails with
+  `ENODEV` and dmesg "Leaving GameZone WMI to lenovo-wmi-gamezone";
+  `lenovo_wmi_gamezone` binds it. Both platform-profile providers
+  (`lenovo-legion`, `lenovo-wmi-gamezone`) offer the same five choices.
+- `/sys/firmware/acpi/platform_profile`, both class profile devices and
+  `powermode` follow each other for all five modes, whichever is written.
+- `lenovo-wmi-other-0` reads: `ppt_pl1_spl` 50-135 W (default 70),
+  `ppt_pl2_sppt` 60-210 W (default 125), `ppt_cpu_cl` 30-70,
+  `cpu_temp` 85-105 °C. Writes return `EBUSY` outside custom mode; in
+  custom mode (entered through the `lenovo-wmi-gamezone` profile device)
+  they apply to the MMIO RAPL limit at once (70/125 W written, read back
+  in `intel-rapl-mmio:0`, then restored).
+- Entering custom from performance or quiet applies the stored custom
+  PL1/PL2 to MMIO RAPL; entering it from balanced keeps balanced's 70/125 W
+  until `ppt_pl1_spl`/`ppt_pl2_sppt` are written again (same value is
+  enough).
+- The firmware's per-mode defaults (`cpu_longterm_powerlimit_defaults`
+  `low-power:55 balanced:70 performance:125 max-power:130 custom:70`,
+  short-term `65/125/190/205/125`) are what `legiond`'s
+  `cpu_powerlimit_sync` writes; MMIO RAPL followed every profile change.
+
+Validation status: config derived from the DSDT and the validated reads
+in issue #337 (`legion_wmi_other` fan RPM 2400/2100 while raw EC/ACPI
+reads showed impossible values like 18045 RPM; EC id 0x5508 fw 2b0 in
+dmesg with `force=1`). Runtime validation on the reporter's unit is in
+progress - check the issue for the results, and verify locally with
+`sudo dmesg | grep -i legion` (no "not in allowlist", EC id 0x5508),
+`sensors`, and `sudo cat /sys/kernel/debug/legion/fancurve` (`u` = 5,
+speed1 in 1..10).
+
+## Legion Pro 5 16IAX10 (83F3, Q6CN)
+
+BIOS Q6CN78WW/Q6CN79WW (issue #471), EC 0x5508, Intel Core Ultra 7
+255HX + RTX 5070. DMI entry `Q6CN 83F3` is qualified on product name
+`83F3`; config `model_q6cn_f3` in `kernel_module/legion-laptop.c` (the
+header comment cites the DSDT lines from the Q6CN79WW dsdt.dsl attached in
+issue #471). The Legion Pro 5 sibling of the 83LU above, sharing the Q6CN
+BIOS line and the ERAX window.
+
+- Everything goes through WMI: power mode via GameZone `WMAA` 0x2C/0x2D,
+  fan RPM / CPU+GPU temperature / fan full speed via Other Method `WMAE`,
+  fan table via Fan Method `WMAB` 5/6 with the same `F9F0..F9F9` +
+  `LECR(0xD0,1,1,2)` semantics; `FAN_SPEED_UNIT_LEVEL`, one table for all
+  fans, temperature axis fixed by the EC, static 1..10 placeholder in
+  extreme mode (ODV1 == 4; read the table in another mode). Read on
+  hardware: 1,2,3,4,5,6,7,8,8,8 in performance mode. `LENOVO_FAN_TABLE_DATA`
+  (WQA3) maps level 1..10 to 1700..5300 RPM on both fans, so
+  `fan1_level_rpm_table`/`fan2_level_rpm_table` are available.
+- The keyboard backlight is driven by the KBBACKLIGHT WMI methods
+  (`WMAF`, LECR 0xDA); the chassis has no Y-logo or IO-port lights
+  (issue #471 report), so both light attributes are skipped.
+- `fan_fullspeed` (WMAE `0x04020000` -> EC `FNST`, set and clear) is
+  exposed but writes require custom power mode, as on Q7CN/RLCN.
+- Power-limit/OC attributes stay hidden (`skip_oc_controls`); only
+  `cpu_temperature_limit`, `cpu_l1_tau` and `gpu_power_target_offset`
+  are visible, as on Q7CN/RLCN. Rapid charge uses `VPC0.GBMD`/`SBMC`.
+- `minifancurve` and `lockfancontroller` are hidden (undeclared EC
+  bytes on the 0x5508 generation); the EC RAM window (`ERAX @0xFE500400`,
+  `F9FT`/`ECB2` at +0x100/+0x200, `ramio_size` 0x300) is only used for
+  the read-only `ecmemoryram` debugfs dump; raw EC reads return garbage
+  on this generation (issue #491) - the reporter's dump shows EC
+  80/87 C and 18045/16743 RPM while ACPI and WMI3 agree at 64 C and
+  2200 RPM.
+
+Validation status: config derived from the DSDT analysis and validated
+reads in issue #471 (inermage, Q6CN79WW). Runtime validation on the
+reporter's unit is in progress - check the issue for the results, and
+verify locally with `sudo dmesg | grep -i legion` (no "not in allowlist",
+EC id 0x5508), `sensors`, and `sudo cat /sys/kernel/debug/legion/fancurve`
+(`u` = 5, speed1 in 1..10).
+
+## LOQ 15IRX10 (83JE, R3CN)
+
+BIOS R3CN, EC 0x5508, Intel + RTX 50. DMI entry `R3CN` matches the BIOS
+prefix; config `model_r3cn` in `kernel_module/legion-laptop.c` uses the
+existing `ec_register_offsets_loq_v1` map. Sensor/powermode evidence is
+in [#374](https://github.com/johnfanv2/LenovoLegionLinux/issues/374);
+EC3 curve writes were verified under gaming load on **R3CN44WW** in
+[#535](https://github.com/johnfanv2/LenovoLegionLinux/issues/535#issuecomment-5649774722).
+
+- Keep the **EC3 RPM curve**, not the WMI level curve. This supports
+  independent fan speeds in 100-RPM units, temperature thresholds and
+  hysteresis. Use custom power mode: `255`, **not `3`** (performance).
+  The chip ID alone does not identify a register layout: R3CN's verified
+  LOQ map must not be replaced merely because other 0x5508 models need
+  WMI. No new EC addresses are introduced by this correction.
+- EC3 does not store acceleration/deceleration. Their sysfs attributes
+  are hidden (as on EC2 and WMI3); GUI/CLI detect the missing attributes and skip
+  them, rather than failing partway through Apply to HW. Both fan speed
+  columns and temperature/hysteresis fields remain editable.
+- The GZFD WMI device lives in SSDT4.dsl from R3CN.zip (#374), not the
+  DSDT. `WMAB` 5/6 delegate to `GFAN`/`SFAN`, which transfer shared
+  **levels 1..10**, deriving RPM/temperatures from `FNT0..FNT2` before
+  writing the EFAN fields. That interface cannot preserve arbitrary
+  independent RPM/temperature edits and is not the active curve path.
+  Its diagnostic debugfs table still uses unit 5; the active EC3 table
+  uses unit 3. `fan1_level_rpm_table`/`fan2_level_rpm_table` stay hidden
+  for EC3, preventing userspace from treating its PWM values as levels.
+  WMI default-curve restoration remains available; its payload already
+  names the requested mode, as `SFAN` requires. It now refuses an unreadable
+  or extreme active mode rather than reporting an ignored reset as success.
+  It checks live `thermalmode`, not the saved `powermode` request; this WMI
+  guard does not change the native EC3 curve path. The full-speed enable guard
+  uses that same live mode; disabling full speed remains possible even if the
+  mode read fails.
+- Fan RPM / CPU temperature / fan full speed via Other Method `WMAE`
+  (standard dword feature ids through a DEV0/FEA0/TYP0 dispatch):
+  RPM `0x04030001/2` -> EC `FA1S/FA2S`, full speed `0x04020000` -> EC
+  `FFON` (writes require custom power mode), CPU temp `0x05040000` ->
+  EC `CTMP`; note `0x05050000` (labeled GPU) returns the socket
+  temperature `SKTC`, the only dGPU-side reading this firmware offers,
+  and `0x05010000` reads Zero, so the IC temperature attribute is
+  hidden (`skip_ic_temp`). Power limits map to EC `CSPL/CLPL/CCTL/
+  CCPL` and stay exposed. Power mode via GameZone `WMAA` 0x2C/0x2D
+  (quiet/balanced/performance/custom 0xFF/extreme 0xE0); keyboard
+  backlight via KBBACKLIGHT `WMAF`.
+- `minifancurve` and `lockfancontroller` are hidden: their loq_v1 offsets
+  are placeholders, not validated controls. The read-only `ecmemoryram`
+  debugfs dump retains the `0xFE0B0F00`/0x600 EFAN window (#374).
+  The WMI sensor path, hidden IC sensor and custom-mode full-speed guard
+  are retained; restoring EC3 curves does not switch sensor access to EC.
+
+Hardware regression check (on AC; do not run thermal stress unattended):
+
+1. Select custom mode, for example
+   `echo 255 | sudo tee /sys/devices/platform/legion/powermode`, and read
+   it back. Record `sudo dmesg | grep -i legion`, `sensors`, and
+   `sudo cat /sys/kernel/debug/legion/fancurve`. The **first** curve table
+   must use `u = 3` (speed values multiplied by 100 give RPM).
+2. Read the curve in the GUI and save a backup preset (or use
+   `sudo legion_cli fancurve-write-hw-to-file r3cn-before.yaml`). Confirm
+   both fan columns and temperature fields are editable; accel/decel,
+   minifancurve and controller lock must be unavailable.
+3. Make a small, conservative change to one populated interior point
+   (e.g. increase its RPM within the original curve's maximum, or lower
+   a temperature threshold). Apply, read back, compare the native EC3
+   table and monitor `sensors`. Do not substitute level indices or raw
+   RPM numbers for the hwmon `pwm` values, which remain in 0..255.
+4. Restore the saved curve and verify the readback. New hardware results
+   should be reported with model/BIOS; this patch restores the path tested
+   in #535, rather than claiming a new on-hardware validation.
+
+Offline regression tests: `./tests/test_python_unit.sh` exercises RPM,
+zero-RPM and independent fan/temperature edits through a temporary EC3
+sysfs fixture and the offscreen GUI, without writing to hardware. It also
+runs the WMI level tests: zero-RPM requests there must clamp to the driver's
+per-point minimum rather than produce a rejected level-0 write.
+
+## LOQ 15IAX9 (83GS, NECN)
+
+`model_necn_83gs` (DMI `83GS` + BIOS `NECN`). The EC3 fan curve is read back
+from the `EXT_*_BASE` block that the writer writes, not from
+`EXT_*_RPM_LSB`, so a read-modify-write (GUI/CLI/legiond) keeps the table.
+Check: in custom mode write a curve, then
+`sudo cat /sys/kernel/debug/legion/fancurve` must show the same table.
+
+## Legion Y7000 2021 (82JK, H1CN)
+
+BIOS H1CN49WW, EC 0x8227 (fw 2a4), Intel Tiger Lake-H. The DMI entry
+`Legion Y7000 2021 (82JK) - EC 0x8227` is qualified on product name `82JK`
+and BIOS `H1CN`, and it deliberately sits **before** the generic `H1CN`
+entry, which keeps `model_v0`: `dmi_first_match()` uses the first match, so
+the more specific entry has to come first or it is shadowed (the #601 trap).
+
+Where it differs: the H1CN49WW DSDT puts the EC at `\_SB.PC00.LPCB.EC0`, not
+at the `\_SB.PCI0.LPC0.EC0` of `model_v0` — the string `LPC0` does not occur
+in that table at all, so every v0 ACPI path failed with AE_NOT_FOUND (-5):
+
+- kernels < 7.0: `acpi_init()` is fatal there, so the whole driver refused
+to probe — `legion PNP0C09:00: probe with driver legion failed with error
+-5`, no hwmon, no LEDs, no fancurve. This is the same failure that commit
+`643cd36` chose to tolerate on 7.x only, so on 6.x the laptop was simply
+unsupported despite the `H1CN` allowlist entry;
+- kernels >= 7.0: the probe survives without ACPI, so everything except
+`rapidcharge` and `battery_conservation` worked, and both attributes stayed
+hidden because they are the only features that need the ACPI path.
+
+Config: `model_h1cn_8227` in `kernel_module/legion-laptop.c` — `model_v0`
+registers and features, with the four ACPI paths moved to
+`\_SB.PC00.LPCB.EC0.VPC0`. DSDT references (H1CN49WW): `Scope
+(\_SB.PC00.LPCB)` L20615, `Device (EC0)` L20627, `Scope
+(\_SB.PC00.LPCB.EC0)` L21745, `Device (VPC0)` (`_HID` "VPC2004") L21747,
+`_STA` L21753 (returns 0x0F), `_CFG` L21758 (returns `_VPC` = 0x7C0DF516),
+`GBMD` L21908, `SBMC` L22128.
+
+Verified on H1CN49WW with three module loads: kernel 6.18.63 (LTS) with
+this patch stashed (`probe with driver legion failed with error -5`), the
+same kernel with it applied, and kernel 7.3.4 with the stock DKMS build
+compared against the patched one:
+
+- probe: `Using configuration for system: Legion Y7000 2021 (82JK) - EC
+0x8227`, `ACPI CFG error: 0`, `ACPI CFG: 2081289494` (0x7C0DF516) and
+`legion_laptop loaded for this device`, instead of `Could not init ACPI
+access: -5` + `probe with driver legion failed with error -5`;
+- `rapidcharge` and `battery_conservation` nodes appear on both kernels.
+The write goes through `SBMC` and the read-back through `GBMD` (QCHO, bit
+2), so the `0 -> 1 -> 0` sequence after `Set rapidcharge to 1 by calling 7:
+result: 0` / `... to 0 by calling 8: result: 0` reports EC state read by a
+different method than the one that wrote it;
+- rapid-charge A/B on AC at 44-47 % state of charge: `power_now` 34.25 W
+with rapid charge off vs 83.46 W with it on;
+- no regression on 7.3.4 with the patched build: `powermode` 2,
+`platform_profile` balanced, `fancurve_speed_unit` = rpm with the same
+4-point EC curve as the stock build (pwm 0/40/45/53, CPU 0/65/75/85/127,
+IC 0/46/50/54/127), `fan_fullspeed` 0, `lockfancontroller` 0, plus the
+`legion_hwmon` fan and temperature readings, keyboard backlight and
+Y-logo/IO-port LEDs.
+
+Notes: rapid charge is stored in the EC, so an enabled setting survives a
+module reload and a reboot. `fan_unlock` stays unavailable, since
+`model_v0` has no `has_fan_unlock` and the ACPI fix does not add one. The GPU temperature reads 0 while the
+dGPU is runtime-suspended and matches `nvidia-smi` once it is woken. The WMI
+fan table is not implemented on this generation (`WMI fancurve error: -1`),
+the EC curve is used.
+
+## Legion Y7000P IRX10 (83NN, S9CN)
+
+BIOS S9CN19WW, EC 0x5508 (fw 2b0), Intel Arrow Lake-HX + RTX 50
+(issue #506). DMI entry `S9CN` is qualified on product name `83NN`;
+config `model_s9cn` in `kernel_module/legion-laptop.c` (the header
+comment cites the DSDT lines from the dsdt.dsl attached in issue #506).
+
+Same WMI-only firmware layout as the Q7CN (83F5) above, on the Y7000P
+chassis:
+
+- Everything goes through WMI: power mode via GameZone `WMAA` 0x2C/0x2D,
+  fan RPM / CPU+GPU temperature / fan full speed via Other Method `WMAE`,
+  fan table via Fan Method `WMAB` 5/6 with the same `F9F0..F9F9` +
+  `LECR(0xD0,1,1,2)` semantics; `FAN_SPEED_UNIT_LEVEL`, one table for all
+  fans, temperature axis fixed by the EC, static 1..10 placeholder in
+  extreme mode (ODV1 == 4; read the table in another mode).
+  `LENOVO_FAN_TABLE_DATA` (WQA3) maps level 1..10 to 1700..5100 RPM on
+  fan 1, so `fan1_level_rpm_table`/`fan2_level_rpm_table` are available.
+- The keyboard backlight and the Y-logo light are driven by the
+  KBBACKLIGHT WMI methods (`WMAF` get(1)/set(2), light ids 0x00/0x03);
+  the IO-port light id 0x05 is unimplemented on this firmware and the
+  attribute is skipped automatically.
+- `fan_fullspeed` (WMAE `0x04020000` -> EC `FNST`, set and clear) is
+  exposed but writes require custom power mode; on this generation a
+  full-speed write through the wrong WMI method (old fallback config)
+  wedged the fans at maximum speed until reboot on the 83LT, so validate
+  with care and be ready to reboot.
+- Power-limit/OC attributes stay hidden (`skip_oc_controls`); only
+  `cpu_temperature_limit`, `cpu_l1_tau` and `gpu_power_target_offset`
+  are visible, as on Q7CN. Rapid charge uses `VPC0.GBMD`/`SBMC` at
+  `\_SB.PC00.LPCB.EC0`.
+- `minifancurve` and `lockfancontroller` are hidden (undeclared EC bytes
+  on the 0x5508 generation); the EC RAM window (`ERAX @0xFE0B0400`, len
+  0xFF; `F9FT`/`ECB2` at +0x100/+0x200) is only used for the read-only
+  `ecmemoryram` debugfs dump. Raw EC reads are misaligned on this unit
+  (issue #491): with the old fallback config the EC column reported
+  ~18045/~16740 RPM at ~2400 RPM real speed, while the WMI3 values are
+  correct (idle ~48 C/fans off, load ~85-88 C/~2000-2500 RPM, matching
+  `lenovo_wmi_other`).
+
+Validation status: config derived from the DSDT analysis and the runtime
+reports in issue #506 (huverse: WMI powermode, WMI3 CPU temp and fan RPM
+verified under load; AXFOX: DSDT, `lenovo_wmi_other` fan RPM tracking
+load correctly); full runtime validation of the final config is in
+progress - check the issue for the results, and verify locally with
+`sudo dmesg | grep -i legion` (no "not in allowlist", EC id 0x5508),
+`sensors`, and `sudo cat /sys/kernel/debug/legion/fancurve` (`u` = 5,
+speed1 in 1..10).
+
+## Legion Pro 7 16AFR10H (83RU, SMCN)
+
+BIOS SMCN19WW, EC 0x5508, AMD Ryzen 9 9955HX + RTX 50 (issue #624).
+DMI entry `SMCN` is qualified on product name `83RU`; config
+`model_smcn` in `kernel_module/legion-laptop.c` (the header comment
+cites the DSDT lines from the dsdt.dsl attached in issue #624).
+
+Same WMI-only firmware layout as the Q7CN (83F5) above - this is the
+AMD twin of the 16IAX10H chassis:
+
+- Everything goes through WMI: power mode via GameZone `WMAA` 0x2C/0x2D,
+  fan RPM / CPU+GPU temperature / fan full speed via Other Method `WMAE`,
+  fan table via Fan Method `WMAB` 5/6 with the same `F9F0..F9F9` +
+  `LECR(0xD0,1,1,2)` semantics; `FAN_SPEED_UNIT_LEVEL`, one table for all
+  fans, temperature axis fixed by the EC, static 1..10 placeholder in
+  extreme mode (ODV1 == 4; read the table in another mode).
+  `LENOVO_FAN_TABLE_DATA` (WQA3) maps level 1..10 to 1700..5200 RPM on
+  fan 1 (sensor 0x01), 1700..5400 RPM on fan 2 (sensor 0x05) and
+  1500..6500 RPM on fan 4 (sensor 0x04), and the third fan's RPM is
+  readable as hwmon `fan3` (`WMAE` 0x04030004 -> EC `FASF`*100); the
+  ladders match the `lenovo_wmi_other` fan1/fan2/fan4 min/max reported
+  in issue #624.
+- No keyboard/light control: the per-key RGB keyboard and the RGB lid
+  logo / rear vent lighting are driven by the USB-HID Spectrum
+  controller (PSREF), not by the WMI light methods, exactly as on the
+  16IAX10H twin.
+- `fan_fullspeed` (WMAE `0x04020000` -> EC `FNST`, set and clear) is
+  exposed but writes require custom power mode; on this generation a
+  full-speed write through the wrong WMI method (old fallback config)
+  wedged the fans at maximum speed until reboot on the 83LT, so validate
+  with care and be ready to reboot.
+- Power-limit/OC attributes stay hidden (`skip_oc_controls`); only
+  `cpu_temperature_limit`, `cpu_l1_tau` and `gpu_power_target_offset`
+  are visible, as on Q7CN. Rapid charge and battery conservation use
+  `VPC0.GBMD`/`SBMC` at `\_SB.PCI0.LPC0.EC0` (GBMD bit 0x20 = BTSM,
+  bit 0x04 = QCHO). Instant boot (`instant_boot_ac`/
+  `instant_boot_usb_pd`, WMAE 0x03010001/0x03010002) is implemented
+  like on Q7CN.
+- `minifancurve` and `lockfancontroller` are hidden (undeclared EC bytes
+  on the 0x5508 generation); the EC RAM window (`ERAX @0xFEEC2400`, len
+  0xFF; `F9FT`/`ECB2` at +0x100/+0x200) is only used for the read-only
+  `ecmemoryram` debugfs dump. Raw EC reads are misaligned on this unit:
+  with the old fallback config the EC column reported ~23000/~18000 RPM
+  while `lenovo_wmi_other` showed the correct values (issue #624).
+
+Validation status: config derived from the DSDT analysis and the
+reporter's logs in issue #624; runtime validation of the final config
+is in progress - check the issue for the results, and verify locally
+with `sudo dmesg | grep -i legion` (no "not in allowlist", EC id
+0x5508), `sensors` (legion_hwmon now matches `lenovo_wmi_other`,
+including `fan3`), and `sudo cat /sys/kernel/debug/legion/fancurve`
+(`u` = 5, speed1 in 1..10).
+
+## Legion 7 15ASH11 (83V9, UACN)
+
+Legion 7a 15" Gen 11. BIOS UACN23WW, EC 0x5508 (fw 2b0), AMD Ryzen AI
+Max+ 392 with integrated Radeon 8060S only - no discrete GPU (issue
+#657). DMI entry `UACN` is qualified on product name `83V9`; config
+`model_uacn` in `kernel_module/legion-laptop.c` (the header comment
+cites the DSDT lines from the dsdt.dsl attached in issue #657).
+
+Same WMI-only firmware layout as the RLCN/RGCN/SMCN models above:
+
+- Everything goes through WMI: power mode via GameZone `WMAA` 0x2C/0x2D,
+  fan RPM / CPU temperature / fan full speed via Other Method `WMAE`,
+  fan table via Fan Method `WMAB` 5/6 with the same `F9F0..F9F9` +
+  `LECR(0xD0,1,1,2)` semantics; `FAN_SPEED_UNIT_LEVEL`, one table for all
+  fans, temperature axis fixed by the EC, static 1..10 placeholder in
+  extreme mode (ODV1 == 4; read the table in another mode). The table
+  reads ten zeros until something has written it since boot (seen in the
+  issue #657 dump); the first write sends levels 1..10 for unset points.
+- `LENOVO_FAN_TABLE_DATA` (WQA3) holds two ladders selected by the
+  firmware flag `GDMF`: 1900..6500 RPM when it is 0 (fan 1 against
+  sensors 0x01/0x04, fan 2 against sensor 0x01 only), otherwise
+  1700..5500 RPM (fan 2 against sensor 0x05). Which one this unit uses
+  is not known yet; `fan1_level_rpm_table`/`fan2_level_rpm_table` show
+  it. Fan 2 falls back to its sensor 0x01 row when there is no GPU row.
+- No GPU temperature: the firmware flags feature 0x05050000 unsupported
+  in capability data 00 and EC `GPUT` read 0 on the unit, so hwmon
+  `temp2` is hidden (`skip_gpu_temp`); `temp3` is hidden like on the
+  other 0x5508 models. Capability data 00 also flags the fan 2 RPM id
+  (0x04030002) unsupported, although `WMAE` implements it
+  (`FA2S`*100) and the chassis has two fans, so hwmon `fan2` is exposed
+  and still needs a reading under load.
+- The 1-zone RGB keyboard's brightness level goes through the
+  KBBACKLIGHT WMI methods (`WMAF`, LECR 0xDA, levels 1..3); the read
+  worked on the unit (LED driver registered), a write is not validated
+  yet. The laptop has no lid logo and no IO-port light (PSREF and issue
+  #657 report), so both light attributes are skipped.
+- `fan_fullspeed` (WMAE `0x04020000` -> EC `FNST`, set and clear) is
+  exposed but writes require custom power mode; on this generation a
+  full-speed write through the wrong WMI method (old fallback config)
+  wedged the fans at maximum speed until reboot on the 83LT, so validate
+  with care and be ready to reboot.
+- No power-limit/OC attributes at all (`skip_oc_controls`, no
+  `access_method_powerlimits`): the GPU ones have no meaning without a
+  discrete GPU and none is validated on this APU platform; the mainline
+  `lenovo_wmi_other` firmware attributes cover them. Rapid charge and
+  battery conservation use `VPC0.GBMD`/`SBMC` at `\_SB.PCI0.LPC0.EC0`
+  (GBMD bit 0x20 = BTSM, bit 0x04 = QCHO).
+- Instant boot and flip to start are not exposed: capability data 00
+  flags the AC instant-boot id (0x03010001) unsupported, and `WMAE` sets
+  flip to start through the SWMI BIOS-setting interface (0x0D010201)
+  rather than the `FBSWIF` EFI variable the driver uses. If
+  `ls /sys/firmware/efi/efivars | grep -i FBSWIF` lists the variable on
+  this laptop, report it in the issue so flip to start can be enabled.
+- `minifancurve` and `lockfancontroller` are hidden (undeclared EC bytes
+  on the 0x5508 generation); the EC RAM window (`ERAX @0xFEEC2400`, len
+  0xFF; `F9FT`/`ECB2` at +0x100/+0x200) is only used for the read-only
+  `ecmemoryram` debugfs dump. Raw EC reads are misaligned on this unit:
+  with the old fallback config the EC column reported 70/55 RPM and 0 C
+  while WMI3 matched `k10temp` and `lenovo_wmi_other` (issue #657).
+
+Validation status: config derived from the DSDT analysis and the
+reporter's force-loaded logs in issue #657 (WMI power mode switching,
+WMI3 CPU temperature and idle fan RPM confirmed there); runtime
+validation of the final config is in progress - check the issue for the
+results, and verify locally with `sudo dmesg | grep -i legion` (no "not
+in allowlist", "Using configuration for system: UACN", EC id 0x5508),
+`sensors` (legion_hwmon shows two fans and the CPU temperature, no GPU
+or IC temperature; fan 2 should spin up under load),
+`cat /sys/kernel/debug/legion/fancurve` as root (`u` = 5), and the two
+`fan*_level_rpm_table` attributes.
+
+## Legion 5 15IRX10 (83LY, QNCN)
+
+BIOS QNCN38WW, EC 0x5508 (fw 2b0), Intel i7-13650HX + RTX 5070 Laptop
+(issue #491). DMI entry `QNCN`; config `model_qncn` in
+`kernel_module/legion-laptop.c` (the header comment cites the firmware
+evidence from the reporter's QNCN38WW dump: 25 decompiled ACPI tables,
+method extracts and runtime logs).
+
+Same WMI-only firmware layout as S9CN (83NN) above, on the Legion 5
+chassis:
+
+- Everything goes through WMI: power mode via GameZone `WMAA`
+  0x2C/0x2D, fan RPM / CPU+GPU temperature / fan full speed via Other
+  Method `WMAE`, fan table via Fan Method `WMAB` 5/6 with the same
+  `F9F0..F9F9` + `LECR(0xD0,1,1,2)` semantics; `FAN_SPEED_UNIT_LEVEL`,
+  one table for all fans, temperature axis fixed by the EC, static 1..10
+  placeholder in extreme mode (ODV1 == 4; read the table in another
+  mode). Unlike R3CN/T2CN the QNCN write path ignores the payload mode
+  byte, so no mode-byte quirk is needed. `LENOVO_FAN_TABLE_DATA` (WQA3)
+  maps level 1..10 to 1800..4600 RPM, or to 1800..5400 RPM when the
+  BIOS byte GSKU is 0x08 (fan 1 sensors 0x01/0x04, fan 2 sensor 0x05,
+  modes 1/2/3/0xE0/0xFF). The 83LY reports the 4600 RPM ladder in
+  `fan1_level_rpm_table`/`fan2_level_rpm_table`.
+- The keyboard backlight and the Y-logo light are driven by the
+  KBBACKLIGHT WMI methods (`WMAF` get(1)/set(2), light ids 0x00/0x03).
+  No IO-port light id exists on this firmware, so `skip_ioport_light`
+  is set.
+- `fan_fullspeed` (WMAE `0x04020000` -> EC `FNST`, bit 0 of 0xC58B)
+  needs custom power mode. In any other mode the write returns `EBUSY`.
+  On the 83LY, setting it took both fans from 2300 to 4700-4800 RPM
+  within 3 s, and clearing it let them ramp back down to the table
+  level. On this generation a full-speed write through the wrong WMI
+  method (old fallback config) once wedged the fans at maximum speed
+  until reboot on the 83LT.
+- Rapid charge and battery conservation use `VPC0.GBMD`/`SBMC` at
+  `\_SB.PC00.LPCB.EC0`; instant boot (power on AC / USB-PD) uses WMAE
+  `0x03010001`/`0x03010002` (EC `EACS`/`ETCS` via `WSMI` 7/8, 9/0xA).
+- `minifancurve`, `lockfancontroller` and `fan_maxspeed` (WMAB ids 3/4
+  are not implemented) are hidden. `fan1_target`/`fan2_target` are
+  hidden too (`skip_fan_target`): the firmware has no fan target byte,
+  and the v0 offsets read 9600 and 0 RPM.
+- The driver reads the EC through port I/O at EC 0xC400 and up, using
+  `ec_register_offsets_qncn`. The ERAX window at 0xFE0B0400 (len 0xFF;
+  `F9FT`/`ECB2` at +0x100/+0x200) is the same memory: the `ecmemory`
+  and `ecmemoryram` dumps match except for bytes that change between
+  the two reads. `FANS` 0xC406 and `FA2S` 0xC403 count in units of
+  100 RPM, `CPUT` 0xC4B0 and `GPUT` 0xC4B4 hold degrees Celsius, and
+  `SPMO` is bits 0-3 of 0xC420 (0 balanced, 1 performance, 2 quiet,
+  3 custom, 4 extreme). The v0 offsets hit other variables, so the old
+  RAM address was not what broke the EC columns. 0xC5E0..0xC5E3 hold the
+  custom-mode CPU power limits: 0x467D is PL1 70 W and PL2 125 W, the
+  "18045 RPM" in older dumps.
+- The GameZone WMI block is left to `lenovo-wmi-gamezone`
+  (`leave_gamezone_wmi_unbound`, as on Q7CN). While LLL held it,
+  `/sys/class/platform-profile` was empty and the `lenovo-wmi-other`
+  `ppt_pl1_spl`/`ppt_pl2_sppt` reads returned `EINVAL`. With the block
+  unbound, both work whichever module loads first, and `powermode` and
+  the native platform profile follow each other in both directions.
+
+Hardware validation on an 83LY (QNCN38WW, on AC, issue #491):
+
+- The fan table is one shared buffer. Quiet, balanced, performance and
+  custom read the same ten bytes, and extreme reads the 1..10
+  placeholder. After a cold boot it reads all zeros until custom mode
+  is entered, which seeds 1,2,3,4,5,6,7,8,8,8. The
+  1,2,3,4,5,6,7,9,10,10 readback earlier in the issue was taken in
+  performance mode.
+- The EC applies the table only in custom mode. All points at level 10
+  took both fans to 4600 RPM and all points at level 1 to 1800 RPM, the
+  two ends of `fan1_level_rpm_table`. A table written in balanced mode
+  reads back, but the fans keep following the balanced curve until
+  custom mode is entered. The EC ramps about 70 RPM/s up and 25 RPM/s
+  down.
+- The driver keeps points 9 and 10 at level 3 and level 5 or higher and
+  rejects level 0 with `EOPNOTSUPP`. The firmware does no range check
+  of its own.
+- Temperature axis: with the table set to 1..10 and the CPU loaded in
+  steps, the settled level was never below the level the WQA3 CPU row
+  gives for the CPU temperature (sensor 0x04, `CPUT`: 46 49 53 58 64 69
+  72 78 83 87 C), and it was above that level only while cooling down.
+  A 1 s spike to 95 C did not raise the level, so the EC filters the
+  temperature and has some downward hysteresis. No byte in the three EC
+  windows tracks the active point.
+- Rapid charge, battery conservation and both instant boot switches
+  read back what was written. Conservation also shows in
+  `ideapad_laptop`'s `conservation_mode` and as `Long_Life` in
+  `BAT0/charge_types`, and rapid charge shows as `Fast`. Turning rapid
+  charge on clears conservation.
+- The keyboard backlight (0..2) and Y-logo (0..1) LEDs read back each
+  written level.
+- Not tested yet: suspend/resume, and whether a custom table survives a
+  reboot.
+
+Verify locally with `sudo dmesg | grep -i legion` (no "not in
+allowlist", EC id 0x5508), `sensors`, and `sudo cat
+/sys/kernel/debug/legion/fancurve` (`u` = 5, speed1 in 1..10; the EC
+columns match the WMI3 ones).
+
+## Legion R9000P AFR10 (83F6, RECN)
+
+BIOS RECN20WW, EC 0x5508, AMD Ryzen 9 9900HX (Fire Range) + RTX 5060
+(issue #405). DMI entry `RECN` product-qualified to `83F6`; config
+`model_recn_83f6` in `kernel_module/legion-laptop.c` (the header
+comment cites the firmware evidence from the reporter's decompiled
+RECN20WW DSDT).
+
+Same WMI-only 0x5508 layout as the 83F2 (model_recn) and the Fire
+Range twin SMCN (83RU):
+
+- Everything goes through WMI: power mode via GameZone `WMAA`
+  0x2C/0x2D/0x37 (incl. custom 0xFF and extreme 0xE0, AC only), fan
+  RPM / CPU+GPU temperature / fan full speed via Other Method `WMAE`
+  Get(0x11)/Set(0x12), fan table via Fan Method `WMAB` 5/6 with the
+  usual `F9F0..F9F9` + `LECR(0xD0,1,1,2)` semantics;
+  `FAN_SPEED_UNIT_LEVEL`, one shared table, temperature axis fixed by
+  the EC, static 1..10 placeholder in extreme mode (ODV1 == 4). The
+  write path ignores the payload mode byte (unlike R3CN/T2CN), so no
+  mode-byte quirk is needed. `LENOVO_FAN_TABLE_DATA` (WQA3) maps level
+  1..10 to 1700..5100 RPM (fan 1 sensors 0x01/0x04, fan 2 sensor 0x05,
+  modes 1/2/3/0xFF/0xE0), so
+  `fan1_level_rpm_table`/`fan2_level_rpm_table` are available.
+- WMAE `0x04030004` returns EC `FASF * 100` (the small third fan,
+  hwmon `fan3`; its ladder is not exposed in WQA3).
+- The white keyboard backlight (light id 0x00, levels 1-3) and the
+  Y-logo light (id 0x03) are driven by the KBBACKLIGHT WMI methods
+  (`WMAF` get(1)/set(2)); Fn+Space and Fn+L are confirmed working on
+  the unit. No IO-port light id exists on this firmware
+  (`skip_ioport_light`).
+- `fan_fullspeed` (WMAE `0x04020000` -> EC `FNST`, set and clear) is
+  exposed; the DSDT write path is not gated on the power mode. On this
+  EC generation a full-speed write through the wrong WMI method once
+  wedged the fans at maximum speed until reboot (83LT), so validate
+  with care and be ready to reboot.
+- Rapid charge and battery conservation use `VPC0.GBMD`/`SBMC` at
+  `\_SB.PCI0.LPC0.EC0`; instant boot (power on AC / USB-PD) uses WMAE
+  `0x03010001`/`0x03010002` (EC `EACS`/`ETCS` via `WSMI` 7/8, 9/0xA).
+- `minifancurve`, `lockfancontroller` and `fan_maxspeed` (WMAB ids 3/4
+  are not implemented) are hidden; the EC RAM window (`ERAX
+  @0xFEEC2400`, len 0xFF; `F9FT`/`ECB2` at +0x100/+0x200, the same
+  window as SMCN) is only used for the read-only `ecmemoryram`
+  debugfs dump. WMAE `0x05010000` is the CPU socket temp (`CPUS`), so
+  the IC temp attribute is hidden (`skip_ic_temp`).
+
+Validation status: config derived from the reporter's RECN20WW DSDT
+analysis in issue #405; EC chip id 0x5508 was read on the unit during
+an earlier force-load. A custom-mode Fan_Set_Table write round trip is
+still pending on hardware - test with one small upward level change,
+then read back and restore the original table and mode, and report the
+result in issue #405. Verify locally with `sudo dmesg | grep -i
+legion` (no "not in allowlist", EC id 0x5508), `sensors`
+(`legion_hwmon` fan1/fan2/fan3 and CPU/GPU temps), and `sudo cat
+/sys/kernel/debug/legion/fancurve` (`u` = 5, speed1 in 1..10).
+
+## Legion 5 15AKP10 (83F1, RYCN)
+
+BIOS RYCN27WW/RYCN28WW, EC 0x5508, AMD (issue #416). DMI entry `RYCN`
+product-qualified to `83F1`; config `model_rycn` in
+`kernel_module/legion-laptop.c` (the header comment cites the firmware
+evidence from the RYCN28WW DSDT attached to the issue).
+
+Same WMI-only 0x5508 layout as the R9000P AFR10 (83F6, RECN), without
+the third fan:
+
+- Everything goes through WMI: power mode via GameZone `WMAA`
+  0x2C/0x2D (incl. custom 0xFF and extreme 0xE0, AC only), fan RPM /
+  CPU+GPU temperature / fan full speed via Other Method `WMAE`
+  Get(0x11)/Set(0x12), fan table via Fan Method `WMAB` 5/6 with the
+  usual `F9F0..F9F9` + `LECR(0xD0,1,1,2)` semantics;
+  `FAN_SPEED_UNIT_LEVEL`, one shared table, temperature axis fixed by
+  the EC, static 1..10 placeholder in extreme mode (ODV1 == 4). The
+  write path ignores the payload mode byte, so no mode-byte quirk is
+  needed. `LENOVO_FAN_TABLE_DATA` (WQA3) maps level 1..10 to
+  1800..5400 RPM (SKU 0x2A) or 1800..4600 RPM (other SKUs), fan 1
+  sensors 0x01/0x04, fan 2 sensor 0x05, so
+  `fan1_level_rpm_table`/`fan2_level_rpm_table` are available.
+- Only two fans: WQA3 has no fan 4 rows and the in-tree
+  `lenovo_wmi_other` driver shows only fan1/fan2 on the unit.
+- The keyboard backlight (light id 0x00, levels 1-3) and the Y-logo
+  light (id 0x03) are driven by the KBBACKLIGHT WMI methods (`WMAF`
+  get(1)/set(2)); no IO-port light id exists (`skip_ioport_light`).
+- `fan_fullspeed` (WMAE `0x04020000` -> EC `FNST`) is only accepted in
+  custom power mode, as on the other 0x5508 models.
+- Rapid charge and battery conservation use `VPC0.GBMD`/`SBMC` at
+  `\_SB.PCI0.LPC0.EC0`; instant boot uses WMAE
+  `0x03010001`/`0x03010002` and flip to start `0x00030000`.
+- `minifancurve`, `lockfancontroller`, `fan_maxspeed` and the IC temp
+  attribute are hidden; the EC RAM window (`ERAX @0xFEEC2400`) is only
+  used for the read-only `ecmemoryram` debugfs dump. The wrong RPM
+  values seen with `force=1` (GKCN fallback) came from reading EC
+  registers directly, which this config no longer does.
+
+Validation status: config derived from the RYCN28WW DSDT; EC chip id
+0x5508 was read on a RYCN27WW unit during a force-load. A custom-mode
+Fan_Set_Table write round trip is still pending on hardware - test
+with one small upward level change, then read back and restore the
+original table and mode, and report the result in issue #416. Verify
+locally with `sudo dmesg | grep -i legion` (no "not in allowlist", EC
+id 0x5508), `sensors` (`legion_hwmon` fan1/fan2 and CPU/GPU temps,
+matching `lenovo_wmi_other`), and `sudo cat
+/sys/kernel/debug/legion/fancurve` (`u` = 5, speed1 in 1..10).
+
+## Legion 7 16IRX9 (83FD, NSCN)
+
+BIOS NSCN37WW, EC 0x5507, Intel Core i9-14900HX + RTX 4070 (issue #617).
+DMI entry `NSCN 83FD` is qualified on product name `83FD` and precedes the
+generic `NSCN` entry; config `model_nscn_83fd` in
+`kernel_module/legion-laptop.c`. The fan methods live in SSDT4 ("CB-01")
+of the dump attached in issue #617 (DSDT SHA-256
+`eb58e64104373288b6f80f736e5377c2b557bcbd2cb88af4fd63450f6e9aa19f`).
+
+- Fan Method `WMAB` implements only 5/6 (`GFAN`/`SFAN`): ten shared fan
+  **levels** in EC `F101..F10A`, the same transport as the T2CN below.
+  `SFAN` selects the FNT0 RPM row from the payload mode byte, so the
+  driver sends the live thermal mode (`GetThermalMode`, GZ44) and uses
+  the same mode for the RPM calibration; writes are rejected in extreme
+  mode, where `WMAB` 6 discards them. `GFAN` returns a static 1..10
+  placeholder in extreme mode.
+- `LENOVO_FAN_TABLE_DATA` (`WQA7` -> `SFTW`) exports the per-level RPM
+  ladders; level 1 is 0 RPM and keeps its index.
+- `WMAB` 1..4 are missing, so `fan_maxspeed` is hidden and
+  `fan_fullspeed` uses Other Method `WMAE` (DEV 4 FEA 2 -> EC `FFON`),
+  gated behind custom power mode. Fan RPM and CPU/GPU temperature also
+  come from `WMAE`; the IC temperature is a constant 0 and is hidden.
+- `minifancurve` and `lockfancontroller` are hidden (no backing EC
+  register on this firmware). The RGB keyboard stays on USB, as before.
+- `platform_profile` comes from the mainline `lenovo-wmi-gamezone`
+  driver: LLL leaves the GameZone WMI block unbound
+  (`leave_gamezone_wmi_unbound`), because both drivers alias its GUID
+  and udev autoload races, which can cost `platform_profile` on boot
+  (issue #625). GameZone methods are still called by GUID, so the LLL
+  fan curve keeps working. On this firmware
+  `/sys/firmware/acpi/platform_profile` rejects `custom` (EINVAL);
+  select custom mode through the platform-profile class device.
+
+Validation status: config derived from the firmware dump (issue #617);
+fan curve writes verified on a second unit with BIOS NSCN41WW (issue
+#625): levels 6/8 reach the expected RPMs within ~25 s and the
+restored table matches the saved copy. `Fan curve current point id`
+always reads 0 on this firmware, even while the fans run a written
+level, so test with multi-point changes. After leaving and re-entering
+custom mode the EC still reads back the written table but runs its own
+mode default until the table is written again: rewrite the table on
+custom-mode entry. Verify with `sudo dmesg | grep -i legion` (config
+`NSCN 83FD`) and `sudo cat /sys/kernel/debug/legion/fancurve`. To test
+writes: on AC, select custom mode, back up the curve, apply one small
+change, compare the level/RPM readback and `sensors`, then restore the
+backup. Do not write in extreme mode.
+
+## Legion Pro 5 16IRX9 (83DF, N0CN)
+
+BIOS N0CN32WW / N0CN35WW ([#497](https://github.com/johnfanv2/LenovoLegionLinux/issues/497)),
+EC 0x5507 (fw 2a4, read on both units), Intel Core i7-14700HX / i9-14900HX +
+NVIDIA RTX 4070. DMI entry `N0CN` is qualified on product name `83DF` and
+points to `model_n0cn` in `kernel_module/legion-laptop.c` (replacing the
+earlier `model_g8cn` mapping). Facts below come from the 83DF DSDT attached in
+issue #497 (`dsdt.dat` SHA-256
+`f7c43f2ae53206432ab2a5322587aa734edd65e3b1ae3a5cdf08c2af83e4d8d1`),
+cross-checked against the N0CN32WW and N0CN35WW runtime dumps:
+
+- Fan Method `\_SB.GZFD.WMAB` (L43424–43508) implements only
+  `Fan_Get_Table(5)` and `Fan_Set_Table(6)`: ten shared fan **levels** 1..10 in
+  EC `F9F0..F9F9` (`F9FT` @`0xFE0B05C0 + 0x30`, L28033/28063), committed via
+  `NCMD(0x8C, 0)` (L43502) with no range check and ignoring the `FSTM` mode
+  byte; `Fan_Get_Table` returns a static `1..10` placeholder while `EXMF == 1`
+  (extreme mode). The factory custom-mode table read on N0CN35WW is
+  `1,2,3,4,5,6,7,8,8,8` (all zeros before custom mode is initialized on
+  N0CN32WW). Earlier `model_g8cn` mapped those level bytes as
+  `FAN_SPEED_UNIT_PERCENT` (`pwm = 2..20`), and because points 7..10 cap at
+  level 8 (3400/3500 RPM at 80/65 °C, 3700 RPM max), custom mode stayed around
+  3400–3500 RPM under load unless raised to levels 9–10. Because `F9F0..F9F9` +
+  `NCMD(0x8C)` is the same EC 0x5507 transport where percent bytes caused a
+  hard power-off on `model_lpcn` and persisted in EC RAM on `model_m0cn`, fan
+  curve writes stay gated behind `fancurve_write_unvalidated`
+  (`allow_unvalidated_fancurve=1`) until a level write is confirmed on 83DF.
+- `LENOVO_FAN_TABLE_DATA` (`WQA3`, L35785–36026, 15 rows across modes
+  `1/2/3/0xFF/0xE0`) exports static 10-level ladders ending at 5400 RPM:
+  `1700, 1900, 2100, 2300, 2500, 2900, 3400, 3700, 4400, 5400` RPM on fan 1
+  (sensor `0x01`, and CPU sensor `0x04` at `67..91 °C`) and
+  `1700, 1900, 2100, 2200, 2700, 2900, 3500, 3700, 4600, 5400` RPM on fan 2
+  (GPU sensor `0x05` at `53..85 °C`), matching the 3400/3500 RPM (level 7) and
+  4400–4600 RPM (level 9 in performance mode) measured on N0CN35WW.
+- `WMAB` ids 1..4 do not exist, so `fan_maxspeed` is hidden and `fan_fullspeed`
+  uses Other Method `WMAE` `0x04020000` -> EC `FNST` (L43616 get / L44193 set,
+  `WQA9[0x0C]` flags `0x7`), gated behind custom power mode. Fan RPM
+  (`0x04030001`/`2` -> `FANS`/`FA2S * 100`, L43628/43638) and CPU/GPU
+  temperatures (`0x05040000`/`0x05050000` -> `CPUT`/`GPUT`, L43679/43691) also
+  use `WMAE`; `0x05010000` reads `CPUS` (CPU socket temperature, L43667), not a
+  labeled IC sensor, so hwmon `temp3` is hidden (`skip_ic_temp`).
+- EC host window `ERAX` @`0xFE0B0400` (`EC 0xC400`, L28091) maps `FANS`
+  @`0xC406`, `FA2S` @`0xC4FE` (100 RPM units), `SPMO` @`0xC420` bits 0..3,
+  `CPUT` @`0xC4B0` and `GPUT` @`0xC4B4` (`ec_register_offsets_n0cn`). The `v0`
+  fan RPM offsets `0xC5E0..0xC5E3` hit `F9FT + 0x20..0x23` (`F5E0`, `CCP1`,
+  `F5E2`, `CCP2` CPU PL2/PL1/temp/cross-load limits, producing the bogus
+  `18039`/`14177` EC RPM in #497), while `v0` `0xC536` (`minifancurve`) and
+  `0xC4AB` (`lockfancontroller`) are unmapped and hidden.
+- `VPC0` (`_HID "VPC2004"`, `_VPC = 0x7C0DF516`) lives at
+  `\_SB.PC00.LPCB.EC0.VPC0` (`_STA` L29469, `_CFG` L29474, `GBMD` L29636,
+  `SBMC` L29857, `HALS`/`SALS` L29524/29561), resolving the `-5` (`AE_NOT_FOUND`)
+  `_CFG` and missing `rapidcharge` errors under the `v0` `PCI0.LPC0` paths.
+- `WMAC` (`14afd777-...`, L43510) is an empty `{}` stub and the legacy GPU
+  Method GUID (`da7547f1-...`) is absent from `_WDG` (L31922), so BIOS WMI
+  `cpu_oc`/`gpu_oc` do not exist on this model (`skip_oc_controls`; use NVIDIA
+  NVML / `nvidia-settings` for GPU clock offsets). CPU/GPU power limits use
+  `WMAE` (`ACCESS_METHOD_WMI3`), and LLL leaves the GameZone WMI block to
+  `lenovo-wmi-gamezone` (`leave_gamezone_wmi_unbound`) so `platform_profile`
+  and `lenovo-wmi-other` firmware-attributes coexist cleanly.
+- Camera privacy is a physical side e-Shutter switch (`WMAE 0x03030000` is
+  read-only `0x3` in `WQA9[0x0A]`, with no set handler); `ideapad_laptop`'s
+  `camera_power` attribute (exposed via `_VPC` bit 29) cannot toggle it in
+  software.
+- KBBACKLIGHT `WMAF` (L44759) drives white-backlight SKUs (`KBLT == 0`, id
+  `0x00`, levels 1..3) and the Y-logo light (id `0x03`, `NCMD(0x8D, 2/3)`);
+  4-zone RGB SKUs (`KBLT == 1`, USB HID) return `0` for id `0x00` and skip LED
+  registration cleanly, while IO-port light id `0x02` is absent
+  (`skip_ioport_light`). Flip to start (`0x00030000` `FLBT`) and instant boot
+  (`0x03010001`/`2` `EACS`/`ETCS`) are implemented in `WMAE` and exposed.
+
+Validation status: WMI power mode, `platform_profile`, and WMI3 fan RPM and
+CPU/GPU temperatures are confirmed on N0CN32WW/N0CN35WW hardware; WMI3 level
+table calibration, `fan_fullspeed`, `VPC0` rapid charge / conservation / Fn
+lock, flip to start and instant boot are DSDT-validated. Verify read-only first
+with `sudo dmesg | grep -i legion` (`Using configuration for system: N0CN`),
+`cat /sys/devices/platform/legion/fancurve_speed_unit` (`level`),
+`cat /sys/devices/platform/legion/fan1_level_rpm_table`, `sensors` (`fan1_max`
+/ `fan2_max` = `5400`), and `sudo cat /sys/kernel/debug/legion/fancurve` (`ACPI
+CFG error: 0`, `ACPI rapidcharge error: 0`, matching EC and WMI3 readings). To
+test level writes on AC in custom mode, reload with
+`sudo modprobe legion_laptop allow_unvalidated_fancurve=1`, raise points 8–10
+from level 8 to level 9 or 10, check `sensors` and readback, and report the
+result in [#497](https://github.com/johnfanv2/LenovoLegionLinux/issues/497).
+
+## Legion 5 15AHP11 (83Q7, T2CN)
+
+The firmware attached in [#504](https://github.com/johnfanv2/LenovoLegionLinux/issues/504#issuecomment-5377414566)
+contains 35 ACPI tables. The DSDT SHA-256 is
+`d88fb1646a86f40c6b7bfb92a7071f598b8e1cf1e1c36d16ab46b48678fac8e1`.
+Its `WMAB` 5/6 call `GFAN`/`SFAN`: ten shared **levels**, not percentages.
+`SFAN` reads the requested power mode from the first byte, selects an FNT0/FNT1
+ladder and uses `FNT[level + 2]` for RPM. Mode zero leaves that local unset;
+the driver now sends a freshly read valid mode, and refuses a failed mode read
+rather than guessing. Both calibration and the write payload use live
+`GetThermalMode` (0x37 / `thermalmode`), not `GetSmartFanMode` (0x2D /
+`powermode`), which reads a saved request that may differ from GZ44.
+Extreme mode (`GZ44 == 7`) silently discards writes in
+firmware, so curve writes/default resets now return an error in that mode.
+
+`WQA7`/`SFTW` publishes `FNT[3..12]` as the RPM ladder through the usual WMI
+GUID: entry 1 can be **0 RPM** and must remain at index 1. Dropping it made all
+subsequent RPM conversions off by one, potentially selecting a lower speed than
+requested. Keep zero and repeated RPM entries in their original positions;
+reject descending, empty, oversized or all-zero tables. Calibration is read
+from firmware, not hardcoded in Python. The `_STA`/`_CFG` paths also use the
+DSDT's actual `PCI0.LPC0.EC0.VPC0` namespace, not `PC00.LPCB`.
+
+This corrects the existing WMI curve transport; it does not enable direct EC
+curve access or claim new hardware validation. Monitoring/powermode and reads
+have reporter evidence in #504; the corrected write path still needs a careful
+on-device round trip. On AC, select custom mode, save the original curve, apply
+one small conservative change, compare the level/RPM readback and `sensors`,
+and restore the backup. Do not write while in extreme mode or change power mode
+partway through Apply to HW.
+
+## LOQ 15AHP10 (83JG, R8CN)
+
+BIOS R8CN23WW ([#384](https://github.com/johnfanv2/LenovoLegionLinux/issues/384))
+/ R8CN25WW ([#650](https://github.com/johnfanv2/LenovoLegionLinux/issues/650)),
+EC 0x5508 (fw 2b0, read on both units), AMD Ryzen 7 250 + NVIDIA RTX 5050. DMI
+entry `R8CN` is qualified on product name `83JG`; config `model_r8cn` in
+`kernel_module/legion-laptop.c`. The firmware dump attached in issue #650
+contains 51 ACPI tables; the DSDT SHA-256 is
+`9444592a9087204990128bfb3594a5d7983b51c83de7c1eaced98ffcdc6d72e4`.
+
+Same AMD platform and `\_SB.GZFD` firmware layout as the Legion 5 15AHP11
+(83Q7, T2CN) above, on EC 0x5508 instead of 0x5509:
+
+- Fan Method `WMAB` implements only 5/6 (`GFAN`/`SFAN`): ten shared fan
+  **levels** 1..10 in EC `F101..F10A` (`EFAN` @`0xFEEC2F00 + 0xE0`), replacing
+  the unvalidated `ec_register_offsets_loq_v1` EC3 path (#650). `SFAN` selects
+  an `FNT0`/`FNT1` ladder from the first payload byte (`F000`, modes
+  `1/2/3/0xFF/0xE0`; mode 0 leaves the row local unset), writes
+  `CRP/GRP/ERP = FNT[level + 2] / 100` plus the `FI00..FI09` temperature rows
+  into `EFAN`, and sets `CMRD = 1`. `WMAB` 6 drops writes while `GZ44 == 0x07`
+  (extreme mode), and `GFAN` returns a static 1..10 placeholder there. Both
+  the SFAN payload byte and the RPM calibration therefore use live
+  `GetThermalMode` (`0x37`, EC `GZ44`) rather than saved `GetSmartFanMode`
+  (`0x2D`, CMOS `RXMS(0x76)`), and writes/default resets are rejected in
+  extreme mode (`wmi_sfan_uses_thermal_mode`).
+- `LENOVO_FAN_TABLE_DATA` (`WQA7` -> `SFTW`, 15 rows) exports `FNT0`/`FNT1`
+  verbatim: level 1 is `0 RPM` (preserved at index 1), rising to 4500/4600 RPM
+  on `FNT1` or 5500/5700 RPM on `FNT0` for fan 1 / fan 2.
+- Power mode via GameZone `WMAA` `0x2C`/`0x2D` and `0x37` (quiet, balanced,
+  performance, custom `0xFF`, extreme `0xE0`); fan RPM (`0x04030001`/`2` ->
+  `FA1S`/`FA2S * 100`), CPU/GPU temperatures (`0x05040000`/`0x05050000` ->
+  `CTML`/`SKTC`) and `fan_fullspeed` (`0x04020000` -> EC `FFON`, gated behind
+  custom power mode) go through Other Method `WMAE`. Feature `0x05010000`
+  (IC temperature) returns constant 0 and `WMAB` 1..4 are absent, so hwmon
+  `temp3` and `fan_maxspeed` are hidden; `WMAC`/`WMAD` are `Return (Zero)`
+  stubs and PL/OC controls stay hidden (`skip_oc_controls`) until validated.
+- White keyboard backlight (levels 1..3, EC `KLEN`) is driven via KBBACKLIGHT
+  `WMAF` (`GLT1`/`SLT2` case 0; LED driver init confirmed in #650 `dmesg`).
+  Light id `0x03` (Y-logo) is absent (`WMI returned 0 for unsupported
+  light_id=3` in #650) and id `0x05` (IO-port) is an empty case, so both light
+  attributes are skipped.
+- `VPC0` lives at `\_SB.PCI0.LPC0.EC0.VPC0` (`_STA`, `_CFG`, and `GBMD`/`SBMC`
+  with rapid-charge bit `0x04` and conservation bit `0x20`), fixing the Intel
+  `PC00.LPCB` paths that returned `-5` in #650; read-only `debugfs`
+  `ecmemoryram` maps `EFAN` at `0xFEEC2F00` instead of `0xFE0B0F00`.
+  `minifancurve` and `lockfancontroller` have no mapped registers on this
+  firmware (`EC minifancurve on cool: error` in #384/#650) and are hidden.
+
+Validation status: WMI power mode, `platform_profile`, WMI3 fan RPM (1600/1700
+RPM) and CPU/GPU temperatures (36/38 C in #384, 40/41 C in #650), and keyboard
+backlight LED init are confirmed on hardware; WMI3 fan-curve reads/writes and
+`GBMD`/`SBMC` rapid charge / battery conservation are DSDT-validated and need
+an on-device round trip. Verify with `sudo dmesg | grep -i legion` (config
+`R8CN`, no `light_id=3` error), `sensors`, and
+`sudo cat /sys/kernel/debug/legion/fancurve` (`ACPI CFG error: 0`,
+`ACPI rapidcharge error: 0`, WMI fan curve populated with `u` = 5 and levels
+1..10). To test curve writes: on AC, switch to custom mode, back up the curve,
+apply one small conservative change, check the level/RPM readback and
+`sensors`, and restore the backup; do not write in extreme mode.
+
+## LOQ 15APH8 (82XT, LYCN)
+
+BIOS LYCN50WW, EC 0x8227 (fw 2a4, read on the unit), AMD Ryzen 7 7840HS +
+RTX 4050 (issue #602). DMI entry `LOQ 15APH8 (82XT) - EC 0x8227` is qualified
+on product name `82XT` and BIOS prefix `LYCN` and reuses `model_m3cn_8227`
+from the Legion R7000P APH8 (82Y9, M3CN) in `kernel_module/legion-laptop.c`:
+same AMD Phoenix platform, same EC 0x8227, and the reporter's force-loaded
+debugfs dump shows the same signature — EC-direct temperature/fan reads
+return 0 while WMI3 returns correct live values (CPU 38 C, GPU 42 C, fan1
+1400 RPM) and the EC fan curve table is fully populated.
+
+- Fan Method `WMAB` implements 5/6 (`GFAN`/`SFAN`): a 10-entry fan table
+  (`CFST[0..9]`, EC fields `F101..F10A` on `\_SB.PCI0.LPC0.EC0`). As on
+  82Y9 the speeds are fan **levels** (`FAN_SPEED_UNIT_LEVEL`) and only the
+  speed attributes are exposed (`wmi_fancurve_speed_only`).
+- `WMAD` is a static `Return (Zero)` stub on this firmware; capability
+  probing does not depend on it.
+- Fan RPM and CPU/GPU temperature come from WMI3; `fan_fullspeed` is gated
+  behind custom power mode. The extreme platform-profile choice stays
+  hidden, as on 82Y9.
+
+Validation status: config matched from the reporter's runtime evidence in
+issue #602 (EC id, WMI3 reads, populated curve); fan table **writes** are
+not yet validated on this chassis. Verify with `sudo dmesg | grep -i legion`
+(config `LOQ 15APH8 (82XT) - EC 0x8227`) and
+`sudo cat /sys/kernel/debug/legion/fancurve`. To test writes: on AC, select
+custom mode, back up the curve, apply one small change, compare the
+level/RPM readback and `sensors`, then restore the backup.
+
+## Legion Y9000X IAH7 / Slim 7 16IAH7 (82TF, JYCN)
+
+BIOS `JYCN*` (tested on `JYCN34WW` and `JYCN58WW`), EC `0x8227`, Intel 12th Gen
++ NVIDIA RTX 3050 Ti / 3060 (issues [#86](https://github.com/johnfanv2/LenovoLegionLinux/issues/86),
+[#141](https://github.com/johnfanv2/LenovoLegionLinux/issues/141), PR
+[#659](https://github.com/johnfanv2/LenovoLegionLinux/pull/659)). DMI entry
+`JYCN` uses `model_jycn` (earlier versions mapped `JYCN` to `model_v2022`,
+whose v0 EC map left temperatures at 0, fan RPM stuck on unrelated bytes,
+`ecmemoryram` reading `0xFF`, and `minifancurve` failing with `-EIO`).
+
+Facts from the `JYCN34WW` DSDT and runtime EC dumps on `82TF`:
+
+- `OperationRegion (ECF2, SystemMemory, 0xFE0B0400, 0xFF)` maps byte-for-byte
+  to EC `0xC400..0xC4FF`:
+  - Fan 1 / Fan 2 RPM: little-endian `u16` `F1LO`/`F1HI` at `0xC406`/`0xC407`
+    and `F2LO`/`F2HI` at `0xC408`/`0xC409` (also read in `GZFD.WMAC` id 7).
+  - CPU / GPU temperatures: `TSR2` at `0xC418` (`GZFD.WMAD` id `0x0A`) and
+    `TSR3` at `0xC419` (`GZFD.WMAE` id `0x08` and `H_EC.THMC`). No labeled IC
+    sensor exists (`skip_ic_temp`).
+  - The v0 multi-point EC curve (`0xC535`), `minifancurve` (`0xC536`) and
+    `lockfancontroller` (`0xC4AB`, unmapped in `ECF2`) are absent and hidden.
+- `LENOVO_FAN_METHOD` (`GZFD.WMAC`, `92549549-4BDE-4F06-AC04-CE8BF898DBAA`)
+  declares `CreateDWordField (FANT, 0x08, FMS2)` on a 10-byte buffer at method
+  scope, so WMI evaluation aborts with `AE_AML_BUFFER_LIMIT` before reaching
+  `Fan_Set_Table` (id 6) or completing `Fan_Set_FullSpeed` (id 2); id 5
+  (`Fan_Get_Table`) is absent, ids 3/4 are stubs, and `WMB0` (`DC2A8805-…`)
+  implements only legacy ids `1..0x0B` -> `fan_fullspeed` and `fan_maxspeed`
+  are hidden.
+- Custom fan **levels** (`FAN_SPEED_UNIT_LEVEL`, `wmi_fancurve_speed_only`):
+  reads and writes go through the same EC fields `WMAC` id 6 and `H_EC.THMC`
+  use — `F9F0..F9F9` (`0xC4D0..0xC4D9`), `F9FA` (`0xC4DA`, `SFMD` `1..3`;
+  custom `0xFF` maps to balanced `2`), and `CUFT` (`0xC4DF` bit 1) — serialized
+  under `\_SB.PC00.LPCB.H_EC.ECMT`. Writes stay gated behind
+  `allow_unvalidated_fancurve=1` (`fancurve_write_unvalidated`). Custom mode
+  (`0xFF`) in `WMAA` `0x2C` requires AC power (`ACTY() == 1`).
+- `LENOVO_FAN_TABLE_DATA` (`WQA4`, `87FB2A6D-…`) publishes 3 mode-agnostic
+  72-byte `FACT` rows sharing one 10-level RPM ladder (`1700, 2000, 2200, 2500,
+  2900, 3300, 3500, 4100, 4300, 4500` RPM), exposed via `fan1_level_rpm_table`
+  and `fan2_level_rpm_table`.
+- `WMAD`/`WMAE` implement CPU PL1/PL2 (`cpu_longterm_powerlimit`,
+  `cpu_shortterm_powerlimit`) and GPU PPAB/cTGP (`gpu_ppab_powerlimit`,
+  `gpu_ctgp_powerlimit`); unimplemented or incompatible OC/default/peak/APU/
+  GPU-temp-limit/boost-clock nodes are hidden (`skip_unusable_oc_attrs`), as is
+  the unimplemented Y-logo LED (`skip_ylogo_light`).
+
+Verification on real hardware:
+
+```bash
+cd kernel_module && make && sudo make reloadmodule
+sudo dmesg | grep -i legion
+sensors   # legion_hwmon CPU/GPU temps and fan1/fan2 RPM
+sudo cat /sys/kernel/debug/legion/fancurve
+# Optional level-write test (on AC, custom power mode 255, watch temperatures):
+#   sudo modprobe legion_laptop allow_unvalidated_fancurve=1
+```
+
+## Legion Y530-15ICH (81FV, 8JCN)
+
+BIOS 8JCN56WW, EC 0x8226 (fw 1a2 per issue #16), Intel 8th gen + NVIDIA.
+DMI entry `8JCN` uses `model_8jcn`. The 2018 GameZone firmware is much
+smaller than on later Legions: `\_SB.GZFD.WMAA` implements methods 0x01 to
+0x25 only, so smart fan mode (0x2C/0x2D), the FAN_METHOD GUID and the LED
+methods are absent.
+
+- No power modes. `WMAA` 0x2C/0x2D do not exist and Fn+Q does not touch
+  EC RAM 0xC41D (the Y540 power-mode byte); powermode reads 0.
+- Fn+Q toggles "extreme cooling". `WMAA` 0x0D issues `NCMD(0x59, 0x77)`
+  (on) or `NCMD(0x59, 0x76)` (off), the same call as `fan_unlock` on
+  KWCN54WW, and 0x14 returns `FCST & 1` (EC RAM 0xC439). EC dumps across
+  two Fn+Q presses: `FCST` 0 -> 1 -> 0, `FANS` (0xC406, x100 RPM)
+  0x13 -> 0x28 -> 0x00. `fan_unlock` is enabled with
+  `has_fan_unlock_readback`, so reading it returns the live `FCST` bit.
+- Fan RPM via `WMAA` 0x08/0x09 (`FANS`/`FA2S` x 100) works. `WMAA` 0x12/0x13
+  (CPU/GPU temperature) are `Return (Zero)` stubs, so temperatures are read
+  from the EC fields `CPUT` (0xC4B0) and `GPUT` (0xC4B4) through ACPI
+  (`access_method_temperature = ACCESS_METHOD_ACPI`). `GPUT` is 0 while the
+  dGPU is off.
+- `fan_fullspeed` failed with -ENODEV (no FAN_METHOD GUID) and is hidden.
+- Fan curve: the EC keeps the IdeaPad table (`ec_register_offsets_ideapad_v1`,
+  `ACCESS_METHOD_EC2`), not the v0 Legion one, which is why the v0 read
+  returned `fan curve points size: 0` (issue #16). 8 points; per point:
+  - fan speed, 100 RPM units: fan 1 at 0xC5A0, fan 2 at 0xC5A8
+  - CPU step-up / step-down temperature at 0xC550 / 0xC590
+  - GPU step-up / step-down temperature at 0xC5C0 / 0xC5D0
+  - each temperature table repeated 8 bytes later (0xC558, 0xC598, ...)
+
+  Stock table on 8JCN56WW (point 1 is "fans off"):
+
+  | point | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+  |---|---|---|---|---|---|---|---|---|
+  | fan 1 RPM | 0 | 1900 | 2300 | 2400 | 2700 | 3100 | 3500 | 3800 |
+  | fan 2 RPM | 0 | 1600 | 2000 | 2100 | 2400 | 2800 | 3200 | 4000 |
+  | CPU up °C | 50 | 58 | 64 | 70 | 76 | 82 | 88 | 99 |
+  | CPU down °C | 0 | 46 | 54 | 61 | 67 | 73 | 79 | 85 |
+  | GPU up °C | 66 | 66 | 66 | 66 | 66 | 66 | 74 | 99 |
+  | GPU down °C | 0 | 62 | 62 | 62 | 62 | 62 | 62 | 70 |
+
+  With the stock curve the fans start at 50 °C and stop below 46 °C, which is
+  this laptop's idle temperature, so they keep switching on and off. The EC
+  restores its table after a reset, so a custom curve has to be written again
+  after boot and resume.
+- The mini fan curve register reads 0, so `has_minifancurve` is off.
+- EC RAM is mapped at 0xFF00D400 (DSDT: `OperationRegion (ERAX,
+  SystemMemory, 0xFF00D400, 0xFF)`); 0xFE00D400 reads all 0xFF here.
+
+Validation on 81FV / 8JCN56WW, kernel 7.2:
+
+```bash
+L=/sys/bus/platform/drivers/legion/legion
+cat $L/fan_unlock                       # 0
+echo 1 | sudo tee $L/fan_unlock; sleep 10; sensors | grep Fan   # ~3800/4100 RPM
+cat $L/fan_unlock                       # 1
+echo 0 | sudo tee $L/fan_unlock; sleep 10; sensors | grep Fan   # back to auto
+# press Fn+Q, then
+cat $L/fan_unlock                       # 1 (read back from firmware)
+
+H=$(grep -l legion_hwmon /sys/class/hwmon/hwmon*/name | xargs dirname)
+cat $H/temp1_input                      # CPU, e.g. 49000
+cat $H/auto_points_size                 # 8
+cat $H/pwm1_auto_point1_temp            # 50 (stock)
+echo 51 | sudo tee $H/pwm1_auto_point1_temp   # fans now start at 51 °C
+echo 50 | sudo tee $H/pwm1_auto_point1_temp
+```
+
+`/sys/kernel/debug/legion/ecmemoryram` now matches the port-I/O EC dump
+(`ecmemory`) over 0xC400-0xC6FF except for live values.
+
+The platform profile is registered but `powermode` cannot be read on this
+firmware; load the module with `enable_platformprofile=0` until it is gated.
+## Legion 5 15ACH6H (82JU, GKCN65WW)
+
+DMI `LENOVO` / `82JU` / `GKCN65WW` matches the `GKCN` allowlist entry and
+therefore loads `model_v0` (EC id `0x8227`, EC RAM mapped at `0xfe00d400`);
+observed on kernel 7.2.9-1-cachyos with the module built from main.
+
+Verified: a clean probe in `sudo dmesg | grep -i legion` (`is_denied: 0;
+is_allowed: 1`, `Using configuration for system: GKCN`); `legion_hwmon`
+reports CPU/GPU/IC temperatures and both fan RPMs;
+`sudo cat /sys/kernel/debug/legion/fancurve` returns the EC curve (8
+points, RPM unit) together with the EC/ACPI/WMI method comparison;
+`powermode`, `platform_profile` (low-power/balanced/performance/custom),
+rapid charge, battery conservation, minifancurve, lockfancontroller, fan
+fullspeed and the keyboard/Y-Logo/IO-Port LEDs are all present. The three
+power mode views agree: `powermode` 1 (`LEGION_WMI_POWERMODE_LOW_POWER`),
+EC raw `2` (`LEGION_EC_POWERMODE_QUIET`) and `platform_profile`
+`low-power`.
+
+- **Instant Boot is not available here, and it is not just a missing
+  driver flag.** Decompressed ACPI evidence: `0x03010001` and `0x03010002`
+  do not occur in the decompiled DSDT or in any of the 17 SSDTs, and the
+  Other Method block (`dc2a8805-3a8c-41ba-a6f7-092e0089cd3b`, object id
+  `B5` → `Method (WMB5, 3)`) dispatches only method ids 1, 2, 3, 4, 5 and
+  8 — no `GetFeatureValue`/`SetFeatureValue` (17/18), which is what
+  `instant_boot_{ac,usb_pd}` call through `wmi_other_method_{get,set}_value()`.
+  The capability table GUID `7a8f5407-cb67-4d6e-b547-39b3be018154` and the
+  discrete data GUID are absent as well, and there is no `WSMI` method in
+  any table. `EACS` and `ETCS` *do* exist as one-bit EC fields (alongside
+  `SACS`/`STCS`, the same names Q7CN's Instant Boot reads), but no ACPI
+  method references them, so nothing can reach them. `has_instant_boot`
+  must stay unset for `GKCN`.
+- `cpu_temperature_limit`, `cpu_l1_tau` and `gpu_power_target_offset` used
+  to be listed in sysfs while returning `-EINVAL` on every access: their
+  show/store handlers only implement `ACCESS_METHOD_WMI3` and `model_v0`
+  leaves `access_method_powerlimits` at `ACCESS_METHOD_NO_ACCESS`. They
+  are now hidden unless `access_method_powerlimits` is `ACCESS_METHOD_WMI3`
+  (verified: they disappear on GKCN65WW, while `cpu_shortterm_powerlimit`
+  88 W and `cpu_longterm_powerlimit` 70 W, which go through the CPU WMI
+  method, keep working).
+- `gpu_oc` remains visible and still fails: `WMB4` only returns for
+  method id 1 (`GPU_GET_OC_STATUS`) inside the `ECAV` +
+  `Acquire(LFCM)` branch, so on this machine every read logs
+  `legion_laptop: WMI evaluation error for:
+  da7547f1-824d-405f-be79-d9903e29ced7:1` and `cat` reports
+  `Invalid argument`. Unlike `overdrive`, whose query succeeds and answers
+  0, a failing query is not a "not supported" answer, so the attribute is
+  deliberately kept visible.
+
+To reproduce the ACPI evidence: dump
+`/sys/firmware/acpi/tables/{DSDT,SSDT*}` as root, decompile with `iasl -d`,
+then grep for `0x03010001`, `Arg1 == 0x11` and `EACS`.
+
+## Yoga Pro 7 14AHP9 (83E3, NCCN)
+
+BIOS NCCN30WW, EC 0x5571, AMD Ryzen 7 8845HS (Hawk Point) + RTX 3050
+(issue #630). DMI entry `NCCN` is qualified on product name `83E3`;
+config `model_nccn` in `kernel_module/legion-laptop.c` (the header
+comment cites the DSDT lines from the dump attached in issue #630).
+
+This is an ideapad-platform machine (VPC2004/DYTC), not a Legion WMI
+one; the driver deliberately exposes only what the firmware publishes:
+
+- CPU and GPU temperatures only: the EC RAM window `ERAM @0xFEEC2300`
+  (len 0xFF) carries `TCPU` @0x07 and `TGPU` @0x08 (read/written by the
+  firmware's own thermal and GPU code), read through the per-model
+  validated-temp-register path; `SEN1`-`SEN4` exist but are unlabeled,
+  so the IC channel stays hidden. EC port-IO reads work - the unit
+  returns chip id 0x5571 at 0x2000/0x2001.
+- No fan support: the EC RAM publishes no fan RPM and no fan table,
+  and there is no Fan Method WMI block (`WMAB`) and no
+  `LENOVO_FAN_TABLE_DATA` in any ACPI table, so the fan channels, the
+  fan curve and `fan_fullspeed` are hidden (`NO_ACCESS`).
+- No legion platform_profile handler: GZFD `WMAA` implements only ids
+  0x04/0x3F/0x40/0x41/0x42 (no SmartFanMode 0x2C/0x2D) and `WMAE`
+  handles only 0x001C0001/0x001C0002, so `powermode` is `NO_ACCESS`
+  and the driver skips registering its profile handler on this model;
+  power modes keep working through ideapad-laptop (`VPC0` `DYTC`).
+- No light control: the white keyboard backlight is driven through
+  `VPC0`/`WMIU` (LSK20), not the Legion light WMI methods.
+- Rapid charge / battery conservation are not wired up: `VPC0`
+  `GBMD`/`SBMC` use ideapad semantics (`RDER` 0x359-0x35B, `ECCC`
+  commands 0x03-0x08), not the Legion BTSM/QCHO bits; ideapad-laptop
+  owns them.
+
+Validation status: config derived from the DSDT analysis of the dump
+attached in issue #630; runtime validation on the reporter's unit is
+in progress - verify locally with `sudo dmesg | grep -i legion` (no
+"not in allowlist", EC id 0x5571) and `sensors` (legion_hwmon shows
+CPU/GPU temperatures and no fan channels).
+
+## Legion Pro 5 16ARX8 (82WM, LPCN)
+
+BIOS LPCN59WW/LPCN65WW, EC 0x5507, AMD Ryzen 7000HX + RTX 40 (R9000P ARX8 in
+China; issues #71, #140, #234). DMI entry `LPCN`, config `model_lpcn`; the
+Legion 7 Pro 16ARX8H shares the BIOS family.
+
+Fan table unit: **levels**, writes **disabled by default**
+(`fancurve_write_unvalidated`).
+
+- Earlier builds treated the WMI3 table as percent. Only the speed-only layout
+  was ever tested on hardware (PR #563 on LPCN65WW: temperature, fan 2 and
+  accel/decel fields read back 0). The README's "Confirmed on LPCN65WW"
+  referred to that layout, not to the speed unit.
+- The LPCN DSDT posted in #71 (R9000P 2023, `CB-01`) implements
+  `\_SB.GZFD.WMB2` id 6 (`Fan_Set_Table`) as a raw copy of `FSS0..FSS9` into
+  EC RAM `F9F0..F9F9` (`0xFE0B09F0`), with no range check, followed by
+  `NCMD(0x8C)`. Id 5 reads the same bytes back. `WQA3` (`LENOVO_FAN_TABLE_DATA`,
+  15 rows) returns static 10-entry RPM ladders per mode, e.g. 1600, 1800,
+  2100, 2200, 2700, 2900, 3500, 3700, 4600, 5400 RPM, with mode ids
+  1/2/3/0xFF/0xE0. This is the same level table as on `model_kwcn` (Legion
+  Pro 5 16IRX8, the Intel version of this chassis; see
+  [above](#fan-curve-on-legion-zone-v3-firmware-level-indices)).
+- Lenovo Legion Toolkit's `AbstractGodModeController.IsValidFanTableAsync`
+  rejects any table value above 10 on every God Mode generation, and its
+  default table is 1..10.
+- Measured on an 82WM with BIOS LPCN59WW (kernel 7.2.9, module from
+  `dfb9d06`): the factory table read all zeros, and the fans ran about 2100
+  RPM at 52 °C in low-power mode. legiond's quiet-ac preset as percent
+  (`0,15,19,21,23,26,28,35,40,0`) stayed up at idle. Writing pwm 128 to point
+  1 (byte 50) in low-power mode hard-powered-off the laptop about 6 s later,
+  with no shutdown sequence. Changing the platform profile does not reset the
+  table.
+
+- The LPCN59WW DSDT on that unit has the identical `WMB2` 5/6 handlers.
+  Entering `max-power` (0xE0) on AC also issues `NCMD(0x8C)`, the same EC
+  command that commits the fan table. That would explain the instant
+  power-off in max-power on LPCN65WW (see [Known Issues](known-issues.md)) if percent bytes were
+  already in the table. This is a hypothesis; `max-power` stays hidden.
+- Validated on the same 82WM/LPCN59WW through this driver (2026-10-12, AC,
+  never max-power). Loaded with `allow_unvalidated_fancurve=1`, writing pwm
+  26 to point 1 sent `1,10,10,..,10` (stale bytes 15..40 clamped). Then the
+  default ladder `1..10` was written; the debugfs readback matched, and the
+  laptop stayed up. In low-power mode the fans stayed at the firmware's 2100
+  RPM. In custom mode (`powermode` 255) at 51 °C they settled at 1900 / 1800
+  RPM, which is exactly level 2 of the fan 1 / fan 2 ladders (`1700 1900 ..`,
+  `1600 1800 ..`); a percent table would have meant 2 %. A 60 s CPU load
+  only reached 53 °C in custom mode, so higher points were not exercised.
+
+- The table can only be raised above the firmware default, never lowered.
+  `WQA3` reports `SOUA`/`EOUA` (start/end of the only-upward-adjust range) as
+  0/10, and the EC enforces it in custom mode. Entering custom mode seeds
+  `1,2,..,8,8,8`. Any write that puts a point below `1..10` (single point or
+  whole curve, monotonic or not, 0.6 s apart or not) is replaced by `1..10`
+  within a millisecond. Raising point 1 to level 2 stuck and lifted the fans
+  from 1700/1600 to 1900/1800 RPM. Outside custom mode the bytes are stored,
+  but the fans follow the firmware curve (idle at 46 °C: 1700/1600 RPM in both
+  low-power and custom). So on LPCN a custom curve can only make the fans
+  louder. The quietest setting is `low-power`, which also has the lowest
+  power limits (55/65 W vs 70/85 W in custom); the fans never stop (level 1
+  is 1700/1600 RPM).
+
+The driver therefore uses `FAN_SPEED_UNIT_LEVEL` for `model_lpcn`:
+`fancurve_speed_unit` reads `level`, `fan1/fan2_level_rpm_table` come from
+`WQA3`, and pwm 0..255 maps to levels with the 1,1,1,1,1,1,1,1,3,5 per-point
+minimum. Every send pulls stale bytes into 1..10. `fan1_max` keeps the generic
+10000 (`has_fancurve_defaults` stays off). All fan table writes (hwmon points,
+resume re-apply, default reset) return `EPERM` unless the module is loaded with
+`allow_unvalidated_fancurve=1`. The gate stays on for the whole family,
+because only LPCN59WW has been validated. Owners can set
+`options legion_laptop allow_unvalidated_fancurve=1` in
+`/etc/modprobe.d/legion_laptop.conf` once the read-only checks below match.
+Userspace refuses bytes above 10 if an older module still reports `percent`
+on an `LPCN*` BIOS.
+
+### LPCN verification (owner, on real hardware)
+
+Read-only checks first. They issue only `Fan_Get_Table` and `WQA3` reads:
+
+```bash
+sudo dmesg | grep -i legion     # "Using configuration for system: LPCN", EC 0x5507,
+                                # "fan table data: fan 1 has 10 levels, ..",
+                                # "above level 10 (stale percent write?)" if bytes > 10 remain
+cat /sys/devices/platform/legion/fancurve_speed_unit     # level
+cat /sys/devices/platform/legion/fan1_level_rpm_table    # 10 RPMs for the current mode
+H=$(grep -l legion_hwmon /sys/class/hwmon/hwmon*/name | xargs dirname)
+for i in $(seq 1 10); do cat $H/pwm1_auto_point${i}_pwm; done
+sudo cat /sys/kernel/debug/legion/fancurve   # WMI block: u = 5, speed1 = raw table bytes
+sensors
+```
+
+Check that your BIOS has the same handler. A 0400 file is read, nothing is
+written:
+
+```bash
+sudo cat /sys/firmware/acpi/tables/DSDT > dsdt.dat && iasl -d dsdt.dat
+grep -n -A45 'Method (WMB2' dsdt.dsl   # id 6: FSS0..FSS9 -> F9F0..F9F9, NCMD (0x8C, Zero)
+grep -n -B2 -A25 'Method (SFTW' dsdt.dsl   # level ladders (RPM, then temperatures)
+```
+
+If any point holds a byte above 10, keep the laptop idle and on AC until the
+table is fixed. If the level theory is right, the EC reads such a byte as an
+invalid level as soon as that point's temperature range is reached. Two ways
+to clear it:
+
+1. No write: keep `legiond` disabled (`fan_control=false`), shut down fully,
+   optionally hold the power button for 30 s (EC reset), boot, and repeat
+   the read-only checks. All-zero points mean the EC clears the table on a
+   cold start. Please report either result.
+2. One write (gate opened deliberately): save your work, stay on AC and at
+   idle, keep the `balanced` profile (never `max-power`), and follow
+   `journalctl -kf` in a second terminal:
+
+```bash
+sudo modprobe -r legion_laptop
+sudo modprobe legion_laptop allow_unvalidated_fancurve=1
+H=$(grep -l legion_hwmon /sys/class/hwmon/hwmon*/name | xargs dirname)
+# Lenovo Legion Toolkit's default table, levels 1..10 (pwm = level * 25.5).
+# The first write already clamps every stale byte into 1..10.
+for p in "1 26" "2 51" "3 77" "4 102" "5 128" "6 153" "7 179" "8 204" "9 230" "10 255"; do
+    set -- $p; echo "$2" | sudo tee "$H/pwm1_auto_point${1}_pwm" >/dev/null
+done
+sudo cat /sys/kernel/debug/legion/fancurve   # speed1 must read 1..10
+sensors                                      # fan RPM should follow fan1_level_rpm_table
+```
+
+Then load the CPU and GPU for a few minutes in balanced mode, then in custom
+mode, and compare `fan1_input`/`fan2_input` with the ladder. Please report the
+BIOS version, `sudo dmesg | grep -i legion`, the debugfs dump before and after,
+and `sensors` at idle and under load. A level write that also powers the
+laptop off disproves the level theory; report it and leave the gate closed.
+Do not re-enable legiond's `fan_control` on LPCN until a level write is
+confirmed. Once it is, `fancurve_write_unvalidated` can be dropped from
+`model_lpcn`.
+
+## Fan-curve capability and unit checks
+
+The hwmon curve schema follows the fields the active backend actually writes:
+
+| Backend | Speed controls | Temperature controls | Accel/decel |
+| --- | --- | --- | --- |
+| EC | Both fans | CPU/GPU/IC bounds | Supported |
+| EC2 | Both fans, 8 points | CPU/GPU bounds | Not supported |
+| EC3 | Both fans | CPU/GPU/IC bounds | Not supported |
+| WMI3 | One shared speed table | Not supported | Not supported |
+
+Unsupported fields are absent, not writable zero-valued placeholders. Userspace
+handles partial temperature support per field, including EC2's missing IC fields,
+and distinguishes the active curve length (`auto_points_size`) from the backend's
+maximum editable point count: `auto_points_size` is read-only on fixed-length
+backends (EC2/EC3/WMI3), whereas on EC backends where `auto_points_size` is
+writable (`0644`), all 10 slots remain editable and applying a curve resizes
+`auto_points_size` automatically (rolling back the previous size and clobbered
+points if a sysfs write fails). This does not select new EC layouts or change any
+model's access method. Unmapped minifancurve/controller-lock registers in the
+IdeaPad and LOQ maps are marked unavailable and guarded even in diagnostic reads.
+Native curve reads initialize the whole result and model-specific RPM scale before
+filling EC fields, so stack garbage cannot affect PWM conversion or unused points.
+
+`/sys/devices/platform/legion/fancurve_speed_unit` reports `rpm`, `percent` or
+`level` for the **active** curve; hwmon PWM values still use 0..255 in every case.
+Do not infer the unit from chip ID, WMI availability or default-reset support.
+Percentage backends round scaled RPM requests to a percentage step and encode
+PWM without the old double-floor loss of one percentage point; native RPM
+backends retain their 100-RPM steps. Conversion clamps finite oversized inputs
+before arithmetic, and rejects non-finite speeds or an invalid RPM scale.
+The per-fan `fan*_level_rpm_table` attrs are only exposed for active level curves
+with the firmware data block. Level curves still advertise their unit if the
+firmware cannot provide RPM calibration; this must never trigger linear-RPM
+fallback. Zero-RPM and repeated entries retain their level indices; they are
+not padding. Missing mode-specific data is not replaced by another mode's
+ladder, and a missing fan-2 ladder is not replaced with fan 1's RPMs. A partial
+query failure is retried rather than permanently caching only the other fan.
+
+GUI/CLI read current-mode calibration for each operation instead of caching it at
+startup. A malformed/missing ladder or unrepresentable level causes an explicit
+error, not a fabricated RPM. All requested speeds are calibrated before any curve
+write. A GUI read/calibration error disables Apply to HW without terminating
+monitoring; Read from HW retries and re-enables editing after a successful read.
+Tray preset failures use the same error dialog instead of escaping a Qt callback.
+Update the module and Python package together; older modules lack explicit unit
+metadata. Review the readback after applying and do not switch power mode during
+an apply operation.
+
+The GUI Fan Curve tab also shows a live, table-backed plot. With a native EC
+curve, edit a CPU/GPU speed or upper/lower temperature in the table: the plotted
+points and shaded hysteresis spans must change without writing sysfs. Check
+that the temperature axis has labeled ticks every 5°C (staggered if narrow). Drag a
+filled fan point vertically (RPM) or horizontally (move both writable CPU/GPU
+temperature bounds with their hysteresis width preserved); drag the square at
+the left end of a shaded span to edit only its lower temperature. Confirm
+independent CPU/GPU fields and the other fan's speed remain unchanged. Drag
+past the 0°C/127°C limits and confirm both temperatures clamp while keeping
+their gap. Hover
+over a point to check its exact °C/RPM (or firmware level); while dragging,
+press Esc and confirm the table is restored without a hardware write. On
+speed-only WMI curves the x-axis must be point ID and temperature fields must
+remain disabled. On level curves the y-axis must be the firmware level; drag
+points 9/10 down and check they stop at `LEVEL_POINT_MIN` (3/5), with RPM from
+the current firmware ladder rather than a linear guess. Trailing all-zero
+padding is crossed and not draggable; points beyond `auto_points_size` cannot
+be edited. Invalid/incomplete text must not create draggable points. The plot
+never writes to hardware: Apply to HW still uses the existing validation and
+readback path. The README screenshot uses example data, not a hardware test.
+
+When `legiond` is running, changing the power mode externally (Fn+Q) makes the
+daemon re-apply the preset for the new mode. The GUI watches
+`/sys/firmware/acpi/platform_profile` and re-reads the curve after the daemon's
+3 s debounce plus a small margin, so the table is not left showing the previous
+mode's curve. The refresh is read-only and is skipped while the table has
+unsaved edits (or when the curve is unsupported/unreadable); it can be turned off
+with `Refresh Fan Curve when the Power Mode Changes` in the Automation tab.
+Verify on hardware by pressing Fn+Q with the GUI open and a preset configured for
+each mode: the table must update to the curve the daemon applied, without
+pressing `Read from HW`, and an edited-but-unapplied table must be left alone.
+
+Offline validation: `./tests/test_python_unit.sh` runs the library, offscreen GUI
+and kernel capability tests. The latter compile the actual C configuration and
+visibility/guard functions against fake device/EC objects: 606 point-attribute
+cases, native vs level unit gates, default-reset independence, poisoned native
+read buffers, zero-RPM ladder indexing, SFAN live-mode payload/error handling,
+mode-specific calibration/retry and no I/O through unmapped control registers. Run with `CC=clang` to additionally test that harness
+with clang (gcc is the default). These are software regressions, not a claim of
+new thermal or firmware validation on every model. On hardware, compare the
+available controls with the table above, read a known curve before changing it,
+save a backup, make only a conservative adjustment in a supported power mode,
+check sysfs/debugfs and `sensors`, then restore the backup.
+
+## External HDMI
+Usually attached to dGPU. So easiest way to make it work is enabling dGPU only in BIOS/UEFI. More advanced would
+be switching in hybrid mode to dGPU only as long as HDMI is attached or outputting via dGPU.
+
+## Flip to Start
+
+cat  /sys/firmware/efi/efivars/FBSWIF-d743491e-f484-4952-a87d-8d5dd189b70c | hexdump -C
+
+Stored in 4-byte UEFI variables FBSWIF-d743491e-f484-4952-a87d-8d5dd189b70c
+```bash
+
+sudo chattr -i /sys/firmware/efi/efivars/FBSWIF-d743491e-f484-4952-a87d-8d5dd189b70c
+# first 4 bytes are attributes
+printf '\x07\x00\x00\x00\x01\x00\x00\x00' | sudo tee /sys/firmware/efi/efivars/FBSWIF-d743491e-f484-4952-a87d-8d5dd189b70c 
+cat  /sys/firmware/efi/efivars/FBSWIF-d743491e-f484-4952-a87d-8d5dd189b70c | hexdump -C
+
+cat  /sys/firmware/efi/efivars/FBSWIF-d743491e-f484-4952-a87d-8d5dd189b70c | hexdump -C
+# 00000000  07 00 00 00 00 00 00 00 
+# 07 = EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS
+#
+
+/efi/vars/FBSWIF-d743491e-f484-4952-a87d-8d5dd189b70c/size
+# 0x04
+sudo cat /sys/firmware/efi/vars/FBSWIF-d743491e-f484-4952-a87d-8d5dd189b70c/data | hexdump -C
+# 0000000 0000 0000    
+
+# first byte: 1 => enabled
+# first byte: 0 => diabled
+
+# enables it
+sudo chattr -i /sys/firmware/efi/efivars/FBSWIF-d743491e-f484-4952-a87d-8d5dd189b70c
+# first 4 bytes are attributes
+printf '\x07\x00\x00\x00\x01\x00\x00\x00' | sudo tee /sys/firmware/efi/efivars/FBSWIF-d743491e-f484-4952-a87d-8d5dd189b70c 
+cat  /sys/firmware/efi/efivars/FBSWIF-d743491e-f484-4952-a87d-8d5dd189b70c | hexdump -C
+
+# disable it
+sudo chattr -i /sys/firmware/efi/efivars/FBSWIF-d743491e-f484-4952-a87d-8d5dd189b70c
+# first 4 bytes are attributes
+printf '\x07\x00\x00\x00\x00\x00\x00\x00' | sudo tee /sys/firmware/efi/efivars/FBSWIF-d743491e-f484-4952-a87d-8d5dd189b70c 
+cat  /sys/firmware/efi/efivars/FBSWIF-d743491e-f484-4952-a87d-8d5dd189b70c | hexdump -C
+```
+
+```
+#should be y
+cat /boot/config-$(uname -r) | grep CONFIG_EFI=y
+# should be rw
+mount | grep efivars
+```
+
+### Fn-Lock
+- using secondary (special) functions of Fn keys
+- works as intended, pressing it toggles the light in the Fn-Lock key
+    - light off: 
+        - F1, F2, ... is triggered when F key is pressed while Fn-key is not pressed
+        - Special functions (increase volume, ...) is triggered when F key is pressed while Fn-key is pressed
+    - light on: 
+        - F1, F2, ... is triggered when F key is pressed while Fn-key is pressed
+        - Special functions (increase volume, ...) is triggered when F key is pressed while Fn-key is not pressed
+    - controllable by software with ideapad_acpi
+```bash
+# 1: enabled
+# 0: disabled
+# read
+cat /sys/bus/platform/drivers/ideapad_acpi/VPC2004:00/fn_lock
+echo 1 > /sys/bus/platform/drivers/ideapad_acpi/VPC2004:00/fn_lock
+# set with software
+```
+- test: toggle by pressing button and activate
+    - expected: read via software returns 1
+- test: toggle by pressing button and deactivate
+    - expected: read via software returns 0
+- test: enable with software
+    - expected: LED indicator turns on; one does not have to hold down Fn to use special functions (test with mute/unmute)
+
+```bash
+sudo apt-get install acpid
+acpi_listen
+# When pressing Fn-Lock
+# 8FC0DE0C-B4E4- 000000d0 00000000
+# 1E3391A1-2C89- 000000e8 00000000
+# When pressing Fn+Q (power switch)
+# D320289E-8FEA- 000000e3 00000000
+# D320289E-8FEA- 000000e7 00000000
+```
+
+### Touchpad
+
+
+### Rapid Charge
+```bash
+# Enable
+echo '\_SB.PCI0.LPC0.EC0.VPC0.SBMC 0x07' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+
+# Distable
+echo '\_SB.PCI0.LPC0.EC0.VPC0.SBMC 0x08' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+
+```
+
+### Keyboard backlight (white)
+#### WMI
+```text
+WMI
+GUID: 8C5B9127-ECD4-4657-980F-851019F99CA5
+Object ID: BA
+
+Getting state
+Method ID: 0x1
+
+Setting state
+Method ID: 0x2
+```
+
+#### Test of WMI via acpi_call
+```bash
+# Get current state
+echo '\_SB.GZFD.WMBA 0 0x1 0' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+{0x00, 0x01}
+
+# Set current state
+echo '\_SB.GZFD.WMBA 0 0x2 {0, 0x01, 0x03}' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+0x0
+```
+
+#### IO-Port Light
+```bash
+# Get current state
+echo '\_SB.GZFD.WMBA 0 0x1 0x5' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+{0x00, 0x01}
+
+# Set current state (off?)
+echo '\_SB.GZFD.WMBA 0 0x2 {0x05, 0x00, 0x01}' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+
+# Set current state (on?)
+echo '\_SB.GZFD.WMBA 0 0x2 {0x05, 0x01, 0x02}' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+```
+
+### GSync
+
+On Legion Pro 5 16ADR10 (83LT) with an **exactly allowlisted** BIOS
+(`RLCN20WW`, `RLCN21WW`, `RLCN25WW`, `RLCN26WW`, `RLCN27WW`,
+`RLCN29WW`, `RLCN31WW`, `RLCN32WW`, `RLCN33WW`, `RLCN34WW`), the driver
+exposes `graphics_mode` (`integrated`/`hybrid`/`discrete`). Writes through either
+`graphics_mode` or the legacy `gsync` attribute are **blocked by default**;
+load with `allow_rlcn20_mux_write=1` and without `ec_readonly=1` to explicitly
+permit firmware requests. A guarded Hybrid → Discrete reboot round trip was
+verified on one 83LT/RLCN20WW (2026-11-08) using PCI and eDP routing.
+UMA (`integrated`) is read-only and is not supported as a write request.
+Three-state readback needs Linux 6.3 or newer with accessible EFI variables;
+the legacy `gsync` read falls back to WMI if EFI is unavailable and cannot
+then distinguish UMA. Only RLCN20WW has passed a real reboot round trip;
+the other nine versions have matching static firmware layouts and untested
+runtime switching. Live switching remains unsupported. See
+[83LT/RLCN20WW graphics mode](83LT-rlcn20ww-mux.md) and the
+[Chinese guide](zh-hans/83LT-rlcn20ww-mux.md).
+
+```text
+WMI
+GUID: 887B54E3-DDDC-4B2C-8B88-68A26A8835D0
+Object ID: AA
+
+Getting state (allowlisted 83LT/RLCN firmware)
+Method ID: 0x29
+Args: None
+Returns: integer (EC MSMF, currently active mode)
+- 0: hybrid (AMD drives internal eDP)
+- 1: discrete (NVIDIA drives internal eDP)
+
+Requesting the next-boot mode (allowlisted 83LT/RLCN firmware)
+Method ID: 0x2A
+Args: four-byte UINT32 (little-endian)
+- 0: request hybrid (SMI 0xCA/0x25)
+- 1: request discrete (SMI 0xCA/0x26)
+Returns: ACPI Integer(0), unconditionally; not proof of MUX completion
+```
+
+### Change to Hybrid Mode
+
+### Flip to Start
+
+### Always on USB Charing
+3 modes
+
+### Check if methods are supported before providing them in sysfs
+
+### CPU boost 
+```
+cpupower frequency-info
+# disable boost
+sudo sh -c "echo '0' > /sys/devices/system/cpu/cpufreq/boost"
+# enable boost
+sudo sh -c "echo '1' > /sys/devices/system/cpu/cpufreq/boost"
+```
+
+### Other to reverse enginner yet
+```c
+#define WMI_METHOD_ID_GSYNCSTATUSGET 0x29 
+#define WMI_METHOD_ID_GSYNCSTATUSSET 0x2A
+
+#define WMI_METHOD_ID_ISSUPPORTIGPUMODE 63
+#define WMI_METHOD_ID_GETIGPUMODESTATUS 64
+#define WMI_METHOD_ID_SETIGPUMODESTATUS 65
+#define WMI_METHOD_ID_NOTIFYDGPUSTATUS 66
+enum IGPUState{
+	IGPUState_default=0,
+	IGPUState_iGPUOnly=1,
+	IGPUState_auto=2
+};
+
+// GETIGPUMODESTATUS is the selected persistent policy, not actual PCI
+// device state. NOTIFYDGPUSTATUS accepts observed availability: 1 when the
+// dGPU is enumerated, 0 when absent. It is not a requested target. On the
+// locally tested M1CN firmware, reporting 1 while iGPU-only is selected
+// invokes DGHP(0) to eject; reporting the final 0 records completed absence
+// without reattaching. Userspace must check every NVIDIA, associated DRM,
+// and HDMI-audio device handle before ejection, then verify every NVIDIA
+// PCI function and report final availability after firmware settles.
+
+// overdrive
+// ODStatusGet, ODStatusSet
+// IsSupportOD
+#define WMI_METHOD_ID_ODSTATUSGET 0x0
+#define WMI_METHOD_ID_ODSTATUSSET 0x0
+// 0=off, 1=on
+enum ODState{
+	ODState_off=0,
+	ODState_on=1,
+};
+
+// touchpad lock
+// TPStatusGet, TPStatusSet
+// IsSupportDisableTP
+#define WMI_METHOD_ID_TPSTATUSGET 0x0
+#define WMI_METHOD_ID_TPSTATUSSET 0x0
+// 0=off, 1=on
+
+//
+// WinKeyStatusGet, WinKeyStatusSet
+// IsSupportDisableWinKey
+#define WMI_METHOD_ID_WINKEYSTATUSGET 0x0
+#define WMI_METHOD_ID_WINKEYSTATUSSET 0x0
+
+//
+// LENOVO_FAN_METHOD
+// Fan_Set_FullSpeed
+```
+
+### Temperatures via WMI
+GetIRTemp: 1 (0x1)
+GetCPUTemp: 18 (0x12)
+GetGPUTemp: 19 (0x13)
+```bash
+echo '\_SB.GZFD.WMAA 0 0x1 0' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+echo '\_SB.GZFD.WMAA 0 0x18 0' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+echo '\_SB.GZFD.WMAA 0 0x19 0' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+```
+Result: Not properly implemented as seen in ACPI dissassembly.
+
+
+### Fan RPM via WMI
+GetFanCount: 7 (0x1)
+GetFan1Speed: 8 (0x8)
+GetFan2Speed: 9 (0x9)
+GetFanMaxSpeed: 10 (0xA)
+```bash
+echo '\_SB.GZFD.WMAA 0 0x1 0' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+echo '\_SB.GZFD.WMAA 0 0x18 0' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+echo '\_SB.GZFD.WMAA 0 0x19 0' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+```
+Result: Not properly implemented as seen in ACPI dissassembly.
+
+### Fan control via WMI FAN_METHOD
+```
+92549549-4BDE-4F06-AC04-CE8BF898DBAA
+Class Name: LENOVO_FAN_METHOD
+Methods Count: 8
+Object ID : B2
+
+Fan_Get_FullSpeed: 1
+```
+
+
+```bash
+# get full speed status
+echo '\_SB.GZFD.WMB2 0 0x1 0' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+
+# set to full speed
+echo '\_SB.GZFD.WMB2 0 0x2 1' > /proc/acpi/call
+cat /proc/acpi/call; printf '\n'
+```
+
+## ACPI
+SPMO: power mode (0,1,2)
+ADPT: AC Adapter
+CPP1, CPP2: power limit cpu at 0xFE00D6B0 (EC?)
+- can by set by WMI
+- if not set yet (i.e.) defualt values like 0x58 (constant) for CPP1; or value calculated in CPP4 (0x37,0x48,...) for  CPP2 depending on GTYP, DBFS
+
+long term:
+-defaullt: 0x46 for CCP2
+-changes stapm (also in quiet mode, immediately confirmed with ryzendadj)
+
+
+set short term: SMUF = 0x07
+- changes: | PPT LIMIT SLOW      |    89.000 | slow-limit   
+set long term: SMUF = 0x05
+call ALIB
+
+also set with FNQR, FNQS
+- use value from CPP2, CPP1 if not 0
+
+WMB3
+
+### GPU
+DTG1, CTG1 at 0xFE00D6C0
+CTG2: calculated as constant from GTYP
+
+short:
+- report: DTG1/8 in first; use DTG1=0x78 if DTG1=0
+- set: DTG1 = 8 * Arg2 and notify
+
+long:
+- report: CTG1/8 in first and CTG2/8 in 0x0C offset; use CTG1=CTG2 if CTG1=0
+- set: CTG1 = 8 * Arg2 and notify
+
+## Powerstate Inspection with AMD
+```bash
+sudo apt install libpci-dev
+git clone https://github.com/FlyGoat/RyzenAdj.git
+cd RyzenAdj
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make
+```
+
+## NVIDIA GPU Stress test
+```
+git clone https://github.com/wilicc/gpu-burn
+cd gpu-burn
+docker build -t gpu_burn .
+docker run --rm --gpus all gpu_burn
+```
+
+### Script for Windows
+```powershell
+$wmi_classes = Get-WmiObject -Namespace 'ROOT/WMI' -List -Class "*LENOVO*"
+foreach ($wmi_class in $wmi_classes){
+  Write-Host "########################################"
+  Write-Host "########################################"
+  Write-Host "########################################"
+  Write-Host "Name:" $wmi_class.Name
+  Write-Host "Class Name:" $wmi_class.Name 
+  Write-Host "Class GUID:" $wmi_class.Qualifiers["guid"].Value
+  Write-Host "Description:" $wmi_class.Methods.Count
+  Write-Host "Methods:"
+  foreach ($method in $wmi_class.Methods){
+    Write-Host "Name:" $method.Name
+    Write-Host "WmiMethodId:" $method.Qualifiers["WmiMethodId"].Value
+    Write-Host "Class Name:" $wmi_class.Name 
+    Write-Host "Class GUID:" $wmi_class.Qualifiers["guid"].Value
+    Write-Host "Description:" $method.Qualifiers["Description"].Value
+    Write-Host "Implemented:" $method.Qualifiers["Implemented"].Value
+    Write-Host ""
+  }
+  Write-Host ""
+}
+```
+
+#### Log from Windows
+
+########################################
+########################################
+########################################
+Name: LENOVO_UTILITY_EVENT
+Class Name: LENOVO_UTILITY_EVENT
+Class GUID: {8fc0de0c-b4e4-43fd-b0f3-8871711c1294}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_GAMEZONE_SMART_FAN_MODE_EVENT
+Class Name: LENOVO_GAMEZONE_SMART_FAN_MODE_EVENT
+Class GUID: {D320289E-8FEA-41E0-86F9-611D83151B5F}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_GAMEZONE_THERMAL_MODE_EVENT
+Class Name: LENOVO_GAMEZONE_THERMAL_MODE_EVENT
+Class GUID: {D320289E-8FEA-41E0-86F9-911D83151B5F}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_GAMEZONE_KEYLOCK_STATUS_EVENT
+Class Name: LENOVO_GAMEZONE_KEYLOCK_STATUS_EVENT
+Class GUID: {10AFC6D9-EA8B-4590-A2E7-1CD3C84BB4B1}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_LIGHTING_EVENT
+Class Name: LENOVO_LIGHTING_EVENT
+Class GUID: {1e3391a1-2c89-464d-95d9-3028b72e7a33}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_GAMEZONE_LIGHT_PROFILE_CHANGE_EVENT
+Class Name: LENOVO_GAMEZONE_LIGHT_PROFILE_CHANGE_EVENT
+Class GUID: {D320289E-8FEA-41E0-86F9-811D83151B5F}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_GAMEZONE_SMART_FAN_SETTING_EVENT
+Class Name: LENOVO_GAMEZONE_SMART_FAN_SETTING_EVENT
+Class GUID: {D320289E-8FEA-41E1-86F9-611D83151B5F}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_GAMEZONE_TEMP_EVENT
+Class Name: LENOVO_GAMEZONE_TEMP_EVENT
+Class GUID: {BFD42481-AEE3-4501-A107-AFB68425C5F8}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_GAMEZONE_OC_EVENT
+Class Name: LENOVO_GAMEZONE_OC_EVENT
+Class GUID: {D062906B-12D4-4510-999D-4831EE80E985}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_GAMEZONE_FAN_COOLING_EVENT
+Class Name: LENOVO_GAMEZONE_FAN_COOLING_EVENT
+Class GUID: {BC72A435-E8C1-4275-B3E2-D8B8074ABA59}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_GAMEZONE_POWER_CHARGE_MODE_EVENT
+Class Name: LENOVO_GAMEZONE_POWER_CHARGE_MODE_EVENT
+Class GUID: {D320289E-8FEA-41E0-86F9-711D83151B5F}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_GAMEZONE_GPU_TEMP_EVENT
+Class Name: LENOVO_GAMEZONE_GPU_TEMP_EVENT
+Class GUID: {BFD42481-AEE3-4502-A107-AFB68425C5F8}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_UTILITY_DATA
+Class Name: LENOVO_UTILITY_DATA
+Class GUID: {ce6c0974-0407-4f50-88ba-4fc3b6559ad8}
+Description: 1
+Methods:
+Name: GetIfSupportOrVersion
+WmiMethodId: 1
+Class Name: LENOVO_UTILITY_DATA
+Class GUID: {ce6c0974-0407-4f50-88ba-4fc3b6559ad8}
+Description: Utility 3.1 function is Support or the function Version
+Implemented: True
+
+
+########################################
+########################################
+########################################
+Name: LENOVO_GAMEZONE_DATA
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: 62
+Methods:
+Name: GetIRTemp
+WmiMethodId: 1
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get IR temp
+Implemented: True
+input: nothing
+output: data
+ACPI dissassembly: no handler
+
+Name: GetThermalTableID
+WmiMethodId: 2
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get ThermalTable ID
+Implemented: True
+ACPI dissassembly: no handler
+
+Name: SetThermalTableID
+WmiMethodId: 3
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Set ThermalTable ID
+Implemented: True
+ACPI dissassembly: no handler
+
+Name: IsSupportGpuOC
+WmiMethodId: 4
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Is SupportGpu OverClock
+Implemented: True
+
+Name: GetGpuGpsState
+WmiMethodId: 5
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get GpuGpsState
+Implemented: True
+ACPI dissassembly: no handler
+
+Name: SetGpuGpsState
+WmiMethodId: 6
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Set GpuGpsState
+Implemented: True
+ACPI dissassembly: no handler
+
+Name: GetFanCount
+WmiMethodId: 7
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Fan Count
+Implemented: True
+input: nothing
+output: data
+ACPI dissassembly: no handler
+
+Name: GetFan1Speed
+WmiMethodId: 8
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Fan1 Speed
+Implemented: True
+input: nothing
+output: data
+ACPI dissassembly: no handler
+
+Name: GetFan2Speed
+WmiMethodId: 9
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Fan2 Speed
+Implemented: True
+input: nothing
+output: data
+ACPI dissassembly: no handler
+
+Name: GetFanMaxSpeed
+WmiMethodId: 10
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Fan Max Speed
+Implemented: True
+input: nothing
+output: data
+ACPI dissassembly: no handler
+
+Name: GetVersion
+WmiMethodId: 11
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get AslCode Version
+Implemented: True
+ACPI dissassembly: implemented, returns constant (here: 0xd)
+
+Name: IsSupportFanCooling
+WmiMethodId: 12
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Fan cooling capabilty
+Implemented: True
+
+Name: SetFanCooling
+WmiMethodId: 13
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Set Fan cooling on/off
+Implemented: True
+
+Name: IsSupportCpuOC
+WmiMethodId: 14
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: cpu oc capability
+Implemented: True
+ACPI dissassembly: implemented, returns constant 0
+
+
+Name: IsBIOSSupportOC
+WmiMethodId: 15
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: bios has overclock capability
+Implemented: True
+ACPI dissassembly: implemented, returns constant 0
+
+
+Name: SetBIOSOC
+WmiMethodId: 16
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: enble or disable overclock in bios
+Implemented: True
+ACPI dissassembly: implemented, returns constant 0
+
+Name: GetTriggerTemperatureValue
+WmiMethodId: 17
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get temperature change trigger temp value
+Implemented: True
+ACPI dissassembly: no handler
+
+Name: GetCPUTemp
+WmiMethodId: 18
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get CPU temperature
+Implemented: True
+input: nothing
+output: data
+ACPI dissassembly: handler, returns constant 0
+
+Name: GetGPUTemp
+WmiMethodId: 19
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get GPU temperature
+Implemented: True
+input: nothing
+output: data
+ACPI dissassembly: handler, returns constant 0
+
+Name: GetFanCoolingStatus
+WmiMethodId: 20
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Fan cooling on/off status
+Implemented: True
+ACPI dissassyembly: implemented, does something depending on FCST, LFCM
+
+Name: IsSupportDisableWinKey
+WmiMethodId: 21
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: EC support disable windows key capability
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: returns 1
+
+Name: SetWinKeyStatus
+WmiMethodId: 22
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Set windows key disable/enable
+Implemented: True
+input: data
+output: nothing
+ACPI dissassyembly: implemented using NCMD
+
+Name: GetWinKeyStatus
+WmiMethodId: 23
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get windows key disable/enable status
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: implemented using NCMD
+
+Name: IsSupportDisableTP
+WmiMethodId: 24
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: EC support disable touchpad capability
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: implemented
+
+Name: SetTPStatus
+WmiMethodId: 25
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Set touchpad disable/enable
+Implemented: True
+input: data
+output: nothing
+ACPI dissassyembly: implemented using NCMD
+
+Name: GetTPStatus
+WmiMethodId: 26
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get touchpad disable/enable status
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: implemented using NCMD
+
+Name: GetGPUPow
+WmiMethodId: 27
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get GPU normal mode max TDP(W)
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: no handler
+
+Name: GetGPUOCPow
+WmiMethodId: 28
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get GPU OC mode max TDP(W)
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: no handler
+
+Name: GetGPUOCType
+WmiMethodId: 29
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get GPU OC type
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: returns 0
+
+Name: GetKeyboardfeaturelist
+WmiMethodId: 30
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Keyboard feature list
+Implemented: True
+ACPI dissassyembly: returns constant that is computed
+
+Name: GetMemoryOCInfo
+WmiMethodId: 31
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Memory OC Information
+Implemented: True
+ACPI dissassyembly: returns constant that is computed
+
+Name: IsSupportWaterCooling
+WmiMethodId: 32
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Water Cooling feature capability
+Implemented: True
+ACPI dissassyembly: returns 0
+
+Name: SetWaterCoolingStatus
+WmiMethodId: 33
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Set Water Cooling status
+Implemented: True
+ACPI dissassyembly: returns constant 0
+
+Name: GetWaterCoolingStatus
+WmiMethodId: 34
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Water Cooling status
+Implemented: True
+ACPI dissassyembly: returns constant 0
+
+Name: IsSupportLightingFeature
+WmiMethodId: 35
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Lighting feature capability
+Implemented: True
+
+Name: SetKeyboardLight
+WmiMethodId: 36
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Set keyboard light off or on to max
+Implemented: True
+ACPI dissassyembly: implemented
+
+Name: GetKeyboardLight
+WmiMethodId: 37
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get keyboard light on/off status
+Implemented: True
+ACPI dissassyembly: implemented
+
+Name: GetMacrokeyScancode
+WmiMethodId: 38
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Macrokey scan code
+Implemented: True
+ACPI dissassyembly: implemented
+
+Name: GetMacrokeyCount
+WmiMethodId: 39
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Macrokey count
+Implemented: True
+ACPI dissassyembly: implemented
+
+Name: IsSupportGSync
+WmiMethodId: 40
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Support G-Sync feature
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: implemented, returns constant 0x02
+
+Name: GetGSyncStatus
+WmiMethodId: 41
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get G-Sync Statust
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: implemented,
+
+Name: SetGSyncStatus
+WmiMethodId: 42
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Set G-Sync Statust
+Implemented: True
+input: data
+output: nothing
+ACPI dissassyembly: implemented,
+
+Name: IsSupportSmartFan
+WmiMethodId: 43
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Support Smart Fan feature
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: implemented, returns 0x04 constant
+
+Name: SetSmartFanMode
+WmiMethodId: 44
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Set Smart Fan Mode
+Implemented: True
+input: data
+output: nothing
+ACPI dissassyembly: implemented,
+
+Name: GetSmartFanMode
+WmiMethodId: 45
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Smart Fan Mode
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: implemented,
+
+Name: GetSmartFanSetting
+WmiMethodId: 46
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Smart Fan Setting Mode
+Implemented: True
+ACPI dissassyembly: implemented
+
+Name: GetPowerChargeMode
+WmiMethodId: 47
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Power Charge Mode
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: implemented
+
+Name: GetProductInfo
+WmiMethodId: 48
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Gaming Product Info
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: implemented, returns contant 0x64
+
+Name: IsSupportOD
+WmiMethodId: 49
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Over Drive feature capability
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: implemented
+
+Name: GetODStatus
+WmiMethodId: 50
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Over Drive status
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: implemented
+
+Name: SetODStatus
+WmiMethodId: 51
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Set Over Drive status
+Implemented: True
+input: data
+output: nothing
+ACPI dissassyembly: implemented, expects 0,1
+
+Name: SetLightControlOwner
+WmiMethodId: 52
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Set Light Control Owner
+Implemented: True
+ACPI dissassyembly: implemented
+
+Name: SetDDSControlOwner
+WmiMethodId: 53
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Set DDS Control Owner
+Implemented: True
+ACPI dissassyembly: returns constant 0
+
+Name: IsRestoreOCValue
+WmiMethodId: 54
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get the flag of restore OC value
+Implemented: True
+ACPI dissassyembly: implemented
+
+Name: GetThermalMode
+WmiMethodId: 55
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Real Thremal Mode
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: implemented, using SPMO, returns 1,2, or 3
+
+Name: GetBIOSOCMode
+WmiMethodId: 56
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get the OC switch status in BIOS
+Implemented: True
+ACPI dissassyembly: implemented, using COCC, returns 0, 1,2,3
+
+Name: SetIntelligentSubMode
+WmiMethodId: 57
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Set the current mode in Intelligent Mode
+Implemented: True
+ACPI dissassyembly: implemented,
+
+Name: GetIntelligentSubMode
+WmiMethodId: 58
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get the current mode in Intelligent Mode
+Implemented: True
+ACPI dissassyembly: implemented
+
+Name: GetHardwareInfoSupportVersion
+WmiMethodId: 59
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get hardware info support version
+Implemented: True
+ACPI dissassyembly: implemented, returns constant 1
+
+Name: GetCpuFrequency
+WmiMethodId: 60
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Cpu core 0 max frequency
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: implemented, using CMSP and COCC, PVSD
+
+Name: GetLearningProfileCount
+WmiMethodId: 61
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Get Total count of Learning Profile
+Implemented: True
+ACPI dissassyembly: implemented,
+
+Name: IsACFitForOC
+WmiMethodId: 62
+Class Name: LENOVO_GAMEZONE_DATA
+Class GUID: {887B54E3-DDDC-4B2C-8B88-68A26A8835D0}
+Description: Check the Adapter type fit for OC
+Implemented: True
+input: nothing
+output: data
+ACPI dissassyembly: implemented, using ACTY
+
+
+########################################
+########################################
+########################################
+Name: LENOVO_INTELLIGENT_OP_LIST
+Class Name: LENOVO_INTELLIGENT_OP_LIST
+Class GUID: {93A57CD3-BBC6-46AB-951D-31F17CC968A0}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_GAMEZONE_GPU_OC_DATA
+Class Name: LENOVO_GAMEZONE_GPU_OC_DATA
+Class GUID: {887B54E2-DDDC-4B2C-8B88-68A26A8835D0}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_CPU_METHOD
+Class Name: LENOVO_CPU_METHOD
+Class GUID: {14afd777-106f-4c9b-b334-d388dc7809be}
+Description: 6
+Methods:
+Name: CPU_Get_OC_Status
+WmiMethodId: 1
+Class Name: LENOVO_CPU_METHOD
+Class GUID: {14afd777-106f-4c9b-b334-d388dc7809be}
+Description: Get CPU OC Status
+Implemented: True
+ACPI dissassembly: returns constant 0
+
+Name: CPU_Set_OC_Status
+WmiMethodId: 2
+Class Name: LENOVO_CPU_METHOD
+Class GUID: {14afd777-106f-4c9b-b334-d388dc7809be}
+Description: Set CPU OC Status
+Implemented: True
+ACPI dissassembly: no handler
+
+Name: CPU_Get_ShortTerm_PowerLimit
+WmiMethodId: 3
+Class Name: LENOVO_CPU_METHOD
+Class GUID: {14afd777-106f-4c9b-b334-d388dc7809be}
+Description: Get CPU ShortTerm_PowerLimit
+Implemented: True
+buffer:
+- 0: SSTPL (also set to CPP1)
+- 4: STP1 (also set to 1)
+- 8: MIP1 (also set to 0x0A)
+- 0x0C: MAP1 (also set to 0x58)
+
+Name: CPU_Set_ShortTerm_PowerLimit
+WmiMethodId: 4
+Class Name: LENOVO_CPU_METHOD
+Class GUID: {14afd777-106f-4c9b-b334-d388dc7809be}
+Description: Set CPU ShortTerm_PowerLimit
+Implemented: True
+ACPI dissassembly: CPP1=arg2, SMUF = 0x07, SMUD = Arg2*0x03E8
+
+Name: CPU_Get_LongTerm_PowerLimit
+WmiMethodId: 5
+Class Name: LENOVO_CPU_METHOD
+Class GUID: {14afd777-106f-4c9b-b334-d388dc7809be}
+Description: Get CPU LongTerm PowerLimit
+Implemented: True
+- 0: LTPL (also set to CPP2)
+- 4: STP2 (also set to 1)
+- 8: MIP2 (also set to 0x0A)
+- 0x0C: MAP2 (also set to CPP4)
+
+Name: CPU_Set_LongTerm_PowerLimit
+WmiMethodId: 6
+Class Name: LENOVO_CPU_METHOD
+Class GUID: {14afd777-106f-4c9b-b334-d388dc7809be}
+Description: Set CPU LongTerm_PowerLimit
+Implemented: True
+ACPI dissassembly: CPP2=arg2, SMUF = 0x05, SMUD = Arg2*0x03E8
+
+
+########################################
+########################################
+########################################
+Name: LENOVO_GPU_METHOD
+Class Name: LENOVO_GPU_METHOD
+Class GUID: {da7547f1-824d-405f-be79-d9903e29ced7}
+Description: 6
+Methods:
+Name: GPU_Get_OC_Status
+WmiMethodId: 1
+Class Name: LENOVO_GPU_METHOD
+Class GUID: {da7547f1-824d-405f-be79-d9903e29ced7}
+Description: Get GPU OC Status
+Implemented: True
+ACPI: implemented
+
+Name: GPU_Set_OC_Status
+WmiMethodId: 2
+Class Name: LENOVO_GPU_METHOD
+Class GUID: {da7547f1-824d-405f-be79-d9903e29ced7}
+Description: Set GPU OC Status
+Implemented: True
+ACPI: implemented
+
+Name: GPU_Get_PPAB_PowerLimit
+WmiMethodId: 3
+Class Name: LENOVO_GPU_METHOD
+Class GUID: {da7547f1-824d-405f-be79-d9903e29ced7}
+Description: Get GPU PPAB PowerLimit
+Implemented: True
+ACPI: implemented
+
+Name: GPU_Set_PPAB_PowerLimit
+WmiMethodId: 4
+Class Name: LENOVO_GPU_METHOD
+Class GUID: {da7547f1-824d-405f-be79-d9903e29ced7}
+Description: Set GPU PPAB PowerLimit
+Implemented: True
+ACPI: implemented
+
+Name: GPU_Get_cTGP_PowerLimit
+WmiMethodId: 5
+Class Name: LENOVO_GPU_METHOD
+Class GUID: {da7547f1-824d-405f-be79-d9903e29ced7}
+Description: Get GPU cTGP PowerLimit
+Implemented: True
+ACPI: implemented
+
+Name: GPU_Set_cTGP_PowerLimit
+WmiMethodId: 6
+Class Name: LENOVO_GPU_METHOD
+Class GUID: {da7547f1-824d-405f-be79-d9903e29ced7}
+Description: Set GPU cTGP PowerLimint
+Implemented: True
+ACPI: implemented
+
+
+########################################
+########################################
+########################################
+Name: LENOVO_FAN_METHOD
+Class Name: LENOVO_FAN_METHOD
+Class GUID: {92549549-4bde-4f06-ac04-ce8bf898dbaa}
+Description: 8
+Methods:
+Name: Fan_Get_FullSpeed
+WmiMethodId: 1
+Class Name: LENOVO_FAN_METHOD
+Class GUID: {92549549-4bde-4f06-ac04-ce8bf898dbaa}
+Description: Get Fan Full Speed
+Implemented: True
+input: nothing
+output: status
+ACPI dissassyembly: implemented
+
+Name: Fan_Set_FullSpeed
+WmiMethodId: 2
+Class Name: LENOVO_FAN_METHOD
+Class GUID: {92549549-4bde-4f06-ac04-ce8bf898dbaa}
+Description: Set Fan Full Speed
+Implemented: True
+input: status
+output: nothing
+ACPI dissassyembly: implemented
+
+
+Name: Fan_Get_MaxSpeed
+WmiMethodId: 3
+Class Name: LENOVO_FAN_METHOD
+Class GUID: {92549549-4bde-4f06-ac04-ce8bf898dbaa}
+Description: Get Fan Max Speed
+Implemented: True
+input: fan_id
+output: fanMaxspeed, fanmaxspeedsize
+ACPI dissassyembly: no handler
+
+Name: Fan_Set_MaxSpeed
+WmiMethodId: 4
+Class Name: LENOVO_FAN_METHOD
+Class GUID: {92549549-4bde-4f06-ac04-ce8bf898dbaa}
+Description: Set Fan Max Speed
+Implemented: True
+Input: FanMaxSpeedTable
+ACPI dissassyembly: no handler
+
+Name: Fan_Get_Table
+WmiMethodId: 5
+Class Name: LENOVO_FAN_METHOD
+Class GUID: {92549549-4bde-4f06-ac04-ce8bf898dbaa}
+Description: Get Fan Table
+Implemented: True
+Input: FanId, SensorId
+Output: FanTable, FanTableSize
+ACPI dissassyembly: no handler
+
+Name: Fan_Set_Table
+WmiMethodId: 6
+Class Name: LENOVO_FAN_METHOD
+Class GUID: {92549549-4bde-4f06-ac04-ce8bf898dbaa}
+Description: Set Fan Table
+Implemented: True
+Input: FanTable
+ACPI dissassyembly: no handler
+
+Name: Fan_GetCurrentFanSpeed
+WmiMethodId: 7
+Class Name: LENOVO_FAN_METHOD
+Class GUID: {92549549-4bde-4f06-ac04-ce8bf898dbaa}
+Description: Get Current Fan Speed
+Implemented: True
+Input: FanId (0 (fan 1) or 1(fan 2))
+Output: CurrentFanSpeed
+ACPI dissassyembly: implementeed using EC0.FANS, EC0.FA2S
+
+Name: Fan_GetCurrentSensorTemperature
+WmiMethodId: 8
+Class Name: LENOVO_FAN_METHOD
+Class GUID: {92549549-4bde-4f06-ac04-ce8bf898dbaa}
+Description: Get Current Sensor Temperature
+Implemented: True
+Input: SensorId (0x03 (cpu) or 0x04(gpu))
+Output: CurrentSensorTemperatue
+ACPI disassembly: implemented using EC0.CPUT, EC0.GPUT
+
+
+########################################
+########################################
+########################################
+Name: LENOVO_FAN_TABLE_DATA
+Class Name: LENOVO_FAN_TABLE_DATA
+Class GUID: {87fb2a6d-d802-48e7-9208-4576c5f5c8d8}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_OTHER_METHOD
+Class Name: LENOVO_OTHER_METHOD
+Class GUID: {dc2a8805-3a8c-41ba-a6f7-092e0089cd3b}
+Description: 8
+Methods:
+Name: GetDeviceType
+WmiMethodId: 1
+Class Name: LENOVO_OTHER_METHOD
+Class GUID: {dc2a8805-3a8c-41ba-a6f7-092e0089cd3b}
+Description: Get Device Type
+Implemented: True
+
+Name: GetSupportThermalMode
+WmiMethodId: 2
+Class Name: LENOVO_OTHER_METHOD
+Class GUID: {dc2a8805-3a8c-41ba-a6f7-092e0089cd3b}
+Description: Get Thermal Mode Status
+Implemented: True
+
+Name: GetCustomModeAbility
+WmiMethodId: 3
+Class Name: LENOVO_OTHER_METHOD
+Class GUID: {dc2a8805-3a8c-41ba-a6f7-092e0089cd3b}
+Description: Get Custom Mode Abiltiy
+Implemented: True
+
+Name: Set_Custom_Mode_Status
+WmiMethodId: 4
+Class Name: LENOVO_OTHER_METHOD
+Class GUID: {dc2a8805-3a8c-41ba-a6f7-092e0089cd3b}
+Description: Set Custom Mode Status
+Implemented: True
+
+Name: Get_Legion_Device_Support_Feature
+WmiMethodId: 5
+Class Name: LENOVO_OTHER_METHOD
+Class GUID: {dc2a8805-3a8c-41ba-a6f7-092e0089cd3b}
+Description: Get Device Support Feature Status
+Implemented: True
+
+Name: Get_Device_Current_Support_Feature
+WmiMethodId: 6
+Class Name: LENOVO_OTHER_METHOD
+Class GUID: {dc2a8805-3a8c-41ba-a6f7-092e0089cd3b}
+Description: Get Device Current Support Feature Status
+Implemented: True
+
+Name: Set_Device_Current_Support_Feature
+WmiMethodId: 7
+Class Name: LENOVO_OTHER_METHOD
+Class GUID: {dc2a8805-3a8c-41ba-a6f7-092e0089cd3b}
+Description: Set Device Current Support Feature enable/disalbe
+Implemented: True
+
+Name: Get_Support_LegionZone_Version
+WmiMethodId: 8
+Class Name: LENOVO_OTHER_METHOD
+Class GUID: {dc2a8805-3a8c-41ba-a6f7-092e0089cd3b}
+Description: Get Support Legionzone Version
+Implemented: True
+
+
+########################################
+########################################
+########################################
+Name: LENOVO_FAN_MAX_SPEED_DATA
+Class Name: LENOVO_FAN_MAX_SPEED_DATA
+Class GUID: {c3c7aeb8-4c06-4d40-8f29-212a6ccd74aa}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_GPU_OVERCLOCKING_DATA
+Class Name: LENOVO_GPU_OVERCLOCKING_DATA
+Class GUID: {8A8984E2-228F-685F-B496-DDA5F52CBE5B}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_PANEL_METHOD
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: 22
+Methods:
+Name: Panel_Get_Support_Status
+WmiMethodId: 1
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Get Panel Support Functions
+Implemented: True
+
+Name: Panel_Get_Status
+WmiMethodId: 2
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Get Panel Functions Status
+Implemented: True
+
+Name: Panel_Set_Status
+WmiMethodId: 3
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Set Panel Functions Status
+Implemented: True
+
+Name: Panel_Get_Low_Latency_Mode
+WmiMethodId: 4
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Get Panel Low Latency Mode
+Implemented: True
+
+Name: Panel_Set_Low_Latency_Mode
+WmiMethodId: 5
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Set Panel Low Latency Mode
+Implemented: True
+
+Name: Panel_Get_PIP_Info
+WmiMethodId: 6
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Get Panel PIP Info
+Implemented: True
+
+Name: Panel_Set_PIP_Info
+WmiMethodId: 7
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Set Panel PIP Info
+Implemented: True
+
+Name: Panel_Get_Game_Aid_FPS_Display_Pos
+WmiMethodId: 8
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Get Panel Game Aid FPS Display
+Implemented: True
+
+Name: Panel_Set_Game_Aid_FPS_Display_Pos
+WmiMethodId: 9
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Set Panel Game Aid FPS Display
+Implemented: True
+
+Name: Panel_Get_Game_Aid_FPS
+WmiMethodId: 10
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Set Panel Game Aid FPS Display
+Implemented: True
+
+Name: Panel_Get_Game_Aid_Sight_Mode
+WmiMethodId: 11
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Get Panel Game Aid Sight Mode
+Implemented: True
+
+Name: Panel_Set_Game_Aid_Sight_Mode
+WmiMethodId: 12
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Set Panel Game Aid Sight Mode
+Implemented: True
+
+Name: Panel_Get_Game_Aid_Timer_Info
+WmiMethodId: 13
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Get Panel Game Aid Timer Info
+Implemented: True
+
+Name: Panel_Set_Game_Aid_Timer_Info
+WmiMethodId: 14
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Set Panel Game Aid Timer Info
+Implemented: True
+
+Name: Panel_Get_Game_Aid_Countdown_Info
+WmiMethodId: 15
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Get Panel Game Aid Countdown Timer Info
+Implemented: True
+
+Name: Panel_Set_Game_Aid_Countdown_Info
+WmiMethodId: 16
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Set Panel Game Aid Countdown Timer Info
+Implemented: True
+
+Name: Panel_Get_Display_Mode
+WmiMethodId: 17
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Get Panel Display Mode
+Implemented: True
+
+Name: Panel_Set_Display_Mode
+WmiMethodId: 18
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Set Panel Display Mode
+Implemented: True
+
+Name: Panel_Get_Gamut_Switch
+WmiMethodId: 19
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Get Panel Gamut Switch
+Implemented: True
+
+Name: Panel_Set_Gamut_Switch
+WmiMethodId: 20
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Set Panel Gamut Switch
+Implemented: True
+
+Name: Panel_Get_MPRT
+WmiMethodId: 21
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Get Panel MPRT info
+Implemented: True
+
+Name: Panel_Set_MPRT
+WmiMethodId: 22
+Class Name: LENOVO_PANEL_METHOD
+Class GUID: {e5edffbf-e822-4bbe-8650-c07b8bae4c54}
+Description: Set Panel MPRT info
+Implemented: True
+
+
+########################################
+########################################
+########################################
+Name: LENOVO_CPU_OVERCLOCKING_DATA
+Class Name: LENOVO_CPU_OVERCLOCKING_DATA
+Class GUID: {4C90256D-44EA-D6A8-7650-63DF4FEB2CFF}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: Lenovo_SystemElement
+Class Name: Lenovo_SystemElement
+Class GUID:
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: Lenovo_BatteryInformation
+Class Name: Lenovo_BatteryInformation
+Class GUID: C3A03776-51AC-49AA-AD0F-F2F7D62C3F3C
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_MEMORY_OC_DATA
+Class Name: LENOVO_MEMORY_OC_DATA
+Class GUID: {37d0014b-370c-47ef-bf03-588e8acb2fcd}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_LIGHTING_DATA
+Class Name: LENOVO_LIGHTING_DATA
+Class GUID: {4dd5bd84-15a9-47e2-ad65-cc61a5c62fd0}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_GAMEZONE_CPU_OC_DATA
+Class Name: LENOVO_GAMEZONE_CPU_OC_DATA
+Class GUID: {B7F3CA0A-ACDC-42D2-9217-77C6C628FBD2}
+Description: 0
+Methods:
+
+########################################
+########################################
+########################################
+Name: LENOVO_LIGHTING_METHOD
+Class Name: LENOVO_LIGHTING_METHOD
+Class GUID: {8c5b9127-ecd4-4657-980f-851019f99ca5}
+Description: 2
+Methods:
+Name: Get_Lighting_Current_Status
+WmiMethodId: 1
+Class Name: LENOVO_LIGHTING_METHOD
+Class GUID: {8c5b9127-ecd4-4657-980f-851019f99ca5}
+Description: Get Current Lighting Status
+Implemented: True
+input: lighting_id
+output: current_Brigness_Level, Current_State_Type
+
+Name: Set_Lighting_Current_Status
+WmiMethodId: 2
+Class Name: LENOVO_LIGHTING_METHOD
+Class GUID: {8c5b9127-ecd4-4657-980f-851019f99ca5}
+Description: Set Current Lighting Status
+Implemented: True
+Input: Current_Brithngess_Level, Current_State_Type, Lighting_ID
+
+
+########################################
+########################################
+########################################
+Name: LENOVO_MEMORY_METHOD
+Class Name: LENOVO_MEMORY_METHOD
+Class GUID: {03607fce-0d83-4612-8a6e-4a4ef0415ea9}
+Description: 3
+Methods:
+Name: MEM_Get_OC_Status
+WmiMethodId: 1
+Class Name: LENOVO_MEMORY_METHOD
+Class GUID: {03607fce-0d83-4612-8a6e-4a4ef0415ea9}
+Description: Get Memory OC Status
+Implemented: True
+
+Name: MEM_Set_OC_Status
+WmiMethodId: 2
+Class Name: LENOVO_MEMORY_METHOD
+Class GUID: {03607fce-0d83-4612-8a6e-4a4ef0415ea9}
+Description: Set Memory OC Status
+Implemented: True
+
+Name: MEM_Set_OC_Data
+WmiMethodId: 3
+Class Name: LENOVO_MEMORY_METHOD
+Class GUID: {03607fce-0d83-4612-8a6e-4a4ef0415ea9}
+Description: Set Memory OC Data
+Implemented: True

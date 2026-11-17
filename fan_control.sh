@@ -14,7 +14,24 @@ find_base() {
 }
 
 set_attr() {
-	echo "$2" | sudo tee "$1/$3" > /dev/null
+	if ! echo "$2" | sudo tee "$1/$3" > /dev/null; then
+		echo "Error: failed to set $3 (on some models the power mode must be set to Custom first)" >&2
+		return 1
+	fi
+}
+
+set_attr_checked() {
+	if set_attr "$@"; then
+		return 0
+	fi
+	exit 1
+}
+
+# fan_maxspeed is hidden on models whose firmware lacks Fan_Get/Set_MaxSpeed (e.g. KWCN)
+set_attr_if_present() {
+	if [ -e "$1/$3" ]; then
+		set_attr_checked "$@"
+	fi
 }
 
 read_attr() {
@@ -41,15 +58,15 @@ BASE=$(find_base) || {
 case "$1" in
 	"enable")
 		echo "🔥 Enabling high-performance fan mode..."
-		set_attr "$BASE" 1 fan_fullspeed
-		set_attr "$BASE" 1 fan_maxspeed
+		set_attr_checked "$BASE" 1 fan_fullspeed
+		set_attr_if_present "$BASE" 1 fan_maxspeed
 		echo "✅ High-performance fan mode enabled!"
 		show_status "$BASE"
 		;;
 	"disable")
 		echo "🌡️ Disabling high-performance fan mode..."
-		set_attr "$BASE" 0 fan_fullspeed
-		set_attr "$BASE" 0 fan_maxspeed
+		set_attr_checked "$BASE" 0 fan_fullspeed
+		set_attr_if_present "$BASE" 0 fan_maxspeed
 		echo "✅ Automatic fan control restored!"
 		show_status "$BASE"
 		;;

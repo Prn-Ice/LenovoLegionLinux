@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 # PYTHON_ARGCOMPLETE_OK
 # pylint: disable=wrong-import-order
-import argcomplete
+try:
+    import argcomplete
+except ImportError:
+    argcomplete = None
 import argparse
 import logging
 import sys
 import os
 import json
 
-# Make it possible to run without installationimport
-# pylint: disable=# pylint: disable=wrong-import-position
+# Make it possible to run without installation
+# pylint: disable=wrong-import-position
 sys.path.insert(0, os.path.dirname(__file__) + "/..")
 import legion_linux.legion
 from legion_linux.legion import LegionModelFacade
@@ -19,6 +22,19 @@ log = logging.getLogger(legion_linux.legion.__name__)
 loglevels = ["NOTSET", "DEBUG", "INFO", "WARN", "ERROR", "CRITICAL"]
 # will be set in main to user defined level after parsing
 log.setLevel("ERROR")
+
+# Exit codes. These have to stay within 0-255: a process exit status is a
+# single unsigned byte, so a negative value is truncated by the kernel and
+# reaches the shell as some unrelated number (-10 became 246, -1 became
+# 255, -2 became 254). Anything checking "rc != 0" is unaffected; only
+# callers that inspect the specific value would notice a change.
+EXIT_OK = 0
+# the base class does not implement the action
+EXIT_NOT_IMPLEMENTED = 1
+# the feature is missing, most often because the kernel module is not loaded
+EXIT_FEATURE_UNAVAILABLE = 2
+# a named feature does not exist
+EXIT_FEATURE_NOT_FOUND = 3
 
 
 class CLIFeatureCommand:
@@ -50,29 +66,29 @@ class CLIFeatureCommand:
     def command_status_cli(self, **_) -> int:
         if self.check_if_exist():
             return self.command_status()
-        return -10
+        return EXIT_FEATURE_UNAVAILABLE
 
     def command_enable_cli(self, **_) -> int:
         if self.check_if_exist():
             return self.command_enable()
-        return -10
+        return EXIT_FEATURE_UNAVAILABLE
 
     def command_disable_cli(self, **_) -> int:
         if self.check_if_exist():
             return self.command_disable()
-        return -10
+        return EXIT_FEATURE_UNAVAILABLE
 
     def exists(self) -> bool:
         return False
 
     def command_status(self, **_) -> int:
-        return 0
+        return EXIT_OK
 
     def command_enable(self, **_) -> int:
-        return -1
+        return EXIT_NOT_IMPLEMENTED
 
     def command_disable(self, **_) -> int:
-        return -1
+        return EXIT_NOT_IMPLEMENTED
 
 
 class MiniFancurveFeatureCommand(CLIFeatureCommand):
@@ -81,7 +97,7 @@ class MiniFancurveFeatureCommand(CLIFeatureCommand):
         self.model = model
 
     def exists(self) -> bool:
-        return self.model.fancurve_io.exists()
+        return self.model.fancurve_io.has_minifancurve()
 
     def command_status(self, **_) -> int:
         print(self.model.fancurve_io.get_minifancuve())
@@ -271,6 +287,48 @@ class AlwaysOnUsbCharging(CLIFeatureCommand):
         return 0
 
 
+class InstantBootAC(CLIFeatureCommand):
+    def __init__(self, parser_subcommands, model: LegionModelFacade, cmd_group: list):
+        super().__init__("instant-boot-ac", parser_subcommands, cmd_group)
+        self.model = model
+
+    def exists(self) -> bool:
+        return self.model.instant_boot_ac.exists()
+
+    def command_status(self, **_) -> int:
+        print(self.model.instant_boot_ac.get())
+        return 0
+
+    def command_enable(self, **_) -> int:
+        self.model.instant_boot_ac.set(True)
+        return 0
+
+    def command_disable(self, **_) -> int:
+        self.model.instant_boot_ac.set(False)
+        return 0
+
+
+class InstantBootUSBPD(CLIFeatureCommand):
+    def __init__(self, parser_subcommands, model: LegionModelFacade, cmd_group: list):
+        super().__init__("instant-boot-usb-pd", parser_subcommands, cmd_group)
+        self.model = model
+
+    def exists(self) -> bool:
+        return self.model.instant_boot_usb_pd.exists()
+
+    def command_status(self, **_) -> int:
+        print(self.model.instant_boot_usb_pd.get())
+        return 0
+
+    def command_enable(self, **_) -> int:
+        self.model.instant_boot_usb_pd.set(True)
+        return 0
+
+    def command_disable(self, **_) -> int:
+        self.model.instant_boot_usb_pd.set(False)
+        return 0
+
+
 class RapidCharging(CLIFeatureCommand):
     def __init__(self, parser_subcommands, model: LegionModelFacade, cmd_group: list):
         super().__init__("rapid-charging", parser_subcommands, cmd_group)
@@ -352,7 +410,16 @@ def fancurve_write_hw_to_file(legion: LegionModelFacade, filename: str, **_) -> 
 
 def fancurve_write_preset_for_current_profile(legion: LegionModelFacade, **_) -> int:
     # pylint: disable=unused-argument
-    legion.fancurve_write_preset_for_current_profile(write_minifancurve=True)
+    written = legion.fancurve_write_preset_for_current_profile(write_minifancurve=True)
+    if not written:
+        print(
+            "No fan curve preset exists for the current power mode, so nothing was"
+            " written to the hardware. Presets ship for the balanced and"
+            " performance modes; use fancurve-write-file-to-hw with an explicit"
+            " file for any other mode.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -372,11 +439,11 @@ def monitor(legion: LegionModelFacade, period=None, **_) -> int:
 def set_feature(legion: LegionModelFacade, name, values, **_) -> int:
     log.setLevel("INFO")
     if legion.set_feature_to_str_value(name, values):
-        return 0
+        return EXIT_OK
     print("Feature not found.")
     for feat in legion.get_all_features():
         print(feat)
-    return -2
+    return EXIT_FEATURE_NOT_FOUND
 
 
 def graphics_mode_status(legion: LegionModelFacade, json_output=False, **_) -> int:
@@ -589,11 +656,14 @@ def main():
     CameraPowerFeatureCommand(subcommands, None, cmd_group)
     OnPowerSupplyFeatureCommand(subcommands, None, cmd_group)
     AlwaysOnUsbCharging(subcommands, None, cmd_group)
+    InstantBootAC(subcommands, None, cmd_group)
+    InstantBootUSBPD(subcommands, None, cmd_group)
     RapidCharging(subcommands, None, cmd_group)
     HybridMode(subcommands, None, cmd_group)
 
     # only add autocompletion if package is installed
-    argcomplete.autocomplete(parser)
+    if argcomplete is not None:
+        argcomplete.autocomplete(parser)
 
     args = parser.parse_args()
     log.setLevel(args.loglevel)
@@ -612,4 +682,20 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except FileNotFoundError as err:
+        log.error(str(err))
+        print(
+            "Error: The kernel module is not loaded or the hwmon directory was not found. "
+            "Are you sure 'legion-laptop' is loaded? Use '--donotexpecthwmon' to proceed without hwmon access.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except RuntimeError as err:
+        log.error(str(err))
+        sys.exit(1)
+    except (OSError, KeyError, TypeError, ValueError, OverflowError) as err:
+        log.error(str(err))
+        print(f"Error: {err}", file=sys.stderr)
+        sys.exit(1)

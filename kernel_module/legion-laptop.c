@@ -63,8 +63,12 @@
 #include <asm/io.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/workqueue.h>
 #include <linux/dmi.h>
+#include <linux/efi.h>
 #include <linux/leds.h>
+#include <linux/input.h>
+#include <linux/input/sparse-keymap.h>
 #include <linux/hwmon.h>
 #include <linux/hwmon-sysfs.h>
 #include <linux/kernel.h>
@@ -72,6 +76,7 @@
 #include <linux/moduleparam.h>
 #include <linux/platform_device.h>
 #include <linux/platform_profile.h>
+#include <linux/power_supply.h>
 #include <linux/types.h>
 #include <linux/wmi.h>
 #include <linux/version.h>
@@ -79,6 +84,12 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("johnfan");
 MODULE_DESCRIPTION("Lenovo Legion laptop extras");
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS("EFIVAR");
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+MODULE_IMPORT_NS(EFIVAR);
+#endif
 
 static bool force;
 module_param(force, bool, 0440);
@@ -92,11 +103,23 @@ MODULE_PARM_DESC(
 	ec_readonly,
 	"Only read from embedded controller but do not write or change settings.");
 
+/* Allowlisted 83LT/RLCN GPU mode writes take effect after firmware reboot. */
+static bool allow_rlcn20_mux_write;
+module_param(allow_rlcn20_mux_write, bool, 0440);
+MODULE_PARM_DESC(allow_rlcn20_mux_write,
+	"Allow 83LT/allowlisted RLCN BIOS graphics requests (reboot required).");
+
 static bool enable_platformprofile = true;
 module_param(enable_platformprofile, bool, 0440);
 MODULE_PARM_DESC(
 	enable_platformprofile,
 	"Enable the platform profile sysfs API to read and write the power mode.");
+
+static bool allow_unvalidated_fancurve;
+module_param(allow_unvalidated_fancurve, bool, 0440);
+MODULE_PARM_DESC(
+	allow_unvalidated_fancurve,
+	"Allow fan curve writes on models whose fan table unit is not yet validated on hardware (e.g. LPCN). A wrong unit can hard power-off the laptop.");
 
 // TODO: remove this?
 #define LEGIONFEATURES \
@@ -194,23 +217,23 @@ enum access_method {
 	ACCESS_METHOD_WMI = 3,
 	ACCESS_METHOD_WMI2 = 4,
 	ACCESS_METHOD_WMI3 = 5,
-	ACCESS_METHOD_WMI3_CLAMPED = 6,
 	ACCESS_METHOD_EC2 = 10, // ideapad fancurve method
 	ACCESS_METHOD_EC3 = 11, // loq
-	ACCESS_METHOD_EC4 = 12, // legion 2024 (e.g. 16IRX9)
 };
 
 // acpi paths used by this driver
 enum acpi_paths_inventory_ids {
 	ACPI_PATH_STA = 0, // _STA
-	ACPI_PATH_CFG,     // _CFG
+	ACPI_PATH_CFG, // _CFG
 	ACPI_PATH_READ_RAPIDCHARGE, // GBMD
-	ACPI_PATH_WRITE_RAPIDCHARGE,// SBMC
+	ACPI_PATH_WRITE_RAPIDCHARGE, // SBMC
 	ACPI_PATH_READ_POWERMODE, // BTSM
 	ACPI_PATH_READ_FANSPEED1, // FANS
 	ACPI_PATH_READ_FANSPEED2, // FA2S
 	ACPI_PATH_READ_CPU_TEMP, // CPUT
 	ACPI_PATH_READ_GPU_TEMP, // GPUT
+	ACPI_PATH_READ_FNLOCK, // HALS
+	ACPI_PATH_WRITE_FNLOCK, // SALS
 	ACPI_PATH_MAX // not a PATH just the max nbr of this enum
 };
 
@@ -239,6 +262,13 @@ struct model_config {
 	bool has_minifancurve;
 	bool has_custom_powermode;
 	bool has_extreme_powermode;
+
+	// Which EXT_*_TEMP_INPUT offsets have actually been validated for this
+	// model, as a TEMP_REGISTER_* bitmask. Zero everywhere by default, which
+	// keeps reading the hardcoded addresses below, exactly as before. Most
+	// model configs carry unvalidated placeholders for these registers, so a
+	// model may only opt in for the registers confirmed on real hardware.
+	u8 validated_temp_registers;
 	enum access_method access_method_powermode;
 
 	enum access_method access_method_keyboard;
@@ -249,15 +279,84 @@ struct model_config {
 	enum access_method access_method_powerlimits;
 	bool three_state_keyboard;
 	bool skip_ic_temp;
+	/* No discrete GPU: the firmware flags the GPU temperature feature
+	 * (0x05050000) unsupported and EC GPUT reads 0, so hide temp2.
+	 */
+	bool skip_gpu_temp;
 	bool skip_oc_controls;
+	/*
+	 * Hide WMI OC / default / peak / APU / GPU-temp-limit / boost-clock
+	 * attributes whose methods are unimplemented or return incompatible
+	 * ACPI types on this firmware, while keeping working PL1/PL2 and
+	 * GPU PPAB/cTGP attributes visible.
+	 */
+	bool skip_unusable_oc_attrs;
+	/* The lockfancontroller attribute writes EC byte
+	 * EXT_LOCKFANCONTROLLER through Super-I/O port I/O regardless of
+	 * the configured access methods; set on models whose EC does not
+	 * declare that byte.
+	 */
+	bool skip_lockfancontroller;
+	/*
+	 * fan_maxspeed calls Fan_Get_MaxSpeed/Fan_Set_MaxSpeed (ids 3/4) on
+	 * LENOVO_FAN_METHOD; set on firmware whose fan method does not
+	 * implement them, where the call runs off the end of the dispatcher
+	 * without a Return and succeeds, so the attribute reads a meaningless 0
+	 * and a write is a no-op.
+	 */
+	bool skip_fan_maxspeed;
 	bool acpi_fanspeed_is_rpm;
 	/* fan_target registers hold duty-cycle (0-100); scale by 100 to approximate RPM */
 	bool fan_target_is_duty;
+	/* EXT_FAN*_RPM_LSB is a single byte in units of 100 RPM and there is
+	 * no MSB byte (QNCN FANS/FA2S).
+	 */
+	bool ec_fanspeed_unit_100rpm;
+	/* Bits of EXT_POWERMODE that hold the power mode; 0 = whole byte.
+	 * QNCN keeps SPMO in bits 0-3 and unrelated flags in bits 4-7.
+	 */
+	u8 ec_powermode_mask;
+	/* The EC has no fan target register: hide fan1_target/fan2_target. */
+	bool skip_fan_target;
 	bool has_four_fans;
+	/* hwmon fan3 is the firmware's fan 4, read through the WMI3 Other
+	 * Method feature OtherMethodFeature_FAN_SPEED_4 (Q7CN).
+	 */
+	bool has_third_fan;
+	/* Do not bind the GameZone WMI method block, so the mainline
+	 * lenovo-wmi-gamezone driver can: lenovo-wmi-other needs it to read
+	 * the power mode, else its firmware-attributes (PL1/PL2, cTGP, ...)
+	 * return -EINVAL. Methods are still called by GUID.
+	 */
+	bool leave_gamezone_wmi_unbound;
+	/* Re-apply the last fan table written through hwmon after resume: the
+	 * EC raises every point to at least the mode default on resume (Q7CN),
+	 * which silently loses quieter custom curves.
+	 */
+	bool restore_fancurve_on_resume;
+	bool has_single_fan;
+	u16 fan_max_rpm;
+	bool fanfullspeed_requires_custom_powermode;
 	bool skip_ylogo_light;
 	bool skip_ioport_light;
 	// EC register holding the Y-Logo light state; 0 = not available
 	u16 ec_ylogo_register;
+	/*
+	 * EC byte holding the firmware's custom mode flags (J2CN: CTMD in
+	 * bit 0, CTPA in bit 1); 0 = not available. A custom request on
+	 * battery leaves the EC in balanced with CTPA ("custom pending for
+	 * AC") set, and the GameZone get method then reports custom. The
+	 * driver only reads this byte, to report such a parked request as
+	 * balanced.
+	 */
+	u16 ec_custom_mode_register;
+	/*
+	 * The firmware only enters custom mode on AC; on battery it parks
+	 * the request (see ec_custom_mode_register), and none of the other
+	 * mode requests clear it, so it fires when AC is plugged in later.
+	 * Refuse custom while the system runs on battery.
+	 */
+	bool custom_powermode_requires_ac;
 
 	bool acpi_check_dev;
 
@@ -266,6 +365,15 @@ struct model_config {
 	const char *acpi_paths[ACPI_PATH_MAX];
 	bool has_fancurve_defaults;
 	bool wmi_fancurve_speed_only;
+	/* The fan table unit is inferred (DSDT, Lenovo Legion Toolkit) but not
+	 * yet validated by a write on hardware: refuse fan curve writes unless
+	 * the allow_unvalidated_fancurve module parameter is set.
+	 */
+	bool fancurve_write_unvalidated;
+	/* EC3: fan curve is read back from EXT_*_BASE (the block the writer
+	 * writes) instead of EXT_*_RPM_LSB. Validated on LOQ 15IAX9 (83GS).
+	 */
+	bool ec3_fancurve_shared_table;
 	bool require_unlocked_fan_controller;
 	bool has_pl_coupling;
 	/* Firmware silently ignores SetFeatureValue power-limit writes outside
@@ -281,6 +389,17 @@ struct model_config {
 	 * issuing an unverified WMI call. See issue #429 / PR #443.
 	 */
 	bool has_fan_unlock;
+	/* fan_unlock reads the live state back through WMAA(0, 0x14) instead
+	 * of the cached last write. Set only where the DSDT implements 0x14 as
+	 * FCST & 1, so a Fn+Q toggle is reported too (Legion Y530, 8JCN).
+	 */
+	bool has_fan_unlock_readback;
+	bool has_fn_lock;
+	bool has_flip_to_start;
+	/* instant_boot_ac/instant_boot_usb_pd through WMI3 feature ids
+	 * 0x03010001/0x03010002; set only where the DSDT implements both.
+	 */
+	bool has_instant_boot;
 };
 
 /* =================================== */
@@ -413,8 +532,8 @@ static const struct ec_register_offsets ec_register_offsets_ideapad_v0 = {
 	.EXT_FAN1_RPM_MSB = 0xC5a0, // not found yet
 	.EXT_FAN2_RPM_LSB = 0xC5a0, // not found yet
 	.EXT_FAN2_RPM_MSB = 0xC5a0, // not found yet
-	.EXT_MINIFANCURVE_ON_COOL = 0xC5a0, // does not exists or not found
-	.EXT_LOCKFANCONTROLLER = 0xC5a0, // does not exists or not found
+	.EXT_MINIFANCURVE_ON_COOL = 0, // unsupported
+	.EXT_LOCKFANCONTROLLER = 0, // unsupported
 	.EXT_CPU_TEMP_INPUT = 0xC5a0, // not found yet
 	.EXT_GPU_TEMP_INPUT = 0xC5a0, // not found yet
 	.EXT_IC_TEMP_INPUT = 0xC5a0, // not found yet
@@ -446,8 +565,8 @@ static const struct ec_register_offsets ec_register_offsets_ideapad_v1 = {
 	.EXT_FAN1_RPM_MSB = 0xC5a0, // not found yet
 	.EXT_FAN2_RPM_LSB = 0xC5a0, // not found yet
 	.EXT_FAN2_RPM_MSB = 0xC5a0, // not found yet
-	.EXT_MINIFANCURVE_ON_COOL = 0xC5a0, // does not exists or not found
-	.EXT_LOCKFANCONTROLLER = 0xC5a0, // does not exists or not found
+	.EXT_MINIFANCURVE_ON_COOL = 0, // unsupported
+	.EXT_LOCKFANCONTROLLER = 0, // unsupported
 	.EXT_CPU_TEMP_INPUT = 0xC5a0, // not found yet
 	.EXT_GPU_TEMP_INPUT = 0xC5a0, // not found yet
 	.EXT_IC_TEMP_INPUT = 0xC5a0, // not found yet
@@ -479,8 +598,8 @@ static const struct ec_register_offsets ec_register_offsets_loq_v0 = {
 	.EXT_FAN1_RPM_MSB = 0xC5a0, // not found yet
 	.EXT_FAN2_RPM_LSB = 0xc530, // gpu fan base for reads
 	.EXT_FAN2_RPM_MSB = 0xC5a0, // not found yet
-	.EXT_MINIFANCURVE_ON_COOL = 0xC5a0, // not found yet
-	.EXT_LOCKFANCONTROLLER = 0xC5a0, // not found yet
+	.EXT_MINIFANCURVE_ON_COOL = 0, // unsupported
+	.EXT_LOCKFANCONTROLLER = 0, // unsupported
 	.EXT_CPU_TEMP_INPUT = 0xC5a0, // not found yet
 	.EXT_GPU_TEMP_INPUT = 0xC5a0, // not found yet
 	.EXT_IC_TEMP_INPUT = 0xC5a0, // not found yet
@@ -512,8 +631,8 @@ static const struct ec_register_offsets ec_register_offsets_loq_v1 = {
 	.EXT_FAN1_RPM_MSB = 0xC5a0, // not found yet
 	.EXT_FAN2_RPM_LSB = 0xc53c, // gpu fan base for reads
 	.EXT_FAN2_RPM_MSB = 0xC5a0, // not found yet
-	.EXT_MINIFANCURVE_ON_COOL = 0xC5a0, // not found yet
-	.EXT_LOCKFANCONTROLLER = 0xC5a0, // not found yet
+	.EXT_MINIFANCURVE_ON_COOL = 0, // unsupported
+	.EXT_LOCKFANCONTROLLER = 0, // unsupported
 	.EXT_CPU_TEMP_INPUT = 0xC5a0, // not found yet
 	.EXT_GPU_TEMP_INPUT = 0xC5a0, // not found yet
 	.EXT_IC_TEMP_INPUT = 0xC5a0, // not found yet
@@ -523,6 +642,90 @@ static const struct ec_register_offsets ec_register_offsets_loq_v1 = {
 	.EXT_MAXIMUMFANSPEED = 0xC5a0, // not found yet
 	.EXT_WHITE_KEYBOARD_BACKLIGHT = 0xC5a0 // not found yet
 };
+
+// Yoga Pro 7 14AHP9 (83E3, NCCN, EC 0x5571): this EC publishes only the two
+// temperatures below in its host RAM window (ERAM @0xFEEC2300, DSDT of issue
+// #630): TCPU @0x07 and TGPU @0x08, read through the validated-temp-register
+// path. There are no fan RPM, fan curve or power mode fields in the window;
+// the zeroed offsets are never read because every matching access method is
+// NO_ACCESS in model_nccn.
+static const struct ec_register_offsets ec_register_offsets_nccn = {
+	.ECHIPID1 = 0x2000,
+	.ECHIPID2 = 0x2001,
+	.ECHIPVER = 0x2002,
+	.ECDEBUG = 0x2003,
+	.EXT_CPU_TEMP_INPUT = 0x07,
+	.EXT_GPU_TEMP_INPUT = 0x08,
+};
+
+// Legion 5 15IRX10 (83LY), BIOS QNCN38WW, EC 0x5508 (issue #491). The
+// DSDT's ERAX window at 0xFE0B0400 is EC 0xC400 (the port I/O and RAM
+// dumps match byte for byte). FANS @0xC406 and FA2S @0xC403 count in
+// units of 100 RPM, CPUT @0xC4B0 and GPUT @0xC4B4 are degrees Celsius,
+// and SPMO is bits 0-3 of 0xC420; all of them matched the WMI3 readings
+// on an 83LY. The v0 fan RPM bytes 0xC5E0..0xC5E3 are custom-mode CPU
+// power limits on this firmware (0x467D = 18045 "RPM"), and the
+// EC_TEMP_INPUT_CPU/GPU fallbacks are the GPU cTGP and the GPU
+// temperature limit NTCC. The firmware declares no fan target byte.
+// EXT_MAXIMUMFANSPEED keeps the v0 value; FNST is bit 0 of 0xC58B, which
+// ec_read_fanfullspeed() cannot express, and QNCN uses WMI3 for it.
+static const struct ec_register_offsets ec_register_offsets_qncn = {
+	.ECHIPID1 = 0x2000,
+	.ECHIPID2 = 0x2001,
+	.ECHIPVER = 0x2002,
+	.ECDEBUG = 0x2003,
+	.EXT_FAN1_RPM_LSB = 0xC406,
+	.EXT_FAN2_RPM_LSB = 0xC403,
+	.EXT_POWERMODE = 0xC420,
+	.EXT_MAXIMUMFANSPEED = 0xBD,
+	.EXT_CPU_TEMP_INPUT = 0xC4B0,
+	.EXT_GPU_TEMP_INPUT = 0xC4B4,
+};
+
+// Legion Y9000X IAH7 / Slim 7 16IAH7 (82TF), BIOS JYCN, EC 0x8227 (issues #86,
+// #141, PR #659). JYCN34WW DSDT ECF2 @0xFE0B0400 maps byte-for-byte to EC
+// 0xC400..0xC4FF: F1LO/F1HI @0xC406/0xC407 and F2LO/F2HI @0xC408/0xC409 are
+// little-endian fan RPM (also read in GZFD.WMAC id 7), TSR2 @0xC418 is CPU
+// temperature (read in GZFD.WMAD id 0x0A), and TSR3 @0xC419 is GPU temperature
+// (read in GZFD.WMAE id 0x08 and H_EC.THMC).
+static const struct ec_register_offsets ec_register_offsets_jycn = {
+	.ECHIPID1 = 0x2000,
+	.ECHIPID2 = 0x2001,
+	.ECHIPVER = 0x2002,
+	.ECDEBUG = 0x2003,
+	.EXT_FAN1_RPM_LSB = 0xC406,
+	.EXT_FAN1_RPM_MSB = 0xC407,
+	.EXT_FAN2_RPM_LSB = 0xC408,
+	.EXT_FAN2_RPM_MSB = 0xC409,
+	.EXT_CPU_TEMP_INPUT = 0xC418,
+	.EXT_GPU_TEMP_INPUT = 0xC419,
+	.EXT_POWERMODE = 0xC420,
+	.EXT_MAXIMUMFANSPEED = 0xBD,
+};
+
+// Legion Pro 5 16IRX9 (83DF), BIOS N0CN, EC 0x5507 (issue #497). ERAX
+// @0xFE0B0400 maps to EC 0xC400..0xC4FF: FANS @0xC406 and FA2S @0xC4FE count
+// in units of 100 RPM, SPMO is bits 0-3 of 0xC420, and CPUT @0xC4B0 / GPUT
+// @0xC4B4 are degrees Celsius. On v0 offsets 0xC5E0..0xC5E3 hit F9FT+0x20..0x23
+// (F5E0/CCP1/F5E2/CCP2 CPU power/temp limits, yielding bogus 18039/14177 RPM).
+static const struct ec_register_offsets ec_register_offsets_n0cn = {
+	.ECHIPID1 = 0x2000,
+	.ECHIPID2 = 0x2001,
+	.ECHIPVER = 0x2002,
+	.ECDEBUG = 0x2003,
+	.EXT_FAN1_RPM_LSB = 0xC406,
+	.EXT_FAN2_RPM_LSB = 0xC4FE,
+	.EXT_POWERMODE = 0xC420,
+	.EXT_MAXIMUMFANSPEED = 0xBD,
+	.EXT_CPU_TEMP_INPUT = 0xC4B0,
+	.EXT_GPU_TEMP_INPUT = 0xC4B4,
+};
+
+// Selects which per-model EXT_*_TEMP_INPUT offsets are trusted, see
+// model_config.validated_temp_registers.
+#define TEMP_REGISTER_CPU (1 << 0)
+#define TEMP_REGISTER_GPU (1 << 1)
+#define TEMP_REGISTER_IC (1 << 2)
 
 static const struct model_config model_v0 = {
 	.registers = &ec_register_offsets_v0,
@@ -541,12 +744,46 @@ static const struct model_config model_v0 = {
 	.acpi_check_dev = true,
 	.ramio_physical_start = 0xFE00D400,
 	.ramio_size = 0x600,
-	.acpi_paths = {
-		[ACPI_PATH_STA] = "\\_SB.PCI0.LPC0.EC0.VPC0._STA",
-		[ACPI_PATH_CFG] = "\\_SB.PCI0.LPC0.EC0.VPC0._CFG",
-		[ACPI_PATH_READ_RAPIDCHARGE] = "\\_SB.PCI0.LPC0.EC0.VPC0.GBMD",
-		[ACPI_PATH_WRITE_RAPIDCHARGE] = "\\_SB.PCI0.LPC0.EC0.VPC0.SBMC"
-	}
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PCI0.LPC0.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PCI0.LPC0.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.SBMC" }
+};
+
+// Legion Y7000 2021 (82JK), BIOS H1CN, EC chip 0x8227. Same register map
+// as model_v0, but the H1CN49WW DSDT puts the EC under \_SB.PC00.LPCB.EC0
+// instead of \_SB.PCI0.LPC0.EC0 (LPC0 does not exist in that table at all),
+// so the v0 ACPI paths never resolve with AE_NOT_FOUND (-5): the probe was
+// aborted on kernels < 7.0 and rapidcharge stayed hidden on 7.x.
+// DSDT references (H1CN49WW): Scope (\_SB.PC00.LPCB) at L20615, Device
+// (EC0) at L20627, Scope (\_SB.PC00.LPCB.EC0) at L21745 with Device (VPC0)
+// (_HID "VPC2004") at L21747, _STA at L21753 (returns 0x0F), _CFG at
+// L21758 (returns _VPC = 0x7C0DF516), GBMD at L21908 and SBMC at L22128.
+static const struct model_config model_h1cn_8227 = {
+	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x8227,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = true,
+	.has_custom_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI,
+	.access_method_fanspeed = ACCESS_METHOD_EC,
+	.access_method_temperature = ACCESS_METHOD_EC,
+	.access_method_fancurve = ACCESS_METHOD_EC,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI,
+	.acpi_check_dev = true,
+	.ramio_physical_start = 0xFE00D400,
+	.ramio_size = 0x600,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SBMC" }
 };
 
 static const struct model_config model_efcn = {
@@ -577,14 +814,21 @@ static const struct model_config model_efcn = {
 	// and the EC keeps this register in sync).
 	.ec_ylogo_register = 0xC36F,
 	.skip_ioport_light = true,
-	.acpi_paths = {
-		[ACPI_PATH_STA] = "\\_SB.PCI0.LPCB.EC0.VPC0._STA",
-		[ACPI_PATH_CFG] = "\\_SB.PCI0.LPCB.EC0.VPC0._CFG",
-		[ACPI_PATH_READ_RAPIDCHARGE] = "\\_SB.PCI0.LPCB.EC0.VPC0.GBMD",
-		[ACPI_PATH_WRITE_RAPIDCHARGE] = "\\_SB.PCI0.LPCB.EC0.VPC0.SBMC"
-	}
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PCI0.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PCI0.LPCB.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPCB.EC0.VPC0.SBMC" }
 };
 
+// Legion 5 Pro 16IAH7H (82RF, 2022), BIOS J2CN, EC chip 0x8227 (issue
+// #600). Same register map as model_v0, but this Alder Lake DSDT puts
+// the EC under \_SB.PC00.LPCB.EC0 instead of \_SB.PCI0.LPC0.EC0, so the
+// v0 ACPI paths never resolve and rapidcharge stayed hidden. A duplicate
+// J2CN allowlist entry using model_v0 shadowed this config until #601.
+// Rapidcharge verified on BIOS J2CN35WW: charge power 79 W off vs
+// 168 W avg / 188 W peak on, no fancurve/sensors/powermode regression.
 static const struct model_config model_j2cn = {
 	.registers = &ec_register_offsets_v0,
 	.check_embedded_controller_id = true,
@@ -599,9 +843,21 @@ static const struct model_config model_j2cn = {
 	.access_method_temperature = ACCESS_METHOD_EC,
 	.access_method_fancurve = ACCESS_METHOD_EC,
 	.access_method_fanfullspeed = ACCESS_METHOD_WMI,
+	/*
+	 * ERAX offset 0x1D (CTMD bit 0, CTPA bit 1) in the J2CN61WW DSDT;
+	 * ERAX starts at 0xC400, as SPMO (ERAX 0x20) is EXT_POWERMODE
+	 * 0xC420, which reads 0 in balanced and 2 in quiet here (#651).
+	 */
+	.ec_custom_mode_register = 0xC41D,
+	.custom_powermode_requires_ac = true,
 	.acpi_check_dev = true,
 	.ramio_physical_start = 0xFE00D400,
-	.ramio_size = 0x600
+	.ramio_size = 0x600,
+	/* rapidcharge EC at \_SB.PC00.LPCB.EC0, not v0 \_SB.PCI0.LPC0.EC0 */
+	.acpi_paths = { [ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SBMC" }
 };
 
 static const struct model_config model_9vcn = {
@@ -642,6 +898,53 @@ static const struct model_config model_v2022 = {
 	.ramio_size = 0x600
 };
 
+// Legion Y9000X IAH7 / Slim 7 16IAH7 (82TF), BIOS JYCN, EC 0x8227 (issues #86,
+// #141, PR #659; JYCN34WW DSDT + runtime dumps):
+// - Sensors via ec_register_offsets_jycn; no labeled IC sensor -> skip_ic_temp.
+//   The v0 multi-point EC curve (0xC535), minifancurve (0xC536) and
+//   lockfancontroller (0xC4AB, unmapped in ECF2) do not exist here.
+// - LENOVO_FAN_METHOD (GZFD.WMAC) declares CreateDWordField(FANT, 8, FMS2) on a
+//   10-byte buffer at method scope, so WMI evaluate aborts with
+//   AE_AML_BUFFER_LIMIT before reaching Fan_Set_FullSpeed (id 2, tail) or
+//   Fan_Set_Table (id 6); Fan_Get_Table (id 5) is absent and ids 3/4 are stubs,
+//   while WMB0 lacks 0x11/0x12 -> fan_fullspeed/fan_maxspeed disabled. Read and
+//   write the same 10-level EC table F9F0..F9F9 (0xC4D0..0xC4D9), F9FA (0xC4DA,
+//   SFMD 1..3; custom 0xFF maps to balanced 2) and CUFT (0xC4DF bit 1) under
+//   \_SB.PC00.LPCB.H_EC.ECMT, gated behind allow_unvalidated_fancurve.
+// - LENOVO_FAN_TABLE_DATA (WQA4) publishes 3 mode-agnostic 72-byte FACT rows
+//   sharing one 10-level ladder (1700..4500 RPM).
+// - WMAD/WMAE implement PL1/PL2 and GPU PPAB/cTGP; OC, default/peak/APU limits,
+//   GPU temp limit and boost clock are stubs or incompatible -> hidden via
+//   skip_unusable_oc_attrs. WMB1 has no Y-logo light (SLID 3).
+static const struct model_config model_jycn = {
+	.registers = &ec_register_offsets_jycn,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x8227,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI,
+	.access_method_fanspeed = ACCESS_METHOD_EC,
+	.access_method_temperature = ACCESS_METHOD_EC,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_NO_ACCESS,
+	.validated_temp_registers = TEMP_REGISTER_CPU | TEMP_REGISTER_GPU,
+	.skip_ic_temp = true,
+	.skip_lockfancontroller = true,
+	.skip_fan_target = true,
+	.skip_fan_maxspeed = true,
+	.skip_ylogo_light = true,
+	.skip_unusable_oc_attrs = true,
+	.wmi_fancurve_speed_only = true,
+	.has_fancurve_defaults = true,
+	.fancurve_write_unvalidated = true,
+	.acpi_check_dev = true,
+	.ramio_physical_start = 0xFE0B0400,
+	.ramio_size = 0x600,
+};
+
 static const struct model_config model_4gcn = {
 	.registers = &ec_register_offsets_v0,
 	.check_embedded_controller_id = true,
@@ -674,7 +977,11 @@ static const struct model_config model_bvcn = {
 	.access_method_fanspeed = ACCESS_METHOD_WMI,
 	.access_method_temperature = ACCESS_METHOD_WMI,
 	.access_method_fancurve = ACCESS_METHOD_NO_ACCESS,
-	.access_method_fanfullspeed = ACCESS_METHOD_WMI,
+	/* BVCN firmware has no FAN_METHOD WMI data block
+	 * (GUID 92549549-4bde-4f06-ac04-ce8bf898dbaa), so fan_fullspeed
+	 * has no backend here and only errors with ENODEV (issue #94)
+	 */
+	.access_method_fanfullspeed = ACCESS_METHOD_NO_ACCESS,
 	.acpi_check_dev = false,
 	.ramio_physical_start = 0xFC7E0800,
 	.ramio_size = 0x600
@@ -712,12 +1019,48 @@ static const struct model_config model_kwcn = {
 	.access_method_fanspeed = ACCESS_METHOD_WMI3,
 	.access_method_temperature = ACCESS_METHOD_WMI3,
 	.access_method_fancurve = ACCESS_METHOD_WMI3,
-	.access_method_fanfullspeed = ACCESS_METHOD_WMI,
+	/*
+	 * KWCN54WW (Legion Pro 5 16IRX8, 82WK) declares only Fan_Get_Table and
+	 * Fan_Set_Table on LENOVO_FAN_METHOD, only CPU_Set_OC_Data on
+	 * LENOVO_CPU_METHOD and nothing on LENOVO_GPU_METHOD, so the fan
+	 * full-speed methods (ids 1/2), the max-speed methods (ids 3/4) and
+	 * the legacy power-limit methods cannot work. LENOVO_OTHER_METHOD
+	 * answers for the plain feature IDs and LENOVO_CAPABILITY_DATA_01 /
+	 * LENOVO_DISCRETE_DATA publish the per-mode ranges, so use the Other
+	 * Method paths (writes are clamped to the capability-data ranges).
+	 */
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_fan_maxspeed = true,
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
+	/*
+	 * Fan_Set_Table carries one level per point for both fans; the pwm2,
+	 * temperature and accel/decel curve attributes have no effect, so
+	 * hide them as model_n2cn does. Level 10 was measured at 5400 RPM,
+	 * which the driver now reports from the fan table data itself.
+	 */
+	.wmi_fancurve_speed_only = true,
+	/*
+	 * LENOVO_FAN_TABLE_DATA carries one RPM ladder per fan (fan 1 /
+	 * sensor 0x04 and fan 2 / sensor 0x05), identical in every power
+	 * mode; exposes fan1_level_rpm_table/fan2_level_rpm_table.
+	 */
+	.has_fancurve_defaults = true,
 	.acpi_check_dev = true,
 	.ramio_physical_start = 0xFE0B0400,
 	.ramio_size = 0x600,
+	/* 82WK DSDT: _CFG, GBMD and SBMC live under VPC0, not on the EC. */
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SBMC" },
 	/* WMAA(0, 0x0D, 0x01) raises the firmware fan ceiling from ~4400 RPM to
 	 * ~7000-7100 RPM on KWCN54WW (Legion Pro 7 16IRX8H, EC 0x5507).
+	 * Shared with the Pro 5 16IRX8 (82WK): validated only on the 16IRX8H
+	 * sibling; on the 82WK fan_unlock was not exercised, and the level
+	 * table caps the fans at 5400 RPM regardless.
 	 */
 	.has_fan_unlock = true
 };
@@ -741,6 +1084,76 @@ static const struct model_config model_g8cn = {
 	.ramio_size = 0x600
 };
 
+// Legion Pro 5 16IRX9 (83DF) - 2024, Intel Core i7-14700HX / i9-14900HX + RTX
+// 4070; BIOS N0CN32WW/N0CN35WW, EC 0x5507 (fw 2a4; issue #497, dsdt.dat SHA-256
+// f7c43f2ae53206432ab2a5322587aa734edd65e3b1ae3a5cdf08c2af83e4d8d1):
+// - Fan Method \_SB.GZFD.WMAB (L43424) implements only Fan_Get_Table(5) and
+//   Fan_Set_Table(6): ten shared fan LEVELS 1..10 in EC F9F0..F9F9 (F9FT
+//   @0xFE0B05C0 + 0x30), committed via NCMD(0x8C, 0) with no range check and
+//   ignoring FSTM; get returns a static 1..10 placeholder when EXMF == 1.
+//   WMAB ids 1..4 are absent -> skip_fan_maxspeed, WMI3 fan_fullspeed. Keep
+//   fancurve_write_unvalidated like model_lpcn/model_m0cn until a level write
+//   is confirmed on 83DF hardware.
+// - LENOVO_FAN_TABLE_DATA is WQA3 (L35785, 15 rows, modes 1/2/3/0xFF/0xE0):
+//   1700..5400 RPM ladders on fan 1 (sensors 0x01/0x04) and fan 2 (0x05).
+// - Other Method WMAE (L43514): fan RPM 0x04030001/2 (FANS/FA2S * 100), full
+//   speed 0x04020000 -> EC FNST (get/set), CPU/GPU temps 0x05040000/0x05050000
+//   (CPUT/GPUT); 0x05010000 is CPU socket temp CPUS -> skip_ic_temp; flip to
+//   start 0x00030000 (FLBT) and instant boot 0x03010001/2 (EACS/ETCS).
+//   WMAC (L43510) is an empty stub and GPU Method GUID is absent -> WMI3 power
+//   limits with skip_oc_controls and leave_gamezone_wmi_unbound.
+// - KBBACKLIGHT WMAF (L44759): white kbd id 0x00 (KBLT == 0; RGB SKUs return 0
+//   and skip cleanly) and Y-logo id 0x03; no IO-port id -> skip_ioport_light.
+// - VPC0 lives at \_SB.PC00.LPCB.EC0.VPC0 (_STA/_CFG/GBMD/SBMC/HALS/SALS,
+//   L29463-29915), fixing the -5 _CFG/rapidcharge failure on v0 PCI0.LPC0.
+static const struct model_config model_n0cn = {
+	.registers = &ec_register_offsets_n0cn,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5507,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_ic_temp = true,
+	.skip_oc_controls = true,
+	.skip_lockfancontroller = true,
+	.skip_fan_maxspeed = true,
+	.skip_ioport_light = true,
+	.validated_temp_registers = TEMP_REGISTER_CPU | TEMP_REGISTER_GPU,
+	.ec_fanspeed_unit_100rpm = true,
+	.ec_powermode_mask = 0x0F,
+	.skip_fan_target = true,
+	.leave_gamezone_wmi_unbound = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFE0B0400,
+	.ramio_size = 0x300,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SBMC",
+			[ACPI_PATH_READ_FNLOCK] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.HALS",
+			[ACPI_PATH_WRITE_FNLOCK] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SALS" },
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true,
+	.fancurve_write_unvalidated = true,
+	.has_fan_unlock = false,
+	.has_fn_lock = true,
+	.has_flip_to_start = true,
+	.has_instant_boot = true,
+};
+
 static const struct model_config model_n2cn = {
 	.registers = &ec_register_offsets_v0,
 	.check_embedded_controller_id = true,
@@ -758,42 +1171,46 @@ static const struct model_config model_n2cn = {
 	.acpi_check_dev = true,
 	.ramio_physical_start = 0xFE0B0400,
 	.ramio_size = 0x600,
-	.acpi_paths = {
-		[ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
-		[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG",
-		[ACPI_PATH_READ_RAPIDCHARGE] = "\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
-		[ACPI_PATH_WRITE_RAPIDCHARGE] = "\\_SB.PC00.LPCB.EC0.VPC0.SBMC"
-	},
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SBMC" },
 	.wmi_fancurve_speed_only = true,
 	.require_unlocked_fan_controller = true
 };
 
-static const struct model_config model_nmcn = {
-	.registers = &ec_register_offsets_v0,
-	.check_embedded_controller_id = true,
-	.embedded_controller_id = 0x5507,
-	.memoryio_physical_ec_start = 0xC400,
-	.memoryio_size = 0x300,
-	.has_minifancurve = false,
-	.has_custom_powermode = true,
-	.access_method_powermode = ACCESS_METHOD_WMI,
-	.access_method_keyboard = ACCESS_METHOD_WMI,
-	.access_method_fanspeed = ACCESS_METHOD_WMI3,
-	.access_method_temperature = ACCESS_METHOD_WMI3,
-	.access_method_fancurve = ACCESS_METHOD_EC4,
-	.access_method_fanfullspeed = ACCESS_METHOD_EC4,
-	.access_method_powerlimits = ACCESS_METHOD_WMI3,
-	.acpi_check_dev = false,
-	.ramio_physical_start = 0xFE0B0400,
-	.ramio_size = 0x600,
-	.acpi_paths = {
-		/* rapidcharge EC at \_SB.PC00.LPCB.EC0, not v0 \_SB.PCI0.LPC0.EC0 */
-		[ACPI_PATH_READ_RAPIDCHARGE] =
-			"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
-		[ACPI_PATH_WRITE_RAPIDCHARGE] =
-			"\\_SB.PC00.LPCB.EC0.VPC0.SBMC",
-	}
-};
+static const struct model_config
+	model_nmcn = { .registers = &ec_register_offsets_v0,
+		       .check_embedded_controller_id = true,
+		       .embedded_controller_id = 0x5507,
+		       .memoryio_physical_ec_start = 0xC400,
+		       .memoryio_size = 0x300,
+		       .has_minifancurve = false,
+		       .has_custom_powermode = true,
+		       .access_method_powermode = ACCESS_METHOD_WMI,
+		       .access_method_keyboard = ACCESS_METHOD_WMI,
+		       .access_method_fanspeed = ACCESS_METHOD_WMI3,
+		       .access_method_temperature = ACCESS_METHOD_WMI3,
+		       .access_method_fancurve = ACCESS_METHOD_WMI3,
+		       .access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+		       .access_method_powerlimits = ACCESS_METHOD_WMI3,
+		       .wmi_fancurve_speed_only = true,
+		       .fanfullspeed_requires_custom_powermode = true,
+		       .skip_ic_temp = true,
+		       .skip_fan_maxspeed = true,
+		       .has_fancurve_defaults = true,
+		       .acpi_check_dev = false,
+		       .ramio_physical_start = 0xFE0B0400,
+		       .ramio_size = 0x600,
+		       .acpi_paths = {
+			       /* rapidcharge EC at \_SB.PC00.LPCB.EC0, not v0 \_SB.PCI0.LPC0.EC0 */
+			       [ACPI_PATH_READ_RAPIDCHARGE] =
+				       "\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			       [ACPI_PATH_WRITE_RAPIDCHARGE] =
+				       "\\_SB.PC00.LPCB.EC0.VPC0.SBMC",
+		       } };
 
 static const struct model_config model_nxcn = {
 	.registers = &ec_register_offsets_v0,
@@ -820,7 +1237,14 @@ static const struct model_config model_m0cn = {
 	.embedded_controller_id = 0x5507,
 	.memoryio_physical_ec_start = 0xC400,
 	.memoryio_size = 0x300,
-	.has_minifancurve = true,
+	/* The ec_register_offsets_v0 minifancurve, maximumfanspeed and
+	 * lockfancontroller bytes do not match this firmware: on M0CN44WW
+	 * they read 21/24/41, 8 and a constant "true" (issue #637), the
+	 * same EC 0x5507 as model_lpcn which hides them too. Do not read
+	 * or write them.
+	 */
+	.has_minifancurve = false,
+	.skip_lockfancontroller = true,
 	.has_custom_powermode = true,
 	.access_method_powermode = ACCESS_METHOD_WMI,
 	.access_method_keyboard = ACCESS_METHOD_WMI,
@@ -830,7 +1254,22 @@ static const struct model_config model_m0cn = {
 	.access_method_fanfullspeed = ACCESS_METHOD_WMI,
 	.acpi_check_dev = false,
 	.ramio_physical_start = 0xFE0B0400,
-	.ramio_size = 0x600
+	.ramio_size = 0x600,
+	/* Fan_Set_Table carries one table (FSID 0) and only per-point
+	 * speed1: a pwm2_* write never reached the EC on M0CN44WW
+	 * (issue #637). Expose only the speed attributes, like model_lpcn.
+	 */
+	.wmi_fancurve_speed_only = true,
+	/* Same EC (0x5507) and Fan_Set_Table as model_lpcn: the firmware
+	 * default table reads 1 2 3 4 5 6 7 8 8 8, i.e. level indices, not
+	 * percent (FAN_SPEED_UNIT_LEVEL). The old percent unit wrote 14 and
+	 * 16 for pwm 38/43 and the firmware failed the call with the bytes
+	 * already copied into the EC, where they survive reboots until an
+	 * EC reset (issue #637). Percent bytes on the LPCN twin hard
+	 * powered off the laptop, and no level write has been validated on
+	 * M0CN yet, so writes need allow_unvalidated_fancurve.
+	 */
+	.fancurve_write_unvalidated = true
 };
 
 static const struct model_config model_m1cn = {
@@ -839,7 +1278,13 @@ static const struct model_config model_m1cn = {
 	.embedded_controller_id = 0x5507,
 	.memoryio_physical_ec_start = 0xC400,
 	.memoryio_size = 0x300,
-	.has_minifancurve = true,
+	/* AMD twin of model_m0cn (same chassis and EC 0x5507): the v0
+	 * minifancurve byte reads 41 on M1CN48WW (issue #599), a value
+	 * M0CN44WW reads too (issue #637), so the v0 minifancurve and
+	 * lockfancontroller bytes do not match this firmware either.
+	 */
+	.has_minifancurve = false,
+	.skip_lockfancontroller = true,
 	.has_custom_powermode = true,
 	.access_method_powermode = ACCESS_METHOD_WMI,
 	.access_method_keyboard = ACCESS_METHOD_WMI,
@@ -858,7 +1303,15 @@ static const struct model_config model_m1cn = {
 	.power_writes_custom_only = true,
 	.acpi_check_dev = false,
 	.ramio_physical_start = 0xFE0B0400,
-	.ramio_size = 0x600
+	.ramio_size = 0x600,
+	/* Same EC and Fan_Set_Table as model_m0cn and model_lpcn, whose
+	 * tables take levels 1..10 (FAN_SPEED_UNIT_LEVEL) and only speed1.
+	 * No M1CN table dump exists yet, so the unit is inferred from the
+	 * twin and writes need allow_unvalidated_fancurve until a level
+	 * write is validated on M1CN hardware.
+	 */
+	.wmi_fancurve_speed_only = true,
+	.fancurve_write_unvalidated = true
 };
 
 static const struct model_config model_m2cn = {
@@ -874,6 +1327,7 @@ static const struct model_config model_m2cn = {
 	.access_method_fanspeed = ACCESS_METHOD_WMI3,
 	.access_method_temperature = ACCESS_METHOD_WMI3,
 	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.wmi_fancurve_speed_only = true,
 	.access_method_fanfullspeed = ACCESS_METHOD_WMI,
 	.acpi_check_dev = false,
 	.ramio_physical_start = 0xFE0B0400,
@@ -967,23 +1421,133 @@ static const struct model_config model_nscn = {
 	.ramio_size = 0x600
 };
 
-static const struct model_config model_qncn = {
+// Legion 7 16IRX9 (83FD) - 2024, Intel Core i9-14900HX + RTX 4070
+// BIOS: NSCN37WW, EC 0x5507 (issue #617). Facts below are from the
+// NSCN37WW SSDT4 ("CB-01") attached in issue #617; the WMA* methods
+// live in \_SB.GZFD:
+// - Fan Method WMAB implements only Fan_Get_Table(5)/Fan_Set_Table(6)
+//   (GFAN/SFAN), so the WMAB 1/2 full-speed path of model_nscn and the
+//   max-speed methods 3/4 cannot work. GFAN returns the ten EC bytes
+//   F101..F10A (EFAN @0xFE0B0F00 + 0xE0), a static 1..10 placeholder in
+//   extreme mode (GZ44 == 7), and reinitialises the table via INIF when
+//   F10A is 0. SFAN reads the mode byte F000 (1/2/3/0xFF/0xE0) to pick
+//   an FNT0 row and writes CRP/GRP/ERP = FNT[level + 2] / 100 for all
+//   fans; mode 0 leaves that row unset. WMAB 6 drops writes while
+//   GZ44 == 7. The bytes are fan LEVELS 1..10 (FNT0 level 1 is 0 RPM),
+//   one table for all fans: the same GFAN/SFAN semantics as model_t2cn,
+//   so the payload mode and the RPM calibration use the live thermal
+//   mode (GameZone 0x37 reads GZ44; 0x2D reads a saved request).
+// - LENOVO_FAN_TABLE_DATA is WQA7 -> SFTW (15 FNT0 rows, fan 1/sensor 4
+//   and fan 2/sensor 5), so the per-level RPM ladders are available.
+// - Other Method WMAE: fan RPM DEV 4 FEA 3 (FA1S/FA2S * 100), full speed
+//   DEV 4 FEA 2 -> EC FFON (get and set), CPU/GPU temps DEV 5 FEA 4/5;
+//   DEV 5 FEA 1 (IC temp) is a constant 0 -> skip_ic_temp.
+// fan_fullspeed is gated behind custom power mode like model_m3cn_8227/
+// model_q7cn. Product-qualified so other NSCN units keep model_nscn.
+static const struct model_config model_nscn_83fd = {
 	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5507,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	// RGB keyboard is controlled over USB, as on model_nscn
+	.access_method_keyboard = ACCESS_METHOD_NO_ACCESS,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_ic_temp = true,
+	.skip_fan_maxspeed = true,
+	.skip_lockfancontroller = true,
+	.wmi_fancurve_speed_only = true,
+	/* LLL and mainline lenovo-wmi-gamezone both alias the GameZone
+	 * GUID, so udev autoload races and platform_profile can disappear
+	 * (issue #625). Leave the block to lenovo-wmi-gamezone; GameZone
+	 * methods are still called by GUID.
+	 */
+	.leave_gamezone_wmi_unbound = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFE0B0400,
+	.ramio_size = 0x600
+};
+
+// Legion 5 15IRX10 (83LY), BIOS QNCN38WW, EC 0x5508 (issue #491; DSDT +
+// WMAA/WMAB/WMAE/WQA3 extracts and runtime dumps from @TanelLaas):
+// - GameZone WMAA 0x2C/0x2D/0x37 power mode, incl. custom (0xFF) and
+//   extreme (0xE0 -> SPMO 4/ODV1 4, AC only).
+// - Fan Method WMAB implements only Fan_Get_Table(5)/Fan_Set_Table(6):
+//   ten fan LEVELS 1..10 in EC F9F0..F9F9, committed via
+//   LECR(0xD0,1,1,2); the read returns a static 1..10 placeholder while
+//   ODV1 == 4 (extreme). No temperature fields and no range check, and
+//   the write ignores the FSTM mode byte, so no payload mode quirk is
+//   needed. Fan_Get/Set_MaxSpeed (ids 3/4) do not exist
+//   -> skip_fan_maxspeed.
+// - Other Method WMAE standard ids: fan RPM 0x04030001/2 (FANS/FA2S
+//   * 100), full speed 0x04020000 (EC FNST, get and set), CPU/GPU temps
+//   0x05040000/0x05050000 (CPUT/GPUT); 0x05010000 is the CPU socket temp
+//   (CPUS), not a labeled IC temp -> skip_ic_temp. Instant boot
+//   0x03010001/2 (EC EACS/ETCS, set via WSMI 7/8, 9/0xA, same as
+//   model_q7cn) -> has_instant_boot.
+// - KBBACKLIGHT WMAF get(1)/set(2) drives the keyboard (light id 0x00)
+//   and the Y-logo (id 0x03); no IO-port light id exists
+//   -> skip_ioport_light.
+// - LENOVO_FAN_TABLE_DATA is WQA3 (15 rows: modes 1/2/3/0xE0/0xFF x
+//   fan 1 sensors 0x01/0x04 + fan 2 sensor 0x05, ladders ending at 4600
+//   or 5400 RPM), so the per-level RPM ladders are available.
+// - EC RAM window ERAX @0xFE0B0400 len 0xFF, F9FT/ECB2 at +0x100/+0x200,
+//   used only for the read-only ecmemoryram debugfs dump. The EC reads
+//   go through port I/O at EC 0xC400.., where the v0 offsets hit other
+//   variables (garbage EC RPM like 18045); see ec_register_offsets_qncn.
+// fan_fullspeed is gated behind custom power mode like model_q7cn.
+static const struct model_config model_qncn = {
+	.registers = &ec_register_offsets_qncn,
 	.check_embedded_controller_id = true,
 	.embedded_controller_id = 0x5508,
 	.memoryio_physical_ec_start = 0xC400,
 	.memoryio_size = 0x300,
 	.has_minifancurve = false,
 	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
 	.access_method_powermode = ACCESS_METHOD_WMI,
 	.access_method_keyboard = ACCESS_METHOD_WMI,
 	.access_method_fanspeed = ACCESS_METHOD_WMI3,
 	.access_method_temperature = ACCESS_METHOD_WMI3,
-	.access_method_fancurve = ACCESS_METHOD_NO_ACCESS,
-	.access_method_fanfullspeed = ACCESS_METHOD_WMI,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_ic_temp = true,
+	.skip_lockfancontroller = true,
+	/* Fan Method WMAB implements only ids 5/6 (see the header comment). */
+	.skip_fan_maxspeed = true,
+	.skip_ioport_light = true,
+	/* CPUT/GPUT, FANS/FA2S and SPMO, see ec_register_offsets_qncn. */
+	.validated_temp_registers = TEMP_REGISTER_CPU | TEMP_REGISTER_GPU,
+	.ec_fanspeed_unit_100rpm = true,
+	.ec_powermode_mask = 0x0F,
+	.skip_fan_target = true,
+	/* Same GameZone alias race as model_q7cn (issue #625): while LLL
+	 * holds the block, platform_profile is missing and the
+	 * lenovo-wmi-other PL1/PL2 attributes return -EINVAL on QNCN38WW.
+	 */
+	.leave_gamezone_wmi_unbound = true,
 	.acpi_check_dev = false,
-	.ramio_physical_start = 0xFE00D400,
-	.ramio_size = 0x600
+	.ramio_physical_start = 0xFE0B0400,
+	.ramio_size = 0x300,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SBMC" },
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true,
+	.has_fan_unlock = false,
+	.has_fn_lock = false,
+	.has_instant_boot = true,
 };
 
 static const struct model_config model_lpcn = {
@@ -999,8 +1563,15 @@ static const struct model_config model_lpcn = {
 	.access_method_fanspeed = ACCESS_METHOD_WMI3,
 	.access_method_temperature = ACCESS_METHOD_WMI3,
 	.access_method_fancurve = ACCESS_METHOD_WMI3,
-	.access_method_fanfullspeed = ACCESS_METHOD_WMI,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
 	.access_method_powerlimits = ACCESS_METHOD_WMI3,
+	/* Fan Method GZFD.WMB2 implements only ids 5/6 (fan table), so
+	 * Fan_Get/Set_MaxSpeed (ids 3/4) do not exist -> skip_fan_maxspeed.
+	 * Other Method 0x05010000 is the CPU socket temp (CPUS), not an IC
+	 * sensor, and WMI3 has no IC temp -> skip_ic_temp.
+	 */
+	.skip_fan_maxspeed = true,
+	.skip_ic_temp = true,
 	.acpi_check_dev = true,
 	.ramio_physical_start = 0xFE0B0400,
 	.ramio_size = 0x600,
@@ -1010,7 +1581,31 @@ static const struct model_config model_lpcn = {
 		[ACPI_PATH_READ_RAPIDCHARGE] = "\\_SB.PCI0.LPC0.EC0.VPC0.GBMD",
 		[ACPI_PATH_WRITE_RAPIDCHARGE] = "\\_SB.PCI0.LPC0.EC0.VPC0.SBMC",
 	},
-	.has_extreme_powermode = true
+	/* max-power (the "extreme" platform_profile choice) cuts power
+	 * instantly on this EC (hard power-off, no shutdown sequence) instead
+	 * of raising limits like on other has_extreme_powermode models, so
+	 * keep it out of platform_profile's choices entirely.
+	 */
+	.has_extreme_powermode = false,
+	/* WMI3 fancurve writes only transmit per-point speed1 (see
+	 * wmi_write_fancurve_custom): temperature thresholds, fan2 speed
+	 * and accel/decel have no WMI backing and never persist. Expose
+	 * only the speed attributes so userspace does not write (and the
+	 * GUI/CLI does not crash on) fields the firmware drops.
+	 */
+	.wmi_fancurve_speed_only = true,
+	/* Fan_Set_Table (GZFD.WMB2 id 6) copies FSS0..FSS9 raw into EC RAM
+	 * F9F0..F9F9 and commits with NCMD(0x8C), and WQA3 publishes static
+	 * 10-level RPM ladders (e.g. 1600..5400 RPM) - the level table of
+	 * model_kwcn, the Intel twin, and Lenovo Legion Toolkit rejects any
+	 * value above 10 for it. Percent bytes hard-powered-off an 82WM on
+	 * LPCN59WW about 6 s after point 1 was set to 50, so speeds are
+	 * levels (FAN_SPEED_UNIT_LEVEL); in custom mode a written 1..10
+	 * table drove both fans to the level-2 ladder RPM on that unit.
+	 * Other LPCN BIOSes are untested, so writes still need
+	 * allow_unvalidated_fancurve (fancurve_write_unvalidated).
+	 */
+	.fancurve_write_unvalidated = true
 };
 
 static const struct model_config model_kfcn = {
@@ -1157,22 +1752,41 @@ static const struct model_config model_e9cn = {
 };
 
 static const struct model_config model_8jcn = {
-	.registers = &ec_register_offsets_v0,
+	/* The Y530 EC keeps the IdeaPad fan table, not the v0 Legion one:
+	 * fan speeds (100 RPM units) at 0xC5A0/0xC5A8, CPU step-up/step-down
+	 * temperatures at 0xC550/0xC590 and GPU ones at 0xC5C0/0xC5D0, each
+	 * repeated 8 bytes later, 8 points. Read on 81FV, 8JCN56WW.
+	 */
+	.registers = &ec_register_offsets_ideapad_v1,
 	.check_embedded_controller_id = true,
 	.embedded_controller_id = 0x8226,
 	.memoryio_physical_ec_start = 0xC400,
 	.memoryio_size = 0x300,
-	.has_minifancurve = true,
+	/* No mini fan curve register: it reads 0 ("Unexpected value"). */
+	.has_minifancurve = false,
 	.has_custom_powermode = true,
 	.access_method_powermode = ACCESS_METHOD_WMI,
 	.access_method_keyboard = ACCESS_METHOD_WMI,
 	.access_method_fanspeed = ACCESS_METHOD_WMI,
-	.access_method_temperature = ACCESS_METHOD_WMI,
-	.access_method_fancurve = ACCESS_METHOD_EC,
-	.access_method_fanfullspeed = ACCESS_METHOD_WMI,
+	/* WMAA 0x12/0x13 (CPU/GPU temperature) are Return (Zero) stubs; the
+	 * EC fields CPUT/GPUT carry the temperatures.
+	 */
+	.access_method_temperature = ACCESS_METHOD_ACPI,
+	.access_method_fancurve = ACCESS_METHOD_EC2,
+	/* No FAN_METHOD WMI GUID on 8JCN: fan_fullspeed fails with -ENODEV. */
+	.access_method_fanfullspeed = ACCESS_METHOD_NO_ACCESS,
 	.acpi_check_dev = false,
-	.ramio_physical_start = 0xFE00D400,
-	.ramio_size = 0x600
+	/* DSDT: OperationRegion (ERAX, SystemMemory, 0xFF00D400, 0xFF);
+	 * 0xFE00D400 reads all 0xFF on this machine.
+	 */
+	.ramio_physical_start = 0xFF00D400,
+	.ramio_size = 0x600,
+	/* Y530 has no smart fan modes; Fn+Q toggles "extreme cooling" (both
+	 * fans to ~4000 RPM). GZFD.WMAA 0x0D issues NCMD(0x59, 0x77/0x76) as
+	 * on KWCN54WW and 0x14 returns FCST & 1. Validated on 81FV, 8JCN56WW.
+	 */
+	.has_fan_unlock = true,
+	.has_fan_unlock_readback = true
 };
 
 static const struct model_config model_jncn = {
@@ -1274,10 +1888,12 @@ static const struct model_config model_lzcn = {
 	.acpi_check_dev = false,
 	.ramio_physical_start = 0xFE0B0F00,
 	.ramio_size = 0x600,
-	.acpi_paths = {
-		[ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
-		[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG"
-	},
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SBMC" },
 	.has_fancurve_defaults = true
 };
 
@@ -1297,9 +1913,51 @@ static const struct model_config model_necn = {
 	.access_method_temperature = ACCESS_METHOD_WMI3,
 	.access_method_fancurve = ACCESS_METHOD_EC3,
 	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
 	.acpi_check_dev = false,
 	.ramio_physical_start = 0xFE0B0F00,
-	.ramio_size = 0x600
+	.ramio_size = 0x600,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SBMC" },
+	.has_fancurve_defaults = true
+};
+
+// LOQ 15IAX9 (83GS), BIOS NECN53WW: model_necn with the EC3 fan curve
+// read-back fix. Product-qualified: the 83DV (LOQ 15IRX9) shares NECN and is
+// not validated.
+static const struct model_config model_necn_83gs = {
+	.registers = &ec_register_offsets_loq_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x8227,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = true,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI2,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_EC3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFE0B0F00,
+	.ramio_size = 0x600,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SBMC" },
+	.has_fancurve_defaults = true,
+	.ec3_fancurve_shared_table = true
 };
 
 // LOQ 15AHP9
@@ -1321,35 +1979,149 @@ static const struct model_config model_nzcn = {
 	.acpi_check_dev = false,
 	.ramio_physical_start = 0xFE0B0F00,
 	.ramio_size = 0x600,
-	.acpi_paths = {
-		[ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
-		[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG"
-	},
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG" },
 	.has_fancurve_defaults = true
 };
 
-// Legion Slim 5 16AHP9 (2024) - Model 83DH
-static const struct model_config model_nrcn = {
-	.registers = &ec_register_offsets_v0,
+// LOQ 15AHP10 (83JG) - 2025, AMD Ryzen 7 250 + RTX 5050
+// BIOS: R8CN23WW (#384) / R8CN25WW (#650), EC 0x5508 (fw 2b0, read on both
+// units). Facts below are from the R8CN25WW DSDT (L = dsdt.dsl line,
+// attachment in issue #650); the WMA* methods live in \_SB.GZFD:
+// - Fan Method WMAB (L27767) implements only Fan_Get_Table(5)/
+//   Fan_Set_Table(6) via GFAN (L24833) / SFAN (L24904): ten shared fan
+//   LEVELS 1..10 in EC F101..F10A (EFAN @0xFEEC2F00 + 0xE0, L13072/L13261),
+//   with a static 1..10 placeholder (EFST) in extreme mode (GZ44 == 0x07)
+//   and INIF(2) re-init when F10A == 0. SFAN selects an FNT0/FNT1 ladder
+//   from the payload mode byte F000 (1/2/3/0xFF/0xE0; mode 0 leaves the
+//   row local unset), writes CRP/GRP/ERP = FNT[level + 2] / 100 plus the
+//   FI00..FI09 temperature rows into EFAN and sets CMRD = 1 (L25202);
+//   WMAB 6 drops writes while GZ44 == 0x07. Identical GFAN/SFAN semantics
+//   to model_t2cn / model_nscn_83fd, so FAN_SPEED_UNIT_LEVEL,
+//   wmi_fancurve_speed_only and wmi_sfan_uses_thermal_mode (GameZone 0x37
+//   reads live GZ44; 0x2D reads saved CMOS RXMS(0x76)). WMAB ids 1..4 do
+//   not exist -> skip_fan_maxspeed.
+// - LENOVO_FAN_TABLE_DATA (_WDG instance A7, L26663) is WQA7 -> SFTW
+//   (L26743/L24697): 15 rows from FNT0/FNT1 (modes 1/2/3/0xFF/0xE0, fan 1
+//   sensors 0x04/0x01 and fan 2 sensor 0x05; level 1 is 0 RPM, max
+//   4500/4600 RPM on FNT1 or 5500/5700 RPM on FNT0), so
+//   fan1_level_rpm_table/fan2_level_rpm_table appear automatically.
+// - Power mode: GameZone WMAA (L26808) SmartFanMode set 0x2C (L27157) /
+//   get 0x2D (L27297) and GetThermalMode 0x37 (L27517): quiet (1),
+//   balanced (2), performance (3), custom (0xFF) and extreme (0xE0).
+// - Other Method WMAE Get(0x11)/Set(0x12) (L27800/L28594): fan RPM DEV 4
+//   FEA 3 (FA1S/FA2S * 100, L28474), full speed DEV 4 FEA 2 -> EC FFON
+//   (get L28469, set L29136), CPU/GPU temps DEV 5 FEA 4/5 -> EC CTML/SKTC
+//   (L28507/L28512); DEV 5 FEA 1 (IC temp) returns constant Zero (L28492)
+//   -> skip_ic_temp. WMAC (L27787) and WMAD (L27795) are Return (Zero)
+//   stubs; PL/OC controls stay hidden (skip_oc_controls) until validated.
+//   fan_fullspeed is gated behind custom power mode like model_r3cn/
+//   model_rgcn (0x5508 wedge risk).
+// - Lights: KBBACKLIGHT WMAF get(1)/set(2) (L29582 -> GLT1/SLT2
+//   L25564/L25612) drives the white keyboard backlight (id 0x00, EC KLEN,
+//   levels 1..3; LED driver init confirmed in #650 dmesg). Light id 0x03
+//   (Y-logo) is absent ("unsupported light_id=3" in #650 dmesg) and id
+//   0x05 (IO-port) is an empty case -> skip_ylogo_light, skip_ioport_light.
+// - EC0 at \_SB.PCI0.LPC0.EC0 (L10018, _STA L11073); VPC0 at
+//   \_SB.PCI0.LPC0.EC0.VPC0 (L11615, _STA L11621, _CFG L11626, GBMD/SBMC
+//   L11892/L11985 with FCGM bit 0x04 and BTSM bit 0x20) - fixes the
+//   PC00.LPCB paths that caused -5 errors in #650. Read-only debugfs
+//   ecmemoryram maps the EFAN window at 0xFEEC2F00 (L13072; ECMM is at
+//   0xFEEC2400, L10048) instead of the Intel 0xFE0B0F00 address.
+//   Minifancurve and lockfancontroller have no mapped registers on this
+//   firmware ("EC minifancurve on cool: error" in #384/#650) and stay
+//   hidden.
+static const struct model_config model_r8cn = {
+	.registers = &ec_register_offsets_loq_v1,
 	.check_embedded_controller_id = true,
-	.embedded_controller_id = 0x8227,
+	.embedded_controller_id = 0x5508,
 	.memoryio_physical_ec_start = 0xC400,
 	.memoryio_size = 0x300,
-	.has_minifancurve = true,
+	.has_minifancurve = false,
 	.has_custom_powermode = true,
 	.has_extreme_powermode = true,
 	.access_method_powermode = ACCESS_METHOD_WMI,
-	.access_method_keyboard = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI2,
 	.access_method_fanspeed = ACCESS_METHOD_WMI3,
 	.access_method_temperature = ACCESS_METHOD_WMI3,
 	.access_method_fancurve = ACCESS_METHOD_WMI3,
-	.access_method_fanfullspeed = ACCESS_METHOD_WMI,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_ic_temp = true,
+	.skip_oc_controls = true,
+	.skip_lockfancontroller = true,
+	/* Fan Method WMAB implements only ids 5/6 (see the header comment). */
+	.skip_fan_maxspeed = true,
+	.skip_ylogo_light = true,
+	.skip_ioport_light = true,
 	.acpi_check_dev = false,
-	.ramio_physical_start = 0xFE0B0400,
-	.ramio_size = 0x600
+	.ramio_physical_start = 0xFEEC2F00,
+	.ramio_size = 0x600,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PCI0.LPC0.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PCI0.LPC0.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.SBMC" },
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true,
+	.has_fan_unlock = false,
+	.has_fn_lock = false,
 };
 
-static const struct model_config model_r3cn = {
+// Legion 5 15AHP11 (83Q7, AMD Ryzen 7 250 + RTX 5050) - same platform as
+// LOQ 15AHP10, BIOS T2CN33WW, EC chip 0x5509 (issue #504).
+// EC port I/O is blocked by the firmware (vendor EC RAM reads return 0).
+// The DSDT supplied in #504 confirms WMAB 5/6 -> GFAN/SFAN: ten shared
+// LEVEL indices into FNT0/FNT1 (SFAN indexes level + 2). WQA7/SFTW exports
+// that same ladder, including level 1's zero RPM; never shift it away.
+// SFAN requires a valid powermode byte and WMAB drops writes in extreme
+// mode (GZ44 == 7). WMI3 sensors/powermode and curve reads are verified;
+// corrected curve writes still need an on-hardware round trip.
+// The 83Q7 has no Y-logo/lid and no IO-port light.
+// The minifancurve EC register never holds a valid value on this unit
+// (reads 0 or 8, never 0x04/0xA0), so the feature is disabled. Keyboard
+// backlight brightness calls fail on both the WMI and WMI2 paths
+// (firmware returns 0), so keyboard backlight is disabled too; Fn+Space
+// still works at firmware level.
+static const struct model_config model_t2cn = {
+	.registers = &ec_register_offsets_loq_v1,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5509,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_NO_ACCESS,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFE0B0F00,
+	.ramio_size = 0x600,
+	.skip_ylogo_light = true,
+	.skip_ioport_light = true,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PCI0.LPC0.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PCI0.LPC0.EC0.VPC0._CFG" },
+	.has_fancurve_defaults = true
+};
+
+// Legion Pro 5 16AFR10 (83F2, AMD Ryzen 9 9955HX + RTX 5070), BIOS RECN,
+// EC chip 0x5508 (issue #527) - same EC generation as model_secn/model_s2cn.
+// EC fan curve reads return size 0 / all zeros on this EC generation while
+// the WMI fan curve table is populated, so fancurve uses WMI3; WMI3
+// temps/fans, WMI powermode and custom powermode confirmed on the unit
+// in #527. Minifancurve has no mapped LOQ control register. ACPI CFG and rapidcharge (GBMD/SBMC) work via the
+// PCI0.LPC0 paths. The 83F2 has no Y-logo/lid and no IO-port light
+// (reporter-confirmed; the phantom WMI lid-light probe returns 1).
+// The WMI fan table is the level-index kind shared across the 0x5508
+// generation (issue #491: WMAB ids 5/6 only, EC F9F0..F9F9 levels, no
+// temperature fields - see model_q7cn), so only the speed attributes are
+// exposed and FAN_SPEED_UNIT_LEVEL applies.
+static const struct model_config model_recn = {
 	.registers = &ec_register_offsets_loq_v1,
 	.check_embedded_controller_id = true,
 	.embedded_controller_id = 0x5508,
@@ -1362,21 +2134,327 @@ static const struct model_config model_r3cn = {
 	.access_method_keyboard = ACCESS_METHOD_WMI2,
 	.access_method_fanspeed = ACCESS_METHOD_WMI3,
 	.access_method_temperature = ACCESS_METHOD_WMI3,
-	.access_method_fancurve = ACCESS_METHOD_EC3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
 	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
 	.acpi_check_dev = false,
 	.ramio_physical_start = 0xFE0B0F00,
 	.ramio_size = 0x600,
-	.acpi_paths = {
-		[ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
-		[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG"
-	},
-	.has_fancurve_defaults = true
+	.skip_ylogo_light = true,
+	.skip_ioport_light = true,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PCI0.LPC0.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PCI0.LPC0.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.SBMC" },
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true
+};
+
+// Legion R9000P AFR10 (83F6, AMD Ryzen 9 9900HX + RTX 5060), BIOS
+// RECN20WW, EC 0x5508 (issue #405; reporter's dsdt.dsl):
+// - GameZone WMAA 0x2C set / 0x2D get / 0x37 thermal mode (L35911),
+//   incl. custom (0xFF) and extreme (0xE0 -> EXTM 1/SPMO 4, AC only).
+// - Fan Method WMAB (L36635) implements only Fan_Get_Table(5)/
+//   Fan_Set_Table(6): ten fan LEVELS 1..10 in EC F9F0..F9F9, committed
+//   via LECR(0xD0,1,1,2); the read returns a static 1..10 placeholder
+//   while ODV1 == 4 (extreme). No temperature fields and no range
+//   check, and the write ignores the FSTM mode byte, so no payload
+//   mode quirk is needed. Fan_Get/Set_MaxSpeed (ids 3/4) do not exist
+//   -> skip_fan_maxspeed.
+// - Other Method WMAE Get(0x11)/Set(0x12) (L36751) standard ids: fan
+//   RPM 0x04030001/2 (FANS/FA2S * 100), third fan 0x04030004 (FASF *
+//   100 -> has_third_fan), full speed 0x04020000 (EC FNST, get and
+//   set, no power-mode gate), CPU/GPU temps 0x05040000/0x05050000
+//   (CPUT/GPUT); 0x05010000 is the CPU socket temp (CPUS), not a
+//   labeled IC temp -> skip_ic_temp. Instant boot 0x03010001/2 (EC
+//   EACS/ETCS, set via WSMI 7/8, 9/0xA, same as model_q7cn)
+//   -> has_instant_boot.
+// - KBBACKLIGHT WMAF get(1)/set(2) (L38364) drives the keyboard
+//   (light id 0x00, levels 1-3) and the Y-logo (id 0x03); no IO-port
+//   light id exists -> skip_ioport_light (the Fn+L Y-logo toggle is
+//   confirmed working on the unit in #405).
+// - LENOVO_FAN_TABLE_DATA is WQA3 (L16772; 15 rows: modes
+//   1/2/3/0xFF/0xE0 x fan 1 sensors 0x01/0x04 + fan 2 sensor 0x05,
+//   ladders 1700..5100 RPM), so the per-level RPM ladders are
+//   available.
+// - EC RAM window ERAX @0xFEEC2400 len 0xFF (L8272), F9FT/ECB2 at
+//   +0x100/+0x200 (L8160/L8068) - the same window as model_smcn - used
+//   only for the read-only ecmemoryram debugfs dump.
+// - ACPI CFG and rapidcharge (GBMD/SBMC) work via the PCI0.LPC0 paths
+//   (VPC0 at L10349, GBMD L10520, SBMC L10737).
+// EC chip id 0x5508 was read on the unit (force-load dmesg in #405).
+static const struct model_config model_recn_83f6 = {
+	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5508,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI2,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.skip_ic_temp = true,
+	.skip_lockfancontroller = true,
+	/* Fan Method WMAB implements only ids 5/6 (see the header comment). */
+	.skip_fan_maxspeed = true,
+	.skip_ioport_light = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFEEC2400,
+	.ramio_size = 0x300,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PCI0.LPC0.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PCI0.LPC0.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.SBMC" },
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true,
+	.has_third_fan = true,
+	.has_fan_unlock = false,
+	.has_fn_lock = false,
+	.has_instant_boot = true,
+};
+
+// Legion 5 15AKP10 (83F1, AMD), BIOS RYCN27WW/RYCN28WW, EC 0x5508
+// (issue #416; RYCN28WW dsdt.dsl attached there, L = line). Same
+// WMI-only 0x5508 layout as model_recn_83f6, minus the third fan:
+// - GameZone WMAA 0x2C set / 0x2D get (L19557), incl. custom (0xFF)
+//   and extreme (0xE0 -> EXTM 1/SPMO 4/ODV1 4, AC only).
+// - Fan Method WMAB (L20284) implements only Fan_Get_Table(5)/
+//   Fan_Set_Table(6): ten fan LEVELS 1..10 in EC F9F0..F9F9, committed
+//   via LECR(0xD0,1,1,2); the read returns a static 1..10 placeholder
+//   while ODV1 == 4 (extreme). No temperature fields and no range
+//   check, and the write ignores the FSTM mode byte, so no payload
+//   mode quirk is needed. Fan_Get/Set_MaxSpeed (ids 3/4) do not exist
+//   -> skip_fan_maxspeed.
+// - Other Method WMAE Get(0x11)/Set(0x12) (L20388) standard ids: fan
+//   RPM 0x04030001/2 (FANS/FA2S * 100), full speed 0x04020000 (EC
+//   FNST, get and set), CPU/GPU temps 0x05040000/0x05050000
+//   (CPUT/GPUT); 0x05010000 is the CPU socket temp (CPUS), not a
+//   labeled IC temp -> skip_ic_temp. Instant boot 0x03010001/2 (EC
+//   EACS/ETCS, set via WSMI 7/8, 9/0xA, L20853/L21640) and
+//   flip-to-start 0x00030000 (EC FLBT, WSMI 5/6, L20426/L21087).
+//   0x04030004 (FASF) is shared firmware code, but WQA3 has no fan 4
+//   rows and lenovo_wmi_other exposes only fan1/fan2 on the unit, so
+//   no has_third_fan.
+// - KBBACKLIGHT WMAF get(1)/set(2) (L21945) drives the keyboard
+//   (light id 0x00, levels 1-3) and the Y-logo (id 0x03); no IO-port
+//   light id exists -> skip_ioport_light.
+// - LENOVO_FAN_TABLE_DATA is WQA3 (L14122; 15 rows per SKU: modes
+//   1/2/3/0xFF/0xE0 x fan 1 sensors 0x01/0x04 + fan 2 sensor 0x05).
+//   Ladders are 1800..5400 RPM when GSKU == 0x2A, else 1800..4600 RPM
+//   (matching lenovo_wmi_other min/max on the RYCN28WW unit).
+// - EC0 at \_SB.PCI0.LPC0.EC0 (L6578); EC RAM window ERAX @0xFEEC2400
+//   len 0xFF (L6822), F9FT/ECB2 at +0x100/+0x200 (L6717/L6640) - the
+//   same window as model_smcn - used only for the read-only
+//   ecmemoryram debugfs dump.
+// - ACPI CFG and rapidcharge (GBMD/SBMC) via the PCI0.LPC0 paths (VPC0
+//   L8951, GBMD L9124 with BTSM bit 0x20 / QCHO bit 0x04, SBMC L9341).
+// EC chip id 0x5508 was read on the unit (force-load report in #416).
+// fan_fullspeed is gated behind custom power mode like model_qncn.
+static const struct model_config model_rycn = {
+	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5508,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI2,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_ic_temp = true,
+	.skip_lockfancontroller = true,
+	/* Fan Method WMAB implements only ids 5/6 (see the header comment). */
+	.skip_fan_maxspeed = true,
+	.skip_ioport_light = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFEEC2400,
+	.ramio_size = 0x300,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PCI0.LPC0.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PCI0.LPC0.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.SBMC" },
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true,
+	.has_fan_unlock = false,
+	.has_fn_lock = false,
+	.has_flip_to_start = true,
+	.has_instant_boot = true,
+};
+
+// Legion Slim 5 16AHP9 (2024) - Model 83DH
+static const struct model_config model_nrcn = {
+	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x8227,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	/* The v0 minifancurve byte read 0xA0 and later 43, and the
+	 * lockfancontroller byte flipped from false to true, on NRCN25WW
+	 * (issue #516); maximumfanspeed reads 8. They do not match this
+	 * firmware: do not read or write them.
+	 */
+	.has_minifancurve = false,
+	.skip_lockfancontroller = true,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	/* Use WMAE feature 0x04020000 for full speed on NRCN20WW.
+	 * WMAB supports fan table methods 5 and 6 only.
+	 */
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFE0B0400,
+	.ramio_size = 0x600,
+	/* The NRCN25WW default table reads 1 2 3 5 6 7 8 9 10 10 (issue
+	 * #516): level indices, not percent (FAN_SPEED_UNIT_LEVEL); the old
+	 * percent unit let out-of-range values through.
+	 * Fan_Set_Table carries only speed1. No level write has been
+	 * validated on NRCN, so writes need allow_unvalidated_fancurve.
+	 */
+	.wmi_fancurve_speed_only = true,
+	.fancurve_write_unvalidated = true
+};
+
+// Yoga Pro 7 14AHP9 (83E3) - 2024, AMD Ryzen 7 8845HS (Hawk Point)
+// BIOS: NCCN30WW, EC 0x5571 (both read on the unit, issue #630 dmesg).
+// Facts below are from the NCCN30WW DSDT (L = dsdt.dsl line, attachment in
+// issue #630); this is an ideapad-platform machine, not a Legion WMI one:
+// - EC0 at \_SB.PCI0.LPC0.EC0 (PNP0C09, IO 0x62/0x66, GPE 0x0B, _STA 0x0F,
+//   L5184); EC RAM window ERAM @0xFEEC2300 len 0xFF (L5230) is the host view
+//   the ecmemoryram dump maps. EC port-IO reads work: the unit returns chip
+//   id 0x5571 at 0x2000/0x2001.
+// - Temperatures are the only sensor data published to the host: TCPU @0x07
+//   and TGPU @0x08 in ERAM (L5240/L5241; TCPU is read by the firmware
+//   thermal code, SSDT22 L193, TGPU is written from the GPU code, SSDT4
+//   L906). SEN1-SEN4 exist but are unlabeled -> skip_ic_temp. No fan RPM,
+//   fan table or fan speed fields exist anywhere (ERAM carries only the
+//   PWML/DPWM duty bytes) -> fanspeed, fancurve and fanfullspeed NO_ACCESS.
+// - No Fan Method WMI block at all (no WMAB/Fan_Get_Table/Fan_Set_Table in
+//   any table) and no LENOVO_FAN_TABLE_DATA.
+// - GZFD WMAA (L13373) implements only ids 0x04/0x3F/0x40/0x41/0x42 (UMAF/
+//   REJF/WEJF/DGFL plumbing) - no SmartFanMode (0x2C/0x2D) -> powermode
+//   NO_ACCESS and no legion platform_profile handler; power modes come from
+//   ideapad-laptop via VPC0 DYTC (L11423/L11429). GZFD WMAE (L13500) handles
+//   only 0x001C0001/0x001C0002 (EC ATS4/ATS5), none of the Other Method
+//   sensor/power-limit feature ids.
+// - White keyboard backlight is driven through VPC0 (VPC2004, KBLC, L12109)
+//   / WMIU (LSK20, L12970), not the Legion light WMI methods -> keyboard
+//   NO_ACCESS; Y-logo and IO-port lights do not exist and are skipped.
+// - VPC0 GBMD/SBMC (L11846/L11858) use ideapad semantics (RDER 0x359-0x35B,
+//   ECCC commands 0x03-0x08), not the Legion BTSM/QCHO bits, so the
+//   rapidcharge/battery-conservation paths are not wired up; ideapad-laptop
+//   owns them.
+static const struct model_config model_nccn = {
+	.registers = &ec_register_offsets_nccn,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5571,
+	.memoryio_physical_ec_start = 0,
+	.memoryio_size = 0xFF,
+	.has_minifancurve = false,
+	.has_custom_powermode = false,
+	.has_extreme_powermode = false,
+	.access_method_powermode = ACCESS_METHOD_NO_ACCESS,
+	.access_method_keyboard = ACCESS_METHOD_NO_ACCESS,
+	.access_method_temperature = ACCESS_METHOD_EC,
+	.access_method_fanspeed = ACCESS_METHOD_NO_ACCESS,
+	.access_method_fancurve = ACCESS_METHOD_NO_ACCESS,
+	.access_method_fanfullspeed = ACCESS_METHOD_NO_ACCESS,
+	.skip_ic_temp = true,
+	.skip_oc_controls = true,
+	.skip_lockfancontroller = true,
+	.skip_fan_maxspeed = true,
+	.skip_ylogo_light = true,
+	.skip_ioport_light = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFEEC2300,
+	.ramio_size = 0xFF,
+	.validated_temp_registers = TEMP_REGISTER_CPU | TEMP_REGISTER_GPU,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PCI0.LPC0.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PCI0.LPC0.EC0.VPC0._CFG" },
+};
+
+// LOQ 15IRX10 (83JE) - 2025, Intel + RTX 50, BIOS R3CN (issues #374/#535).
+// Keep the EC3 LOQ curve: independent fan RPM and temperature/hysteresis
+// writes were verified in custom mode (255) on R3CN44WW under load (#535).
+// EC chip id 0x5508 alone does not imply the Legion EC layout is in use.
+// ec_register_offsets_loq_v1 supplies this model's existing register map;
+// accel/decel are not stored by the EC3 interface and must stay hidden.
+//
+// The GZFD WMI device is in SSDT4.dsl from R3CN.zip (#374), not the DSDT.
+// WMAB 5/6 (L19638) delegate to GFAN/SFAN (L15463/L15534): the ten values
+// in F101..F10A are level indices shared by both fans. SFAN derives RPM
+// and temperatures from FNT0..FNT2, writes the EFAN fields (L1661) and
+// ignores writes in extreme mode. This is NOT equivalent to EC3's RPM
+// curve. Keep FAN_SPEED_UNIT_LEVEL only for the WMI debugfs readout;
+// fan1/fan2_level_rpm_table must not be exposed for the active EC3 curve.
+// WQA3 (L18101) provides firmware ladders; has_fancurve_defaults permits
+// restoring them via SFAN, whose first payload byte must name the mode.
+//
+// WMAE Get(0x11)/Set(0x12) (L19673/L20503) uses DEV0/FEA0/TYP0 dispatch:
+// RPM 0x04030001/2 -> FA1S/FA2S * 100; full speed 0x04020000 -> FFON;
+// CPU temp 0x05040000 -> CTMP; GPU temp 0x05050000 -> SKTC (socket).
+// 0x05010000 returns Zero, so hide the IC sensor. PL/OC -> CSPL/CLPL/
+// CCTL/CCPL. WMI3 sensors and WMAA powermode were verified in #374;
+// bad EC sensor reads do not invalidate the separately mapped EC3 curve.
+// Keep fan_fullspeed restricted to custom mode (0x5508 wedge risk).
+// KBBACKLIGHT WMAF drives the keyboard; read-only ecmemoryram uses the
+// EFAN window at 0xFE0B0F00. Minifancurve and lockfancontroller have only
+// placeholder offsets in loq_v1, so never expose those writes.
+static const struct model_config model_r3cn = {
+	.registers = &ec_register_offsets_loq_v1,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5508,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI2,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_EC3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_ic_temp = true,
+	.skip_lockfancontroller = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFE0B0F00,
+	.ramio_size = 0x600,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG" },
+	.has_fancurve_defaults = true,
 };
 
 // Legion 7 16IAX10 (83KY) - 2025, Intel Arrow Lake + RTX 5060
 // BIOS: RXCN79WW, EC chip: 0x5508
-// Uses WMI3 for all fan operations (safe - no direct EC memory writes)
+// Uses WMI3 for all fan operations (safe - no direct EC memory writes).
+// The WMI fan table behaves like the rest of the 0x5508 generation (issue
+// #491): per-point speed1 only, temperature columns always read 0, EC
+// values matching the F9F0..F9F9 level bytes - i.e. the level-index kind
+// (FAN_SPEED_UNIT_LEVEL, see model_q7cn). Only the speed attributes are
+// exposed (wmi_fancurve_speed_only); writing percent values into the
+// level bytes matches the thermal-shutdown reports for this generation.
 static const struct model_config model_rxcn = {
 	.registers = &ec_register_offsets_v0,
 	.check_embedded_controller_id = false,
@@ -1395,10 +2473,243 @@ static const struct model_config model_rxcn = {
 	.acpi_check_dev = false,
 	.ramio_physical_start = 0xFE00D400,
 	.ramio_size = 0x600,
-	.has_fancurve_defaults = true
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true
+};
+
+// Legion 5 16IAX10 (83NX) - 2025, Intel Arrow Lake HX + RTX 5060 Max-Q
+// BIOS: Q6CN32WW, EC chip: 0x5508 (confirmed on-hardware)
+// Same chassis generation/EC id/ramio window as model_rxcn (Legion 7
+// 16IAX10, 83KY); on-hardware testing showed raw EC and ACPI fan/temp
+// reads return garbage (fan RPM exceeding the reported max, EC values
+// unrelated to actual sensors) while WMI3 reads back correct values, so
+// this uses WMI3 for all fan/temp/power-limit operations like model_rxcn.
+// Also enables WMI3 power limits (cpu_temperature_limit/cpu_l1_tau/
+// gpu_power_target_offset), confirmed returning plausible values on the
+// unit, same as model_q8cn/model_nmcn/model_lpcn/model_lzcn.
+// The WMI fan table behaves like the rest of the 0x5508 generation (issue
+// #491): per-point speed1 only, temperature columns always read 0, EC
+// values matching the F9F0..F9F9 level bytes - i.e. the level-index kind
+// (FAN_SPEED_UNIT_LEVEL, see model_q7cn). Only the speed attributes are
+// exposed (wmi_fancurve_speed_only); writing percent values into the
+// level bytes matches the thermal-shutdown reports for this generation.
+static const struct model_config model_q6cn = {
+	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5508,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = true,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI2,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFE00D400,
+	.ramio_size = 0x600,
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true
+};
+
+// Legion Pro 5 16IAX10H (83LU) - 2025, Intel Arrow Lake-HX + RTX 5070 Ti
+// BIOS: Q6CN26WW (issue #337), EC chip 0x5508 (read on the unit, fw 2b0).
+// The Q6CN BIOS prefix is shared with the Legion 5 16IAX10 (83NX) above,
+// but this is the Legion Pro 5 chassis; the DSDT (L = dsdt.dsl line, issue
+// #337) shows the same WMI-only firmware layout as model_q7cn (Legion Pro
+// 7 16IAX10H, 83F5, the Q7CN-BIOS sibling of this chassis):
+// - Fan Method WMAB implements only Fan_Get_Table(5)/Fan_Set_Table(6)
+//   (L55540): get returns the 0x58-byte LFGT buffer with the live EC
+//   fields F9F0..F9F9 (static 1..10 placeholder when ODV1 == 4, i.e.
+//   extreme mode); set copies the ten speeds (bytes 0x06..0x18 at even
+//   offsets) to F9F0..F9F9 and commits via LECR(0xD0,1,1,2), no range
+//   check, mode/FSID bytes ignored. The bytes are fan LEVELS 1..10
+//   (LENOVO_FAN_TABLE_DATA, instance A3, is present in the _WDG), one
+//   table for all fans, temperature axis fixed by the EC, hence
+//   FAN_SPEED_UNIT_LEVEL and only the speed attributes are exposed
+//   (wmi_fancurve_speed_only).
+// - Other Method WMAE Get(17)/Set(18) (L55623/L56286) implements the
+//   standard feature ids: fan RPM 0x04030001/2 (FANS*0x64), CPU/GPU temp
+//   0x05040000/0x05050000 (CPUT/GPUT), full speed 0x04020000 -> EC FNST
+//   (both directions), PL/OC 0x0101..0x0107/0x0201..0x0204 stored raw in
+//   the EC. 0x05010000 is the CPU socket temp (CPUS), not a labeled IC
+//   sensor -> skip_ic_temp.
+// - Power mode: GameZone WMAA SmartFanMode set 0x2C / get 0x2D
+//   (L54931/L54802): quiet/balanced/performance, 0xFF custom, 0xE0
+//   extreme; requests are parked on battery (ACTY() checks).
+// - CPU Method WMAC is an empty stub (L55617), so power limits go
+//   through WMAE (WMI3), as on model_q7cn/model_rlcn.
+// - Keyboard backlight (white, off/medium/bright) is driven by the
+//   KBBACKLIGHT WMAF get(1)/set(2) (L57234/L57288, LECR 0xDA func 3,
+//   levels 1..3); light ids 0x03/0x04 exist in the DSDT but the chassis
+//   has no Y-logo or IO-port lights (issue #337 report), so both are
+//   skipped.
+// - EC RAM window ERAX @0xFE500400 (L37121, len 0xFF; F9FT/ECB2 at
+//   +0x100/+0x200, ramio_size 0x300) is used only by the read-only
+//   debugfs ecmemoryram dump; EC register offsets are not trusted on the
+//   0x5508 generation (issue #491) - everything else goes through WMI.
+// - Rapid charge via VPC0 GBMD/SBMC (L39548/L39765); SBMC(7) also
+//   clears conservation mode.
+// Runtime validation on the reporter's unit (issue #337, tramp-tm):
+// legion_wmi_other reports plausible fan RPM (2400/2100) while raw EC and
+// ACPI-path reads are garbage (e.g. 18045 RPM with the fans at ~2400),
+// matching the EC-misalignment quirk of this generation; dmesg with
+// force=1 shows EC id 0x5508 fw 2b0 and all five WMI blocks (GameZone,
+// Fan Method, Other Method, CPU Method, KBBACKLIGHT) registering.
+// fan_fullspeed is gated behind custom power mode like model_q7cn/
+// model_rlcn: on this generation a full-speed write through the wrong
+// path can wedge the fans at maximum speed until reboot (model_rlcn).
+static const struct model_config model_q6cn_lu = {
+	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5508,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI2,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_ic_temp = true,
+	.skip_oc_controls = true,
+	.skip_lockfancontroller = true,
+	/* Fan Method WMAB implements only ids 5/6 (see the header comment). */
+	.skip_fan_maxspeed = true,
+	.skip_ylogo_light = true,
+	.skip_ioport_light = true,
+	/* Same GameZone alias race as model_q7cn (issue #625): while LLL
+	 * holds the block, lenovo-wmi-gamezone binds nothing and the
+	 * lenovo-wmi-other PL1/PL2 attributes return -EINVAL (Q6CN79WW).
+	 */
+	.leave_gamezone_wmi_unbound = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFE500400,
+	.ramio_size = 0x300,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SBMC" },
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true,
+	.has_fan_unlock = false,
+	.has_fn_lock = false,
+	.has_flip_to_start = true,
+};
+
+// Legion Pro 5 16IAX10 (83F3) - 2025, Intel Core Ultra 7 255HX + RTX 5070
+// BIOS: Q6CN78WW/Q6CN79WW (issue #471), EC 0x5508. Facts below are from
+// the Q6CN79WW DSDT (L = dsdt.dsl line, attachment in issue #471); the
+// WMA* methods live in \_SB.GZFD and the chassis is the Legion Pro 5
+// sibling of the 83LU (model_q6cn_lu, same Q6CN BIOS line):
+// - Fan Method WMAB implements only Fan_Get_Table(5)/Fan_Set_Table(6)
+//   (L59967/L60012): get returns the 0x58-byte LFGT buffer with the live
+//   EC fields F9F0..F9F9 (static 1..10 placeholder when ODV1 == 4, i.e.
+//   extreme mode, L59983); set copies the ten speeds (bytes 0x06..0x18
+//   at even offsets) to F9F0..F9F9 and commits via LECR(0xD0,1,1,2)
+//   (L60037), no range check, mode/FSID bytes ignored. The bytes are fan
+//   LEVELS 1..10, one table for all fans, temperature axis fixed by the
+//   EC, hence FAN_SPEED_UNIT_LEVEL and only the speed attributes are
+//   exposed (wmi_fancurve_speed_only). Read on hardware: 1,2,3,4,5,6,
+//   7,8,8,8 (performance mode, issue #471).
+// - LENOVO_FAN_TABLE_DATA (WQA3, L46178) maps level 1..10 to
+//   1700..5300 RPM on fan 1 (sensor 0x04) and fan 2 (sensor 0x05), so
+//   fan1_level_rpm_table/fan2_level_rpm_table appear automatically
+//   (has_fancurve_defaults); the _WDG carries both the Fan Method and
+//   the KBBACKLIGHT (offset 0x50) data blocks.
+// - Other Method WMAE Get(0x11)/Set(0x12) (L60048/L60711) implements the
+//   standard feature ids: fan RPM 0x04030001/2 (FANS*0x64), CPU/GPU temp
+//   0x05040000/0x05050000, full speed 0x04020000 -> EC FNST (both
+//   directions), PL/OC 0x0101..0x0108/0x0201..0x0204 stored raw in the
+//   EC. 0x05010000 is the CPU socket temp (CPUS), not a labeled IC
+//   sensor -> skip_ic_temp. PL/OC attributes stay hidden
+//   (skip_oc_controls) until validated; only cpu_temperature_limit,
+//   cpu_l1_tau and gpu_power_target_offset are visible.
+// - Power mode: GameZone WMAA SmartFanMode set 0x2C / get 0x2D
+//   (L59356/L59227): quiet/balanced/performance, 0xFF custom, 0xE0
+//   extreme. CPU Method WMAC is an empty stub (L60042), so power
+//   limits go through WMAE (WMI3).
+// - Keyboard backlight (4-zone RGB; the WMI path drives the on/off and
+//   brightness levels, effects stay userspace) via KBBACKLIGHT WMAF
+//   get(1)/set(2) (L61749/L61803, LECR 0xDA); the chassis has no
+//   Y-logo or IO-port lights (issue #471 report), so both are skipped.
+// - EC0 at \_SB.PC00.LPCB.EC0 (L36695, in Scope (\_SB.PC00.LPCB)
+//   L36585, _STA L36731); EC RAM window ERAX @0xFE500400 (L36982,
+//   len 0xFF; F9FT/ECB2 at +0x100/+0x200, ramio_size 0x300) is used
+//   only by the read-only debugfs ecmemoryram dump; EC register
+//   offsets are not trusted on the 0x5508 generation (issue #491) -
+//   everything else goes through WMI. VPC0 (VPC2004) _STA/_CFG
+//   (L39301/L39306), GBMD/SBMC (L39468/L39685).
+// Runtime reads on the reporter's unit (issue #471, inermage): EC
+// column is garbage (80/87 C, 18045/16743 RPM) while ACPI and WMI3
+// agree (CPU 64 C, fans 2200 RPM), EC id 0x5508 fw 2b0, powermode
+// WMI 3 - matching the EC-misalignment quirk of this generation.
+// fan_fullspeed is gated behind custom power mode like model_q7cn/
+// model_rlcn: on this generation a full-speed write through the wrong
+// path can wedge the fans at maximum speed until reboot (model_rlcn).
+static const struct model_config model_q6cn_f3 = {
+	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5508,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI2,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_ic_temp = true,
+	.skip_oc_controls = true,
+	.skip_lockfancontroller = true,
+	/* Fan Method WMAB implements only ids 5/6 (see the header comment). */
+	.skip_fan_maxspeed = true,
+	.skip_ylogo_light = true,
+	.skip_ioport_light = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFE500400,
+	.ramio_size = 0x300,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SBMC" },
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true,
+	.has_fan_unlock = false,
+	.has_fn_lock = false,
+	.has_flip_to_start = true,
 };
 
 // Legion 5 15IAX10 (83F0) - same EC Chip ID (0x5508) as R3CN (LOQ 15IRX10)
+// EC3 fancurve reads return garbage on this chassis (#359/#475), and the
+// DSDT disassembly in issue #491 (Silver-Rust-18) shows why the WMI path
+// is the right one: Fan Method WMAB implements only Fan_Get_Table(5)/
+// Fan_Set_Table(6) with the 0x58-byte LFGT buffer - ten fan LEVELS 1..10
+// in EC F9F0..F9F9, committed via LECR(0xD0,1,1,2), no temperature fields
+// anywhere (same layout as model_q7cn/model_rlcn/model_recn). The get
+// branch returns a static 1..10 placeholder while ODV1 == 4 (set by the
+// ASMC state machine, e.g. the extreme thermal mode), so read the table
+// in another mode. WMI3 temps/fans/powermode and monitoring are confirmed
+// on the unit (#475, gauthier1024 in #491); the EC3 offsets borrowed from
+// model_r3cn are wrong for this chassis and unsafe to write.
 static const struct model_config model_s2cn = {
 	.registers = &ec_register_offsets_loq_v1,
 	.check_embedded_controller_id = true,
@@ -1412,16 +2723,15 @@ static const struct model_config model_s2cn = {
 	.access_method_keyboard = ACCESS_METHOD_WMI2,
 	.access_method_fanspeed = ACCESS_METHOD_WMI3,
 	.access_method_temperature = ACCESS_METHOD_WMI3,
-	.access_method_fancurve = ACCESS_METHOD_EC3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
 	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
 	.acpi_check_dev = false,
 	.ramio_physical_start = 0xFE0B0F00,
 	.ramio_size = 0x600,
-	.acpi_paths = {
-		[ACPI_PATH_STA] = "\\\\_SB.PC00.LPCB.EC0.VPC0._STA",
-		[ACPI_PATH_CFG] = "\\\\_SB.PC00.LPCB.EC0.VPC0._CFG"
-	},
-	.has_fancurve_defaults = true
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG" },
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true
 };
 
 static const struct model_config model_m3cn = {
@@ -1449,6 +2759,42 @@ static const struct model_config model_m3cn = {
 	},
 	.has_extreme_powermode = true
 };
+// Legion Slim 5 14APH8 2023
+static const struct model_config model_macn = {
+	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x8227,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_NO_ACCESS,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.acpi_check_dev = true,
+	.ramio_physical_start = 0xFEEC2400,
+	.ramio_size = 0x600,
+	.acpi_paths = {
+		[ACPI_PATH_STA] = "\\_SB.PCI0.LPC0.EC0.VPC0._STA",
+		[ACPI_PATH_CFG] = "\\_SB.PCI0.LPC0.EC0.VPC0._CFG",
+		[ACPI_PATH_READ_RAPIDCHARGE] = "\\_SB.PCI0.LPC0.EC0.VPC0.GBMD",
+		[ACPI_PATH_WRITE_RAPIDCHARGE] = "\\_SB.PCI0.LPC0.EC0.VPC0.SBMC",
+	},
+	.wmi_fancurve_speed_only = true,
+	.has_fancurve_defaults = true,
+	.skip_ylogo_light = true,
+	.skip_ioport_light = true,
+	.skip_ic_temp = true,
+	.skip_lockfancontroller = true,
+	.has_fn_lock = true,
+	.has_flip_to_start = true,
+	.has_instant_boot = true,
+	.fan_max_rpm = 6400,
+};
 static const struct model_config model_m3cn_8227 = {
 	.registers = &ec_register_offsets_v0,
 	.check_embedded_controller_id = true,
@@ -1462,7 +2808,8 @@ static const struct model_config model_m3cn_8227 = {
 	.access_method_fanspeed = ACCESS_METHOD_WMI3,
 	.access_method_temperature = ACCESS_METHOD_WMI3,
 	.access_method_fancurve = ACCESS_METHOD_WMI3,
-	.access_method_fanfullspeed = ACCESS_METHOD_WMI,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
 	.acpi_check_dev = true,
 	.ramio_physical_start = 0xFE0B0400,
 	.ramio_size = 0x600,
@@ -1472,7 +2819,18 @@ static const struct model_config model_m3cn_8227 = {
 		[ACPI_PATH_READ_RAPIDCHARGE] = "\\_SB.PCI0.LPC0.EC0.VPC0.GBMD",
 		[ACPI_PATH_WRITE_RAPIDCHARGE] = "\\_SB.PCI0.LPC0.EC0.VPC0.SBMC",
 	},
-	.has_extreme_powermode = true
+	/* max-power (the "extreme" platform_profile choice) cuts power
+	 * instantly on this EC (hard power-off, no shutdown sequence) instead
+	 * of raising limits like on other has_extreme_powermode models, so
+	 * keep it out of platform_profile's choices entirely.
+	 */
+	.has_extreme_powermode = false,
+	/* Fan_Set_Table carries only per-point speeds on this EC (0x8227);
+	 * temperature thresholds, fan2 speed and accel/decel have no WMI
+	 * backing, so hide them like model_lpcn does (issue #582).
+	 */
+	.wmi_fancurve_speed_only = true,
+	.skip_lockfancontroller = true,
 };
 // LOQ 15IAX9E
 static const struct model_config model_q8cn = {
@@ -1490,13 +2848,12 @@ static const struct model_config model_q8cn = {
 	.access_method_temperature = ACCESS_METHOD_WMI3,
 	.access_method_fancurve = ACCESS_METHOD_WMI3,
 	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
 	.acpi_check_dev = false,
 	.ramio_physical_start = 0xFE0B05C0,
 	.ramio_size = 0x600,
-	.acpi_paths = {
-		[ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
-		[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG"
-	},
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG" },
 	.has_fancurve_defaults = false
 };
 
@@ -1515,16 +2872,620 @@ static const struct model_config model_secn = {
 	.access_method_temperature = ACCESS_METHOD_WMI3,
 	.access_method_fancurve = ACCESS_METHOD_EC3,
 	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
-	.access_method_powerlimits = ACCESS_METHOD_WMI3_CLAMPED,
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
 	.acpi_check_dev = false,
 	.ramio_physical_start = 0xFE0B0F00,
 	.ramio_size = 0x600,
-	.acpi_paths = {
-		[ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
-		[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG"
-	},
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SBMC",
+			[ACPI_PATH_READ_FNLOCK] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.HALS",
+			[ACPI_PATH_WRITE_FNLOCK] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SALS" },
 	.has_fancurve_defaults = true,
-	.has_pl_coupling = true
+	.has_pl_coupling = true,
+	.has_fan_unlock = true,
+	.has_fn_lock = true,
+	.has_flip_to_start = true,
+	.has_single_fan = true,
+	.fan_max_rpm = 5400,
+	.fanfullspeed_requires_custom_powermode = true,
+};
+
+// Legion 5i Gen 10 (83VK) - 2025/2026, Intel Arrow Lake-HX + RTX 5060
+// BIOS: UFCN27WW, EC chip: 0x5509
+// Fan speed/temperature reads and powermode validated on real hardware (issue #507).
+// Fancurve writes currently fail in the firmware's \_SB.GZFD.SFAN method
+// (AE_AML_BUFFER_LIMIT), so WMI3 fancurve access is read-only on this BIOS.
+static const struct model_config
+	model_ufcn = { .registers = &ec_register_offsets_v0,
+		       .check_embedded_controller_id = true,
+		       .embedded_controller_id = 0x5509,
+		       .memoryio_physical_ec_start = 0xC400,
+		       .memoryio_size = 0x300,
+		       .has_minifancurve = true,
+		       .has_custom_powermode = true,
+		       .has_extreme_powermode = true,
+		       .access_method_powermode = ACCESS_METHOD_WMI,
+		       .access_method_keyboard = ACCESS_METHOD_WMI,
+		       .access_method_fanspeed = ACCESS_METHOD_WMI3,
+		       .access_method_temperature = ACCESS_METHOD_WMI3,
+		       .access_method_fancurve = ACCESS_METHOD_WMI3,
+		       .access_method_fanfullspeed = ACCESS_METHOD_WMI,
+		       .acpi_check_dev = false,
+		       .ramio_physical_start = 0xFE0B0400,
+		       .ramio_size = 0x600,
+		       .acpi_paths = {
+			       // rapidcharge EC at \_SB.PC00.LPCB.EC0, not v0 \_SB.PCI0.LPC0.EC0
+			       [ACPI_PATH_READ_RAPIDCHARGE] =
+				       "\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			       [ACPI_PATH_WRITE_RAPIDCHARGE] =
+				       "\\_SB.PC00.LPCB.EC0.VPC0.SBMC",
+		       } };
+
+// Legion Pro 7 16IAX10H (83F5) - 2025, Intel Arrow Lake-HX + RTX 50
+// BIOS: Q7CN78WW, EC firmware 1.78. Facts below are from this unit's DSDT
+// (L = DSDT.dsl line); the EC-internal 0xC4xx offsets are only inferred.
+// - EC RAM window ERAX @0xFE500400 (L37243, plus F9FT/ECB2 at +0x100/
+//   +0x200, ramio_size 0x300) is used only by debugfs ecmemoryram; it is
+//   byte-identical to the EC I2EC bank at 0xC400 and to the ACPI EC I/O
+//   space (verified on hardware). Nothing writes EC RAM, so
+//   lockfancontroller/minifancurve (undeclared bytes) are hidden.
+// - Power mode: GameZone WMAA 0x2C set / 0x2D get (L61539-61800):
+//   1 quiet, 2 balanced, 3 performance, 0xFF custom, 0xE0 extreme.
+//   custom/performance/extreme need AC; on battery the request is
+//   parked and read back as if applied.
+// - Fan table: Fan Method WMAB has only Fan_Get_Table(5)/Fan_Set_Table(6)
+//   (L62277-62351); set copies the byte at each even offset 0x06..0x18
+//   of the 0x40-byte buffer to EC F9F0..F9F9 and calls LECR(0xD0), no
+//   range check. The bytes are fan LEVELS 1..10 (LENOVO_FAN_TABLE_DATA
+//   WQA3, L46562-47779: level 1 = per-fan minimum RPM, 10 = maximum; one
+//   table shared by all fans; the temperature axis is fixed by the EC;
+//   level 0 is undocumented), hence FAN_SPEED_UNIT_LEVEL for this model.
+//   Fan_Get_Table returns a static 1..10 placeholder in extreme mode
+//   (ODV1 == 4) instead of the live table, and Fan_Set_Table ignores the
+//   mode byte. Read on hardware:
+//   1,2,3,4,5,6,7,8,8,8 (performance mode).
+// - RPM/temps/full speed: Other Method WMAE Get(17)/SetFeatureValue(18)
+//   ids 0x04030001/0x04030002 (RPM), 0x05040000/0x05050000 (CPU/GPU
+//   temp, L62942-62965), 0x04020000 (full speed, L62877-62888).
+// - Power limits: CPU Method WMAC is an empty stub (L62354), so WMAE via
+//   WMI3 (writes are clamped to the capability-data ranges). WMAE stores 0x0101/0x0102/0x0104/0x0106 and
+//   0x0201..0x0204 raw in the EC (get L62534-62690, set L63327-63600);
+//   0x0103 always reads back 0, 0x0105 is unimplemented and 0x0107 (tau)
+//   goes through a 13-entry lookup. skip_oc_controls hides the PL/OC
+//   attributes; only cpu_temperature_limit, cpu_l1_tau and
+//   gpu_power_target_offset stay visible.
+// - Keyboard is USB-HID ITE 048d:c197 "Spectrum" that the WMI light
+//   methods do not drive -> NO_ACCESS; Y-logo / IO-port light skipped.
+// - EC id 0x5508 (version 2b0) read on this unit via Super-I/O port I/O;
+//   also reported for other 83F5 units (issue #385).
+// - Rapid charge via VPC0 GBMD/SBMC (L39816/L40033); SBMC(7) also
+//   clears conservation mode.
+static const struct model_config model_q7cn = {
+	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5508,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_NO_ACCESS,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
+	.skip_ic_temp = true,
+	.skip_oc_controls = true,
+	.skip_lockfancontroller = true,
+	/* Fan Method WMAB implements only ids 5/6 (see the header comment). */
+	.skip_fan_maxspeed = true,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_ylogo_light = true,
+	.skip_ioport_light = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFE500400,
+	.ramio_size = 0x300,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SBMC" },
+	/*
+	 * LENOVO_FAN_TABLE_DATA (WQA3, switched on GSKU) carries one RPM
+	 * ladder per fan, identical in every power mode: fan 1 / sensor
+	 * 0x01 (CPU fan), fan 2 / sensor 0x05 (GPU fan) and fan 4 / sensor
+	 * 0x04 (the small third fan, hwmon fan3; its ladder is not
+	 * exposed). There is no (fan 1, sensor 0x04) row, so
+	 * fan1_level_rpm_table comes from the sensor 0x01 row.
+	 */
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true,
+	/* WMAE Get 0x04030004 returns EC FASF * 100 (fan 4 RPM) */
+	.has_third_fan = true,
+	/* PL/OC attributes are hidden (skip_oc_controls) in favour of the
+	 * lenovo-wmi-other firmware-attributes, which need GameZone bound
+	 * by lenovo-wmi-gamezone.
+	 */
+	.leave_gamezone_wmi_unbound = true,
+	/* the EC floors the fan table at the mode default on resume */
+	.restore_fancurve_on_resume = true,
+	.has_fan_unlock = false,
+	.has_fn_lock = false,
+	.has_flip_to_start = true,
+	/* WMAE get L62801/L62813 (EC EACS/ETCS), set L63638/L63654
+	 * (WSMI 7/8, 9/0xA); capdata00 (WQA9) flags both 0x07.
+	 */
+	.has_instant_boot = true,
+};
+
+// Legion Pro 5 16ADR10 (83LT) - 2025, AMD + RTX 50
+// BIOS: RLCN31WW, EC 0x5508. Facts below are from this unit's DSDT
+// (L = dsdt.dsl line, issue #445); the WMA* methods live in \_SB.GZFD:
+// - Fan Method WMAB implements only Fan_Get_Table(5)/Fan_Set_Table(6)
+//   (L29032): get returns the 0x58-byte wmi_fan_table_read buffer, live
+//   EC fields F9F0..F9F9 unless ODV1 == 4 (extreme), which returns the
+//   static 1..10 placeholder; set copies the ten speeds (bytes
+//   0x06..0x18 at even offsets, FSS0..FSS9) to F9F0..F9F9 and commits
+//   via LECR(0xD0,1,1,2), no range check, mode/FSID bytes ignored.
+//   Identical semantics to Q7CN, so FAN_SPEED_UNIT_LEVEL (see
+//   wmi_read_fancurve_custom()) and only the speed attributes are
+//   exposed (wmi_fancurve_speed_only). LENOVO_FAN_TABLE_DATA (WQA3,
+//   L14777) maps level 1..10 to 1700..5100 RPM on fan 1, so
+//   fan1_level_rpm_table/fan2_level_rpm_table appear automatically.
+// - Other Method WMAE Get(0x11)/Set(0x12) (L29136) implements the
+//   standard feature IDs: fan RPM 0x04030001/2 (FANS*0x64), CPU/GPU
+//   temp 0x05040000/0x05050000, full speed 0x04020000 -> EC FNST (both
+//   directions, mutex-protected), PL/OC 0x0101..0x0107/0x0201..0x0204
+//   stored raw in the EC. 0x05010000 is the CPU socket temp (CPUS),
+//   not a labeled IC sensor -> skip_ic_temp. PL/OC attributes stay
+//   hidden (skip_oc_controls) until validated; only
+//   cpu_temperature_limit, cpu_l1_tau and gpu_power_target_offset are
+//   visible, as on Q7CN.
+// - Power mode: GameZone WMAA SmartFanMode set 0x2C / get 0x2D
+//   (L28308): quiet/balanced/performance, 0xFF custom, 0xE0 extreme;
+//   performance/custom are parked on battery (ACTY check).
+// - CPU Method WMAC only handles 0x0E (AMD thermal thresholds via
+//   WECM, L29109), which the driver never calls.
+// - Lights: KBBACKLIGHT WMAF get(1)/set(2) (L30748) drives the
+//   keyboard (LECR 0xDA) and the Y-logo (LCST: 1 = on, 2 = off,
+//   matching the driver's Gen 10 handling); light ID 0x05 (IO-port) is
+//   unimplemented and reads 0, so it is skipped at runtime (-ENODEV).
+// - EC0 at \_SB.PCI0.LPC0.EC0 (PNP0C09, GPE 7, IO 0x62/0x66, _STA
+//   0x0F, L6910); EC RAM window ERAX @0xFEEC2400 len 0xFF (L7144, used
+//   only for the read-only debugfs ecmemoryram dump); VPC0 GBMD/SBMC
+//   (L9341/L9558) present. EC register offsets are not trusted on the
+//   0x5508 generation (issue #491) - everything else goes through WMI.
+// fan_fullspeed needs custom power mode (WMI3 FNST, cf. model_q7cn):
+// on this unit a full-speed write through the wrong WMI method (GKCN
+// fallback config) wedged the fans at ~18000 RPM until reboot, so the
+// write is gated and must be validated with care (set in custom mode,
+// then clear; reboot if it does not release).
+static const struct model_config model_rlcn = {
+	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5508,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI2,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_ic_temp = true,
+	.skip_oc_controls = true,
+	.skip_lockfancontroller = true,
+	/* Fan Method WMAB implements only ids 5/6 (see the header comment). */
+	.skip_fan_maxspeed = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFEEC2400,
+	.ramio_size = 0xFF,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PCI0.LPC0.EC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PCI0.LPC0.EC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.SBMC" },
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true,
+	.has_fan_unlock = false,
+	.has_fn_lock = false,
+	.has_flip_to_start = true,
+};
+
+// Legion 5 15AHP10 (83M0) - 2025, AMD (Ryzen 7 260) + RTX 5060
+// BIOS: RGCN27WW/RGCN35WW/RGCN36WW (issue #373), EC 0x5508. Facts below
+// are from the RGCN35WW DSDT (L = dsdt.dsl line, attachments in issue
+// #373); the WMA* methods live in \_SB.GZFD:
+// - Fan Method WMAB implements only Fan_Get_Table(5)/Fan_Set_Table(6)
+//   (L23364): get returns the 0x58-byte wmi_fan_table_read buffer, live
+//   EC fields F9F0..F9F9 unless ODV1 == 4 (extreme), which returns the
+//   static 1..10 placeholder; set copies the ten speeds (bytes
+//   0x06..0x18 at even offsets, FSS0..FSS9) to F9F0..F9F9 and commits
+//   via LECR(0xD0,1,1,2), no range check, mode/FSID bytes ignored.
+//   Identical semantics to RLCN (83LT), so FAN_SPEED_UNIT_LEVEL (see
+//   wmi_read_fancurve_custom()) and only the speed attributes are
+//   exposed (wmi_fancurve_speed_only). LENOVO_FAN_TABLE_DATA (WQA3,
+//   L17330) maps level 1..10 to 1800..4600 RPM on fan 1 (sensor 0x04)
+//   and fan 2 (sensor 0x05), so fan1_level_rpm_table/
+//   fan2_level_rpm_table appear automatically.
+// - Other Method WMAE Get(0x11)/Set(0x12) (L23468) implements the
+//   standard feature IDs: fan RPM 0x04030001/2 (FANS*0x64), CPU/GPU
+//   temp 0x05040000/0x05050000, full speed 0x04020000 -> EC FNST (both
+//   directions, mutex-protected), PL/OC 0x0101..0x0108/0x0201..0x0204
+//   stored raw in the EC. 0x05010000 is the CPU socket temp (CPUS),
+//   not a labeled IC sensor -> skip_ic_temp. PL/OC attributes stay
+//   hidden (skip_oc_controls) until validated; only
+//   cpu_temperature_limit, cpu_l1_tau and gpu_power_target_offset are
+//   visible, as on Q7CN/RLCN.
+// - Power mode: GameZone WMAA SmartFanMode set 0x2C / get 0x2D
+//   (L22637): quiet/balanced/performance, 0xFF custom, 0xE0 extreme,
+//   mapped from EC ASMC and ODV1 (ODV1 5..9 respect ACTY parking).
+// - CPU Method WMAC only handles 0x0E (AMD thermal thresholds via
+//   WECM, L23441), which the driver never calls.
+// - Lights: KBBACKLIGHT WMAF get(1)/set(2) (L24902) drives the
+//   keyboard (LECR 0xDA); the reporters' units have no lid/logo and no
+//   IO-port lights (issue #373 report), so both light attributes are
+//   skipped.
+// - EC0 at \_SB.PCI0.LPC0.EC0 (L9987, _STA L9988, GPE 7, IO 0x62/0x66);
+//   EC RAM window ERAX @0xFEEC2400 len 0xFF (L10205, used only for the
+//   read-only debugfs ecmemoryram dump); VPC0 (VPC2004) GBMD/SBMC
+//   (L12409/L12626) present. EC register offsets are not trusted on
+//   the 0x5508 generation (issue #491) - everything else goes through
+//   WMI.
+// fan_fullspeed needs custom power mode (WMI3 FNST, cf. model_q7cn):
+// on the 83LT a full-speed write through the wrong WMI method wedged
+// the fans at maximum speed until reboot (model_rlcn), so the write is
+// gated and must be validated with care (set in custom mode, then
+// clear; reboot if it does not release).
+static const struct model_config model_rgcn = {
+	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5508,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI2,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_ic_temp = true,
+	.skip_oc_controls = true,
+	.skip_lockfancontroller = true,
+	/* Fan Method WMAB implements only ids 5/6 (see the header comment). */
+	.skip_fan_maxspeed = true,
+	.skip_ylogo_light = true,
+	.skip_ioport_light = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFEEC2400,
+	.ramio_size = 0xFF,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PCI0.LPC0.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PCI0.LPC0.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.SBMC" },
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true,
+	.has_fan_unlock = false,
+	.has_fn_lock = false,
+	.has_flip_to_start = true,
+};
+
+// Legion Y7000P IRX10 (83NN) - 2025, Intel Arrow Lake-HX + RTX 50
+// BIOS: S9CN19WW (issue #506), EC 0x5508 (fw 2b0, read on the unit).
+// Facts below are from the S9CN19WW DSDT (L = dsdt.dsl line,
+// attachment in issue #506); the WMA* methods live in \_SB.GZFD:
+// - Fan Method WMAB implements only Fan_Get_Table(5)/Fan_Set_Table(6)
+//   (L41247): get returns the 0x58-byte LFGT buffer with the live EC
+//   fields F9F0..F9F9 (static 1..10 placeholder when ODV1 == 4, i.e.
+//   extreme mode); set copies the ten speeds (bytes 0x06..0x18 at even
+//   offsets) to F9F0..F9F9 and commits via LECR(0xD0,1,1,2), no range
+//   check, mode/FSID bytes ignored. The bytes are fan LEVELS 1..10
+//   (LENOVO_FAN_TABLE_DATA, WQA3 L35223, maps level 1..10 to
+//   1700..5100 RPM on fan 1), one table for all fans, temperature axis
+//   fixed by the EC, hence FAN_SPEED_UNIT_LEVEL and only the speed
+//   attributes are exposed (wmi_fancurve_speed_only).
+// - Other Method WMAE Get(0x11)/Set(0x12) (L41328) implements the
+//   standard feature ids: fan RPM 0x04030001/2 (FANS/FA2S*0x64),
+//   CPU/GPU temp 0x05040000/0x05050000 (CPUT/GPUT), full speed
+//   0x04020000 -> EC FNST (both directions), PL/OC 0x0101..0x0107/
+//   0x0201..0x0204 stored raw in the EC. 0x05010000 is the CPU socket
+//   temp (CPUS), not a labeled IC sensor -> skip_ic_temp. PL/OC
+//   attributes stay hidden (skip_oc_controls) until validated; only
+//   cpu_temperature_limit, cpu_l1_tau and gpu_power_target_offset are
+//   visible, as on Q7CN.
+// - Power mode: GameZone WMAA SmartFanMode set 0x2C / get 0x2D
+//   (L40638/L40509): quiet/balanced/performance, 0xFF custom, 0xE0
+//   extreme.
+// - CPU Method WMAC is an empty stub (L41324), so power limits go
+//   through WMAE (WMI3), as on model_q7cn/model_rlcn.
+// - Lights: KBBACKLIGHT WMAF get(1)/set(2) (L42947) drives the
+//   keyboard (id 0x00, LECR 0xDA levels 1..3) and the Y-logo (id 0x03,
+//   LCST on/off via LECR 0xDA); light id 0x05 (IO-port) is
+//   unimplemented and reads 0, so it is skipped at runtime (-ENODEV).
+// - EC0 at \_SB.PC00.LPCB.EC0 (L28222); EC RAM window ERAX @0xFE0B0400
+//   (L28492, len 0xFF; F9FT/ECB2 at +0x100/+0x200, ramio_size 0x300)
+//   is used only by the read-only debugfs ecmemoryram dump; EC
+//   register offsets are not trusted on the 0x5508 generation (issue
+//   #491) - everything else goes through WMI. VPC0 _STA/_CFG
+//   (L30714/L30719), GBMD/SBMC (L30881/L31098) present.
+// Runtime validation on the reporters' units (issue #506, huverse and
+// AXFOX, with the WMI-only config from this family): WMI powermode and
+// platform profile work; WMI3 CPU temp and fan RPM are correct (idle
+// ~48 C/fans off, load ~85-88 C/~2000-2500 RPM) while raw EC reads are
+// garbage (~18045/~16740 RPM), matching the EC-misalignment quirk of
+// this generation; keyboard backlight and Y-logo LED drivers init
+// (the platform::kbd_backlight name collision with ideapad_laptop is
+// cosmetic and handled by the rename).
+// fan_fullspeed is gated behind custom power mode like model_q7cn/
+// model_rlcn: on this generation a full-speed write through the wrong
+// path can wedge the fans at maximum speed until reboot (model_rlcn).
+static const struct model_config model_s9cn = {
+	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5508,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI2,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_ic_temp = true,
+	.skip_oc_controls = true,
+	.skip_lockfancontroller = true,
+	/* Fan Method WMAB implements only ids 5/6 (see the header comment). */
+	.skip_fan_maxspeed = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFE0B0400,
+	.ramio_size = 0x300,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PC00.LPCB.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PC00.LPCB.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PC00.LPCB.EC0.VPC0.SBMC" },
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true,
+	.has_fan_unlock = false,
+	.has_fn_lock = false,
+	.has_flip_to_start = true,
+};
+
+// Legion Pro 7 16AFR10H (83RU) - 2025, AMD (Ryzen 9 9955HX) + RTX 50
+// BIOS: SMCN19WW, EC 0x5508 (both read on the unit, issue #624 dmesg).
+// Facts below are from the SMCN19WW DSDT (L = dsdt.dsl line, attachment
+// in issue #624); the WMA* methods live in \_SB.GZFD:
+// - Fan Method WMAB implements only Fan_Get_Table(5)/Fan_Set_Table(6)
+//   (L20176): get returns the 0x58-byte LFGT buffer with the live EC
+//   fields F9F0..F9F9 (static 1..10 placeholder when ODV1 == 4, i.e.
+//   extreme mode, L20194); set copies the ten speeds (bytes 0x06..0x18
+//   at even offsets) to F9F0..F9F9 and commits via LECR(0xD0,1,1,2)
+//   (L20248), no range check, mode/FSID bytes ignored. Identical
+//   semantics to Q7CN/RLCN, so FAN_SPEED_UNIT_LEVEL (see
+//   wmi_read_fancurve_custom()) and only the speed attributes are
+//   exposed (wmi_fancurve_speed_only). LENOVO_FAN_TABLE_DATA (WQA3,
+//   L14505) maps level 1..10 to 1700..5200 RPM on fan 1 (sensor 0x01),
+//   1700..5400 RPM on fan 2 (sensor 0x05) and 1500..6500 RPM on fan 4
+//   (sensor 0x04) - matching the reporter's lenovo_wmi_other
+//   fan1/fan2/fan4 min/max - so fan1_level_rpm_table/
+//   fan2_level_rpm_table appear automatically.
+// - Other Method WMAE Get(0x11)/Set(0x12) (L20292) implements the
+//   standard feature ids: fan RPM 0x04030001/2 (FANS/FA2S*0x64) and
+//   0x04030004 (FASF*0x64, the small third fan -> has_third_fan)
+//   (L20844-L20881), CPU/GPU temp 0x05040000/0x05050000 (CPUT/GPUT,
+//   L20896/L20908), full speed 0x04020000 -> EC FNST (both directions,
+//   L20832/L21630), PL/OC ids stored raw in the EC. 0x05010000 is the
+//   CPU socket temp (CPUS, L20884), not a labeled IC sensor ->
+//   skip_ic_temp. PL/OC attributes stay hidden (skip_oc_controls)
+//   until validated; only cpu_temperature_limit, cpu_l1_tau and
+//   gpu_power_target_offset are visible, as on Q7CN.
+// - Power mode: GameZone WMAA SmartFanMode set 0x2C / get 0x2D
+//   (L19452): quiet/balanced/performance, 0xFF custom, 0xE0 extreme,
+//   mapped from EC ASMC and ODV1 (like model_rgcn).
+// - CPU Method WMAC only handles 0x0E (AMD 0x414D44xx thermal
+//   features via WSMI, L20253), which the driver never calls, so power
+//   limits go through WMAE (WMI3), as on model_rlcn.
+// - Lights: per PSREF the keyboard is per-key RGB and the lid logo /
+//   rear vent are RGB, all driven by the USB-HID Spectrum controller
+//   like on the 16IAX10H twin (model_q7cn); the WMAF get(1)/set(2)
+//   methods (L21899) exist but do not drive them -> keyboard
+//   NO_ACCESS, Y-logo and IO-port light skipped.
+// - EC0 at \_SB.PCI0.LPC0.EC0 (L8070, PNP0C09, GPE 7, IO 0x62/0x66);
+//   EC RAM window ERAX @0xFEEC2400 len 0xFF (L8319; F9FT/ECB2 at
+//   +0x100/+0x200, L8207/L8117, ramio_size 0x300) is used only by the
+//   read-only debugfs ecmemoryram dump; EC register offsets are not
+//   trusted on the 0x5508 generation (issue #491) - everything else
+//   goes through WMI. VPC0 (VPC2004) _STA/_CFG (L10440) and GBMD/SBMC
+//   (L10611/L10828) present; GBMD bit 0x20 is BTSM and bit 0x04 is
+//   QCHO, so rapidcharge and battery conservation are exposed, as on
+//   the other 0x5508 models.
+// - Instant boot AC/USB-PD: WMAE get/set 0x03010001/0x03010002 (EC
+//   EACS/ETCS, set via WSMI 7/8 and 9/0xA,
+//   L20783/L20795/L21594/L21610) and flip-to-start 0x00030000 (EC
+//   FLBT, L20330/L21017), identical to model_q7cn.
+// fan_fullspeed is gated behind custom power mode like model_q7cn/
+// model_rlcn: on this generation a full-speed write through the wrong
+// path can wedge the fans at maximum speed until reboot (model_rlcn).
+static const struct model_config model_smcn = {
+	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5508,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_NO_ACCESS,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.access_method_powerlimits = ACCESS_METHOD_WMI3,
+	.skip_ic_temp = true,
+	.skip_oc_controls = true,
+	.skip_lockfancontroller = true,
+	/* Fan Method WMAB implements only ids 5/6 (see the header comment). */
+	.skip_fan_maxspeed = true,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_ylogo_light = true,
+	.skip_ioport_light = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFEEC2400,
+	.ramio_size = 0x300,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PCI0.LPC0.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PCI0.LPC0.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.SBMC" },
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true,
+	/* WMAE Get 0x04030004 returns EC FASF * 100 (fan 4 RPM) */
+	.has_third_fan = true,
+	.has_fan_unlock = false,
+	.has_fn_lock = false,
+	.has_flip_to_start = true,
+	/* WMAE get L20783/L20795 (EC EACS/ETCS), set L21594/L21610
+	 * (WSMI 7/8, 9/0xA), identical to model_q7cn.
+	 */
+	.has_instant_boot = true,
+};
+
+// Legion 7 15ASH11 / Legion 7a 15" Gen 11 (83V9) - 2026, AMD Ryzen AI
+// Max+ 392 with integrated Radeon 8060S only (no discrete GPU).
+// BIOS: UACN23WW, EC 0x5508 (fw 2b0, both read on the unit, issue #657).
+// Facts below are from the UACN23WW DSDT (L = dsdt.dsl line, attachment
+// in issue #657); the WMA* methods live in \_SB.GZFD:
+// - Fan Method WMAB implements only Fan_Get_Table(5)/Fan_Set_Table(6)
+//   (L19194): get returns the 0x58-byte LFGT buffer with the live EC
+//   fields F9F0..F9F9 (static 1..10 placeholder when ODV1 == 4, i.e.
+//   extreme mode, L19212); set copies the ten speeds (bytes 0x06..0x18
+//   at even offsets) to F9F0..F9F9 and commits via LECR(0xD0,1,1,2)
+//   (L19266), no range check, mode/FSID bytes ignored. Identical
+//   semantics to Q7CN/RLCN/SMCN, so FAN_SPEED_UNIT_LEVEL (see
+//   wmi_read_fancurve_custom()) and only the speed attributes are
+//   exposed (wmi_fancurve_speed_only). The reporter's readback is ten
+//   zeros (table untouched since boot), which the write path replaces
+//   with levels 1..10 (fancurve_level_table_sanitize()).
+// - LENOVO_FAN_TABLE_DATA (WQA3, L13386) has two ladders, selected by
+//   the firmware flag GDMF: with GDMF == 0, 1900..6500 RPM on fan 1
+//   (sensors 0x01 and 0x04) and fan 2 (sensor 0x01 only); otherwise
+//   1700..5500 RPM on fan 1 (sensors 0x01/0x04) and fan 2 (sensor
+//   0x05). fan2_level_rpm_table therefore relies on the (fan 2, sensor
+//   0x01) fallback in fantable_refresh() on GDMF == 0 units.
+//   LENOVO_FAN_TEST_DATA (WQAB, L16664) lists fans 1 and 2 with
+//   1700..5700 RPM, which is what lenovo_wmi_other reports for fan1.
+// - Other Method WMAE Get(0x11)/Set(0x12) (L19332/L20239) implements
+//   the standard feature ids: fan RPM 0x04030001/2 (FANS/FA2S*0x64,
+//   L19901/L19913), CPU temp 0x05040000 (CPUT, L19958), full speed
+//   0x04020000 -> EC FNST (both directions, L19889/L20983).
+//   0x05010000 is the CPU socket temp (CPUS, L19946), not a labeled IC
+//   sensor -> skip_ic_temp. 0x05050000 returns EC GPUT (L19970), but
+//   capability data 00 (WQA9, L16473) flags it unsupported and it reads
+//   0 on the unit -> skip_gpu_temp. Capability data 00 also flags fan 2
+//   RPM (0x04030002, L16374) unsupported although WMAE implements it
+//   and the chassis has two fans; hwmon fan2 stays visible until
+//   someone reads it under load.
+// - Power mode: GameZone WMAA SmartFanMode set 0x2C / get 0x2D
+//   (L18664/L18535): quiet/balanced/performance, 0xFF custom, 0xE0
+//   extreme, mapped from EC ASMC and ODV1 (like model_rgcn);
+//   performance/custom/extreme are parked on battery (ACTY check).
+//   Validated on the unit: powermode WMI reads 2, platform profile
+//   switches.
+// - CPU Method WMAC only handles 0x0E/0x0F (AMD 0x414D44xx tuning via
+//   SWMI, L19271), which the driver never calls. The WMAE power-limit
+//   ids exist, but without a discrete GPU the GPU ones are meaningless
+//   and none is validated on this APU platform, so
+//   access_method_powerlimits stays unset and skip_oc_controls hides
+//   the rest; lenovo-wmi-other covers the firmware attributes.
+// - Lights: 1-zone RGB keyboard, no lid logo and no IO-port light
+//   (PSREF, issue #657 report). KBBACKLIGHT WMAF get(1)/set(2)
+//   (L21465) drives the keyboard level (id 0x00, LECR 0xDA levels
+//   1..3); the get returned a valid level on the unit (LED driver
+//   registered). Light id 0x03 answers although there is no logo and
+//   id 0x05 is unimplemented, so both light attributes are skipped.
+// - EC0 at \_SB.PCI0.LPC0.EC0 (L6987, PNP0C09, GPE 9, IO 0x62/0x66);
+//   EC RAM window ERAX @0xFEEC2400 len 0xFF (L7282; F9FT/ECB2 at
+//   +0x100/+0x200, L7152/L7036, ramio_size 0x300) is used only by the
+//   read-only debugfs ecmemoryram dump; EC register offsets are not
+//   trusted on the 0x5508 generation (issue #491) - raw EC reads were
+//   garbage on the unit (70/55 RPM, 0 C) while WMI3 matched k10temp and
+//   lenovo_wmi_other. VPC0 (VPC2004) _STA/_CFG (L9421/L9426) and
+//   GBMD/SBMC (L9586/L9803) present; GBMD bit 0x20 is BTSM and bit 0x04
+//   is QCHO, so rapidcharge and battery conservation are exposed.
+// - Not exposed: instant boot (capability data 00 flags the AC id
+//   0x03010001 unsupported, L16311) and flip to start (WMAE sets it
+//   through the SWMI BIOS-setting interface 0x0D010201, L20297; whether
+//   the FBSWIF EFI variable the driver uses still exists is unknown).
+// fan_fullspeed is gated behind custom power mode like model_q7cn/
+// model_rlcn: on this generation a full-speed write through the wrong
+// path can wedge the fans at maximum speed until reboot (model_rlcn).
+static const struct model_config model_uacn = {
+	.registers = &ec_register_offsets_v0,
+	.check_embedded_controller_id = true,
+	.embedded_controller_id = 0x5508,
+	.memoryio_physical_ec_start = 0xC400,
+	.memoryio_size = 0x300,
+	.has_minifancurve = false,
+	.has_custom_powermode = true,
+	.has_extreme_powermode = true,
+	.access_method_powermode = ACCESS_METHOD_WMI,
+	.access_method_keyboard = ACCESS_METHOD_WMI2,
+	.access_method_temperature = ACCESS_METHOD_WMI3,
+	.access_method_fanspeed = ACCESS_METHOD_WMI3,
+	.access_method_fancurve = ACCESS_METHOD_WMI3,
+	.access_method_fanfullspeed = ACCESS_METHOD_WMI3,
+	.fanfullspeed_requires_custom_powermode = true,
+	.skip_ic_temp = true,
+	.skip_gpu_temp = true,
+	.skip_oc_controls = true,
+	.skip_lockfancontroller = true,
+	/* Fan Method WMAB implements only ids 5/6 (see the header comment). */
+	.skip_fan_maxspeed = true,
+	.skip_ylogo_light = true,
+	.skip_ioport_light = true,
+	.acpi_check_dev = false,
+	.ramio_physical_start = 0xFEEC2400,
+	.ramio_size = 0x300,
+	.acpi_paths = { [ACPI_PATH_STA] = "\\_SB.PCI0.LPC0.EC0.VPC0._STA",
+			[ACPI_PATH_CFG] = "\\_SB.PCI0.LPC0.EC0.VPC0._CFG",
+			[ACPI_PATH_READ_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.GBMD",
+			[ACPI_PATH_WRITE_RAPIDCHARGE] =
+				"\\_SB.PCI0.LPC0.EC0.VPC0.SBMC" },
+	.has_fancurve_defaults = true,
+	.wmi_fancurve_speed_only = true,
+	.has_fan_unlock = false,
+	.has_fn_lock = false,
 };
 
 static const struct dmi_system_id denylist[] = { {} };
@@ -1548,6 +3509,21 @@ static const struct dmi_system_id optimistic_allowlist[] = {
 			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
 			DMI_MATCH(DMI_PRODUCT_NAME, "82Y9"),
 			DMI_MATCH(DMI_BIOS_VERSION, "M3CN"),
+		},
+		.driver_data = (void *)&model_m3cn_8227
+	},
+	{
+		// Lenovo LOQ 15APH8 (82XT), BIOS LYCN (issue #602); same AMD
+		// Phoenix + EC 0x8227 platform as the Legion R7000P APH8
+		// (82Y9, M3CN) above. The reporter's debugfs dump shows EC
+		// chip 0x8227, correct WMI3 temperatures/fan RPM and zeroed
+		// EC-direct reads, matching model_m3cn_8227. Product-qualified
+		// in case the LYCN BIOS line is shared by other chassis.
+		.ident = "LOQ 15APH8 (82XT) - EC 0x8227",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "82XT"),
+			DMI_MATCH(DMI_BIOS_VERSION, "LYCN"),
 		},
 		.driver_data = (void *)&model_m3cn_8227
 	},
@@ -1588,20 +3564,23 @@ static const struct dmi_system_id optimistic_allowlist[] = {
 		.driver_data = (void *)&model_v0
 	},
 	{
+		// Legion Y7000 2021 (82JK), BIOS H1CN, EC 0x8227: the EC lives at
+		// \_SB.PC00.LPCB.EC0, so the v0 ACPI paths (PCI0.LPC0) fail with
+		// AE_NOT_FOUND. Must stay before the generic H1CN entry below.
+		.ident = "Legion Y7000 2021 (82JK) - EC 0x8227",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "82JK"),
+			DMI_MATCH(DMI_BIOS_VERSION, "H1CN"),
+		},
+		.driver_data = (void *)&model_h1cn_8227
+	},
+	{
 		// Release year: 2022
 		.ident = "H1CN",
 		.matches = {
 			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
 			DMI_MATCH(DMI_BIOS_VERSION, "H1CN"),
-		},
-		.driver_data = (void *)&model_v0
-	},
-	{
-		// Release year: 2022
-		.ident = "J2CN",
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_BIOS_VERSION, "J2CN"),
 		},
 		.driver_data = (void *)&model_v0
 	},
@@ -1750,6 +3729,18 @@ static const struct dmi_system_id optimistic_allowlist[] = {
 		.driver_data = (void *)&model_k1cn
 	},
 	{
+		// Legion 7 16IRX9 (83FD), BIOS NSCN (issue #617): WMAB 5/6
+		// level fan table like model_t2cn. Must precede the generic
+		// NSCN entry below.
+		.ident = "NSCN 83FD",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83FD"),
+			DMI_MATCH(DMI_BIOS_VERSION, "NSCN"),
+		},
+		.driver_data = (void *)&model_nscn_83fd
+	},
+	{
 		// e.g. Lenovo 7 16IAX9
 		.ident = "NSCN",
 		.matches = {
@@ -1777,6 +3768,15 @@ static const struct dmi_system_id optimistic_allowlist[] = {
 		.driver_data = (void *)&model_4gcn
 	},
 	{
+		// e.g. Legion Slim 5 14APH8 2023
+		.ident = "MACN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_BIOS_VERSION, "MACN"),
+		},
+		.driver_data = (void *)&model_macn
+	},
+	{
 		// e.g. Legion Slim 5 16APH8 2023
 		.ident = "M3CN",
 		.matches = {
@@ -1795,13 +3795,13 @@ static const struct dmi_system_id optimistic_allowlist[] = {
 		.driver_data = (void *)&model_9vcn
 	},
 	{
-		// e.g. Legion Y9000X
+		// e.g. Legion Y9000X IAH7 / Slim 7 16IAH7 (82TF)
 		.ident = "JYCN",
 		.matches = {
 			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
 			DMI_MATCH(DMI_BIOS_VERSION, "JYCN"),
 		},
-		.driver_data = (void *)&model_v2022
+		.driver_data = (void *)&model_jycn
 	},
 	{
 		// e.g. Legion Y740-15IRH, older model e.g. with GTX 1660
@@ -1903,6 +3903,16 @@ static const struct dmi_system_id optimistic_allowlist[] = {
 		.driver_data = (void *)&model_lzcn
 	},
 	{
+		// LOQ 15IAX9 (83GS)
+		.ident = "NECN 83GS",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83GS"),
+			DMI_MATCH(DMI_BIOS_VERSION, "NECN"),
+		},
+		.driver_data = (void *)&model_necn_83gs
+	},
+	{
 		// e.g. LOQ 15IRX9
 		.ident = "NECN",
 		.matches = {
@@ -1919,6 +3929,40 @@ static const struct dmi_system_id optimistic_allowlist[] = {
 			DMI_MATCH(DMI_BIOS_VERSION, "NZCN"),
 		},
 		.driver_data = (void *)&model_nzcn
+	},
+	{
+		// LOQ 15AHP10 (83JG, AMD Ryzen 7 250 + RTX 5050), BIOS R8CN
+		// (issues #384/#650); EC 0x5508, DSDT-validated WMI3 level
+		// fan table like model_t2cn below. Product-qualified in case
+		// the R8CN BIOS line is shared by other chassis.
+		.ident = "R8CN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83JG"),
+			DMI_MATCH(DMI_BIOS_VERSION, "R8CN"),
+		},
+		.driver_data = (void *)&model_r8cn
+	},
+	{
+		// e.g. Legion 5 15AHP11 (83Q7, AMD Ryzen 7 250 + RTX 5050) - same
+		// platform as LOQ 15AHP10; EC 0x5509, fancurve via WMI3 (#504)
+		.ident = "T2CN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_BIOS_VERSION, "T2CN"),
+		},
+		.driver_data = (void *)&model_t2cn
+	},
+	{
+		// e.g. Legion 5 15AGP11 (83Q6, AMD Ryzen AI 9 465 + RTX 5070) -
+		// same platform as the 83Q7 above; EC 0x5509, fancurve via
+		// WMI3 (#504)
+		.ident = "T3CN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_BIOS_VERSION, "T3CN"),
+		},
+		.driver_data = (void *)&model_t2cn
 	},
 	{
 		// e.g. Legion 5 15IRX10 (83LY)
@@ -1939,13 +3983,14 @@ static const struct dmi_system_id optimistic_allowlist[] = {
 		.driver_data = (void *)&model_nzcn
 	},
 	{
-		// e.g. Legion Pro 5 16IRX9 (83DF)
+		// Legion Pro 5 16IRX9 (83DF), BIOS N0CN (issue #497)
 		.ident = "N0CN",
 		.matches = {
 			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83DF"),
 			DMI_MATCH(DMI_BIOS_VERSION, "N0CN"),
 		},
-		.driver_data = (void *)&model_g8cn
+		.driver_data = (void *)&model_n0cn
 	},
 	{
 		// Legion Pro 7 16IRX9H (83DE)
@@ -1977,7 +4022,20 @@ static const struct dmi_system_id optimistic_allowlist[] = {
 		.driver_data = (void *)&model_nrcn
 	},
 	{
-		// e.g. LOQ 15IRX10 (Intel 13450HX + RTX 5060)
+		// Yoga Pro 7 14AHP9 (83E3), BIOS NCCN; AMD Ryzen 7 8845HS.
+		// DSDT-validated EC 0x5571 config (model_nccn, issue #630);
+		// product-qualified in case NCCN is shared by other chassis.
+		.ident = "NCCN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83E3"),
+			DMI_MATCH(DMI_BIOS_VERSION, "NCCN"),
+		},
+		.driver_data = (void *)&model_nccn
+	},
+	{
+		// LOQ 15IRX10 (83JE, Intel + RTX 50), BIOS R3CN;
+		// EC3 RPM/temperature curve verified in custom mode (#535)
 		.ident = "R3CN",
 		.matches = {
 			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
@@ -1993,6 +4051,86 @@ static const struct dmi_system_id optimistic_allowlist[] = {
 			DMI_MATCH(DMI_BIOS_VERSION, "RXCN"),
 		},
 		.driver_data = (void *)&model_rxcn
+	},
+	{
+		// Legion 5 16IAX10 (83NX, Intel Core Ultra 9 275HX + RTX 5060 Max-Q)
+		// EC chip id 0x5508, WMI3 fan/temp/power-limit reads confirmed on
+		// the unit; see model_q6cn comment. Product-qualified because the
+		// Q6CN BIOS is also shared by the 83LU Legion Pro 5 16IAX10H
+		// (model_q6cn_lu below, issue #337) and the 83F3 sibling, which are
+		// different chassis (different ramio window, no minifancurve, etc.)
+		.ident = "Q6CN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83NX"),
+			DMI_MATCH(DMI_BIOS_VERSION, "Q6CN"),
+		},
+		.driver_data = (void *)&model_q6cn
+	},
+	{
+		// Legion Pro 5 16IAX10H (83LU, Intel Core Ultra 9 275HX +
+		// RTX 5070 Ti), BIOS Q6CN (issue #337); DSDT-validated sibling of
+		// the 83F5 Legion Pro 7 16IAX10H below (same ERAX window and
+		// WMAA/WMAB/WMAE/WMAF layout), distinct from the 83NX Legion 5
+		// entry above
+		.ident = "Q6CN 83LU",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83LU"),
+			DMI_MATCH(DMI_BIOS_VERSION, "Q6CN"),
+		},
+		.driver_data = (void *)&model_q6cn_lu
+	},
+	{
+		// Legion Pro 5 16IAX10 (83F3), BIOS Q6CN (issue #471); the
+		// Legion Pro 5 sibling of the 83LU above - same Q6CN BIOS line
+		// and ERAX window, own chassis validation. Product-qualified
+		// because the Q6CN BIOS is also shared with the 83NX Legion 5.
+		.ident = "Q6CN 83F3",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83F3"),
+			DMI_MATCH(DMI_BIOS_VERSION, "Q6CN"),
+		},
+		.driver_data = (void *)&model_q6cn_f3
+	},
+	{
+		// Legion Pro 7 16IAX10H (83F5), BIOS Q7CN; product-qualified
+		// because the Q6CN/83LU and 83F3 siblings are different chassis
+		.ident = "Q7CN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83F5"),
+			DMI_MATCH(DMI_BIOS_VERSION, "Q7CN"),
+		},
+		.driver_data = (void *)&model_q7cn
+	},
+	{
+		// Legion Pro 5 16ADR10 (83LT), BIOS RLCN (issue #445); the
+		// 83LV R9000P 2025 shares the RLCN BIOS line but is a different
+		// chassis, so match the product name and add it only after its
+		// own validation
+		.ident = "RLCN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83LT"),
+			DMI_MATCH(DMI_BIOS_VERSION, "RLCN"),
+		},
+		.driver_data = (void *)&model_rlcn
+	},
+	{
+		// Legion 5 15AHP10 (83M0), BIOS RGCN (issue #373); AMD +
+		// RTX 50, EC 0x5508, DSDT-validated sibling of the 83LT
+		// (RLCN) above: same ERAX window and WMAA/WMAB/WMAE/WMAF
+		// layout. Product-qualified in case the RGCN BIOS line is
+		// shared by other chassis.
+		.ident = "RGCN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83M0"),
+			DMI_MATCH(DMI_BIOS_VERSION, "RGCN"),
+		},
+		.driver_data = (void *)&model_rgcn
 	},
 	{
 		// Legion 5 15IAX10 (83F0)
@@ -2013,6 +4151,81 @@ static const struct dmi_system_id optimistic_allowlist[] = {
 		.driver_data = (void *)&model_secn
 	},
 	{
+		// Legion Pro 5 16AFR10 (83F2), BIOS RECN, EC 0x5508; fancurve
+		// via WMI3 (#527). Product-qualified: the RECN BIOS line is
+		// shared with the R9000P AFR10 (83F6), which has its own
+		// DSDT-validated config below (issue #405).
+		.ident = "RECN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83F2"),
+			DMI_MATCH(DMI_BIOS_VERSION, "RECN"),
+		},
+		.driver_data = (void *)&model_recn
+	},
+	{
+		// Legion R9000P AFR10 (83F6), BIOS RECN, EC 0x5508;
+		// DSDT-validated sibling of the 83F2 above (issue #405).
+		.ident = "RECN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83F6"),
+			DMI_MATCH(DMI_BIOS_VERSION, "RECN"),
+		},
+		.driver_data = (void *)&model_recn_83f6
+	},
+	{
+		// Legion 5 15AKP10 (83F1), BIOS RYCN, EC 0x5508;
+		// DSDT-validated WMI-only config (issue #416).
+		// Product-qualified until other RYCN units are confirmed.
+		.ident = "RYCN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83F1"),
+			DMI_MATCH(DMI_BIOS_VERSION, "RYCN"),
+		},
+		.driver_data = (void *)&model_rycn
+	},
+	{
+		// Legion Y7000P IRX10 (83NN), BIOS S9CN (issue #506);
+		// DSDT-validated WMI-only sibling of the 83F5 Legion Pro 7
+		// 16IAX10H (model_q7cn), EC 0x5508. Product-qualified in
+		// case the S9CN BIOS line is shared by other chassis.
+		.ident = "S9CN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83NN"),
+			DMI_MATCH(DMI_BIOS_VERSION, "S9CN"),
+		},
+		.driver_data = (void *)&model_s9cn
+	},
+	{
+		// Legion Pro 7 16AFR10H (83RU), BIOS SMCN; product-qualified
+		// because the R9000P AFR10 shares neither chassis nor
+		// validated DSDT, so match the product name and add it only
+		// after its own validation
+		.ident = "SMCN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83RU"),
+			DMI_MATCH(DMI_BIOS_VERSION, "SMCN"),
+		},
+		.driver_data = (void *)&model_smcn
+	},
+	{
+		// Legion 7 15ASH11 / Legion 7a 15" Gen 11 (83V9), BIOS UACN
+		// (issue #657); product-qualified in case the UACN BIOS line
+		// is shared by a chassis with a discrete GPU, which would
+		// need its own config (GPU temperature, power limits)
+		.ident = "UACN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_NAME, "83V9"),
+			DMI_MATCH(DMI_BIOS_VERSION, "UACN"),
+		},
+		.driver_data = (void *)&model_uacn
+	},
+	{
 		// e.g. Legion 5 16IRX9 (83DG)
 		.ident = "NMCN",
 		.matches = {
@@ -2030,6 +4243,24 @@ static const struct dmi_system_id optimistic_allowlist[] = {
 		},
 		.driver_data = (void *)&model_q8cn
 	},
+	{
+		// e.g. Legion 5i Gen 10 (83VK)
+		.ident = "UFCN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_BIOS_VERSION, "UFCN"),
+		},
+		.driver_data = (void *)&model_ufcn
+	},
+	{
+		// e.g. Legion Y7000 IRX9 (83JJ)
+		.ident = "PTCN",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_BIOS_VERSION, "PTCN"),
+		},
+		.driver_data = (void *)&model_nmcn
+	},
 	{}
 };
 
@@ -2041,7 +4272,8 @@ static const struct dmi_system_id optimistic_allowlist[] = {
 //move all structs/defn from all the way down up
 static const struct model_config *_model;
 
-static const char *get_model_acpi_path(const struct model_config *model, enum acpi_paths_inventory_ids id)
+static const char *get_model_acpi_path(const struct model_config *model,
+				       enum acpi_paths_inventory_ids id)
 {
 	if (id < 0 || id >= ACPI_PATH_MAX)
 		return NULL;
@@ -2051,20 +4283,23 @@ static const char *get_model_acpi_path(const struct model_config *model, enum ac
 }
 
 // function from ideapad-laptop.c
-static int eval_int(struct acpi_device *adev, const char *name, unsigned long *res)
+static int eval_int(struct acpi_device *adev, const char *name,
+		    unsigned long *res)
 {
 	unsigned long long result;
 	acpi_status status;
 	acpi_handle handle;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
-	status = acpi_get_handle(NULL, (char *)name, &handle);
-	if (ACPI_FAILURE(status))
-		return -EIO;
-#else
-	if (!adev)
-		return -ENODEV;
-	handle = adev->handle;
-#endif
+
+	if (!adev) {
+		/* No ACPI device to evaluate relative to: resolve the
+		 * fully-qualified name from the ACPI root.
+		 */
+		status = acpi_get_handle(NULL, (char *)name, &handle);
+		if (ACPI_FAILURE(status))
+			return -ENODEV;
+	} else {
+		handle = adev->handle;
+	}
 	status = acpi_evaluate_integer(handle, (char *)name, NULL, &result);
 	if (ACPI_FAILURE(status))
 		return -EIO;
@@ -2080,17 +4315,18 @@ static int exec_simple_method(struct acpi_device *adev, const char *name,
 {
 	acpi_handle handle;
 	acpi_status status;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
-	status = acpi_get_handle(NULL, (char *)name, &handle);
-	if (ACPI_FAILURE(status))
-		return -EIO;
-#else
-	if (!adev)
-		return -ENODEV;
-	handle = adev->handle;
-#endif
-	status =
-		acpi_execute_simple_method(handle, (char *)name, arg);
+
+	if (!adev) {
+		/* No ACPI device to evaluate relative to: resolve the
+		 * fully-qualified name from the ACPI root.
+		 */
+		status = acpi_get_handle(NULL, (char *)name, &handle);
+		if (ACPI_FAILURE(status))
+			return -ENODEV;
+	} else {
+		handle = adev->handle;
+	}
+	status = acpi_execute_simple_method(handle, (char *)name, arg);
 
 	return ACPI_FAILURE(status) ? -EIO : 0;
 }
@@ -2118,6 +4354,16 @@ static int exec_sbmc(struct acpi_device *adev, unsigned long arg)
 	return exec_simple_method(adev, acpi_path, arg);
 }
 
+static int exec_sals(struct acpi_device *adev, unsigned long arg)
+{
+	const char *acpi_path;
+
+	acpi_path = get_model_acpi_path(_model, ACPI_PATH_WRITE_FNLOCK);
+	if (!acpi_path)
+		return -EINVAL;
+	return exec_simple_method(adev, acpi_path, arg);
+}
+
 //static int eval_qcho(acpi_handle handle, unsigned long *res)
 //{
 //	// \_SB.PCI0.LPC0.EC0.QCHO
@@ -2130,6 +4376,16 @@ static int eval_gbmd(struct acpi_device *adev, unsigned long *res)
 
 	acpi_path = get_model_acpi_path(_model, ACPI_PATH_READ_RAPIDCHARGE);
 	return eval_int(adev, acpi_path, res);
+}
+
+static int eval_hals(struct acpi_device *adev, unsigned long *res)
+{
+	const char *path;
+
+	path = get_model_acpi_path(_model, ACPI_PATH_READ_FNLOCK);
+	if (!path)
+		return -EINVAL;
+	return eval_int(adev, path, res);
 }
 
 static int eval_spmo(struct acpi_device *adev, unsigned long *res)
@@ -2267,6 +4523,22 @@ static int wmi_exec_noarg_int(const char *guid, u8 instance, u32 method_id,
 	return wmi_exec_int(guid, instance, method_id, &params, res);
 }
 
+/* Query a WMI data block instance and copy the result into a struct of
+ * exactly ressize bytes (as in PR #347). Fails when the block's buffer
+ * has a different size, so variable-size rows are rejected up front.
+ */
+static int wmi_exec_query_ints(const char *guid, u8 instance, u8 *res,
+			       size_t ressize)
+{
+	struct acpi_buffer out_buffer = { ACPI_ALLOCATE_BUFFER, NULL };
+	acpi_status status;
+
+	status = wmi_query_block(guid, instance, &out_buffer);
+
+	return acpi_process_buffer_to_ints(guid, instance, status, &out_buffer,
+					   res, ressize);
+}
+
 static int wmi_exec_noarg_int_or_buffer(const char *guid, u8 instance,
 					u32 method_id, size_t ressize,
 					size_t index, unsigned long *res)
@@ -2312,10 +4584,12 @@ static int wmi_exec_noarg_int_or_buffer(const char *guid, u8 instance,
 			pr_info("Unexpected WMI result for %s:%d: expected buffer length %zu but got %u\n",
 				guid, method_id, ressize, out->buffer.length);
 			if (out->buffer.length)
-				print_hex_dump(KERN_INFO, "WMI result: ",
-					       DUMP_PREFIX_OFFSET, 16, 1,
-					       out->buffer.pointer,
-					       min_t(u32, out->buffer.length, 64), false);
+				print_hex_dump(
+					KERN_INFO,
+					"WMI result: ", DUMP_PREFIX_OFFSET, 16,
+					1, out->buffer.pointer,
+					min_t(u32, out->buffer.length, 64),
+					false);
 			error = -EINVAL;
 			break;
 		}
@@ -2412,6 +4686,10 @@ static int wmi_exec_arg(const char *guid, u8 instance, u32 method_id, void *arg,
 // high-end fan curve subtable (~7000-7100 RPM observed on i9-13900HX +
 // RTX 4080 Laptop). arg=0 reverts. See johnfanv2/LenovoLegionLinux #429.
 #define WMI_METHOD_ID_FAN_EXTREME_TOGGLE 13
+// Fan ceiling state read-back. On the Legion Y530 (8JCN) WMAA(0, 0x14)
+// returns FCST & 1 (EC RAM 0xC439): 1 while the NCMD(0x59, 0x77) "extreme
+// cooling" mode is active, whether set via 0x0D or by Fn+Q.
+#define WMI_METHOD_ID_GETFANEXTREMESTATUS 20
 // power charge mode
 #define WMI_METHOD_ID_GETPOWERCHARGEMODE 47
 // overdrive of display to reduce latency
@@ -2533,7 +4811,15 @@ enum OtherMethodFeature {
 
 	OtherMethodFeature_FAN_SPEED_1 = 0x04030001,
 	OtherMethodFeature_FAN_SPEED_2 = 0x04030002,
+	/* firmware fan 4, the third fan on Q7CN (WMAE -> EC FASF * 100) */
+	OtherMethodFeature_FAN_SPEED_4 = 0x04030004,
 	OtherMethodFeature_FAN_FULLSPEED = 0x04020000,
+
+	/* power on when AC / a USB-PD charger is connected (Q7CN: EC
+	 * EACS/ETCS, set through WSMI)
+	 */
+	OtherMethodFeature_INSTANT_BOOT_AC = 0x03010001,
+	OtherMethodFeature_INSTANT_BOOT_USB_PD = 0x03010002,
 
 	OtherMethodFeature_C_U1 = 0x05010000,
 	OtherMethodFeature_TEMP_CPU = 0x05040000,
@@ -2648,9 +4934,10 @@ static ssize_t wmi_other_method_set_value(enum OtherMethodFeature feature_id,
 	params.length = sizeof(input);
 	params.pointer = &input;
 	error = wmi_exec_int(LEGION_WMI_LENOVO_OTHER_METHOD_GUID, 0,
-					WMI_METHOD_ID_SET_FEATURE_VALUE, &params, &res);
+			     WMI_METHOD_ID_SET_FEATURE_VALUE, &params, &res);
 	if (error)
-		pr_info("Error calling WMI Other Method Set Value: %d\n", error);
+		pr_info("Error calling WMI Other Method Set Value: %d\n",
+			error);
 	else
 		*output = res;
 	return error;
@@ -2723,10 +5010,11 @@ static void ecram_memoryio_exit(struct ecram_memoryio *ec_memoryio)
 static ssize_t ecram_memoryio_read(const struct ecram_memoryio *ec_memoryio,
 				   u16 ec_offset, u8 *value)
 {
-	if (ec_offset < ec_memoryio->physical_ec_start) {
-		pr_info("Unexpected read at offset %d into EC RAM\n",
+	if (ec_offset < ec_memoryio->physical_ec_start ||
+	    ec_offset - ec_memoryio->physical_ec_start >= ec_memoryio->size) {
+		pr_info("Unexpected read at offset 0x%x into EC RAM\n",
 			ec_offset);
-		return -1;
+		return -EIO;
 	}
 	*value = *(ec_memoryio->virtual_start +
 		   (ec_offset - ec_memoryio->physical_ec_start));
@@ -2738,13 +5026,14 @@ static ssize_t ecram_memoryio_read(const struct ecram_memoryio *ec_memoryio,
  * Return status because of commong signature for alle
  * methods to access EC RAM.
  */
-static __maybe_unused ssize_t ecram_memoryio_write(const struct ecram_memoryio *ec_memoryio,
-				    u16 ec_offset, u8 value)
+static __maybe_unused ssize_t ecram_memoryio_write(
+	const struct ecram_memoryio *ec_memoryio, u16 ec_offset, u8 value)
 {
-	if (ec_offset < ec_memoryio->physical_ec_start) {
-		pr_info("Unexpected write at offset %d into EC RAM\n",
+	if (ec_offset < ec_memoryio->physical_ec_start ||
+	    ec_offset - ec_memoryio->physical_ec_start >= ec_memoryio->size) {
+		pr_info("Unexpected write at offset 0x%x into EC RAM\n",
 			ec_offset);
-		return -1;
+		return -EIO;
 	}
 	*(ec_memoryio->virtual_start +
 	  (ec_offset - ec_memoryio->physical_ec_start)) = value;
@@ -2916,7 +5205,7 @@ static void ecram_exit(struct ecram *ecram)
  */
 static u8 ecram_read(struct ecram *ecram, u16 ecram_offset)
 {
-	u8 value;
+	u8 value = 0;
 	int err;
 
 	err = ecram_portio_read(&ecram->portio, ecram_offset, &value);
@@ -2992,13 +5281,33 @@ enum SENSOR_ATTR {
 /* ============================= */
 
 #define MAX_RPM 10000
+/* Highest level index Fan_Set_Table takes on Legion Zone v3 firmware. */
+#define MAX_FAN_LEVEL 10
 
 enum fan_speed_unit {
 	FAN_SPEED_UNIT_PERCENT = 1,
 	FAN_SPEED_UNIT_PWM = 2,
 	FAN_SPEED_UNIT_RPM_HUNDRED = 3,
 	FAN_SPEED_UNIT_PERCENT_NEAREST = 4,
+	/*
+	 * Index 1..MAX_FAN_LEVEL into the firmware's per-level RPM table
+	 * (WMI data block LENOVO_FAN_TABLE_DATA.FanTable_Data), the unit
+	 * Lenovo Legion Toolkit uses for Fan_Set_Table on Legion Zone v3
+	 * firmware (e.g. KWCN54WW). The driver never sends index 0, see
+	 * fancurve_level_min. A valid level can itself map to zero RPM.
+	 */
+	FAN_SPEED_UNIT_LEVEL = 5,
 };
+
+/*
+ * Lowest level Lenovo Legion Toolkit sends per curve point on Legion Zone
+ * v3 firmware (GodModeControllerV2 GetMinimumFanTableAsync): level 0 is
+ * never sent and the last two points stay at or above 3 and 5. The EC
+ * does not range-check the table itself, so this is a safety policy,
+ * not a firmware limit.
+ */
+static const u8 fancurve_level_min[MAXFANCURVESIZE] = { 1, 1, 1, 1, 1,
+							1, 1, 1, 3, 5 };
 
 struct fancurve_point {
 	// rpm1 devided by 100
@@ -3041,6 +5350,26 @@ enum FANCURVE_ATTR {
 	FANCURVE_MINIFANCURVE_ON_COOL = 12
 };
 
+/* Match the fields actually consumed by each read/write implementation. */
+static bool fancurve_attr_supported(const struct model_config *model, int id)
+{
+	if (id == FANCURVE_SIZE)
+		return model->access_method_fancurve != ACCESS_METHOD_NO_ACCESS;
+
+	switch (model->access_method_fancurve) {
+	case ACCESS_METHOD_EC:
+		return true;
+	case ACCESS_METHOD_EC2:
+		return id <= FANCURVE_ATTR_GPU_HYST;
+	case ACCESS_METHOD_EC3:
+		return id <= FANCURVE_ATTR_IC_HYST;
+	case ACCESS_METHOD_WMI3:
+		return id == FANCURVE_ATTR_PWM1;
+	default:
+		return false;
+	}
+}
+
 // used for clearing table entries
 static const struct fancurve_point fancurve_point_zero = { 0, 0, 0, 0, 0,
 							   0, 0, 0, 0, 0 };
@@ -3048,11 +5377,19 @@ static const struct fancurve_point fancurve_point_zero = { 0, 0, 0, 0, 0,
 struct fancurve {
 	struct fancurve_point points[MAXFANCURVESIZE];
 	enum fan_speed_unit fan_speed_unit;
+	u16 max_rpm;
 	// number of points used; must be <= MAXFANCURVESIZE
 	size_t size;
 	// the point at which fans are run currently
 	size_t current_point_i;
 };
+
+static void fancurve_init(struct fancurve *fancurve,
+			  const struct model_config *model)
+{
+	memset(fancurve, 0, sizeof(*fancurve));
+	fancurve->max_rpm = model->fan_max_rpm;
+}
 
 // validation functions
 
@@ -3093,15 +5430,31 @@ static bool fancurve_set_speed_pwm(struct fancurve *fancurve, int point_id,
 		*speed = clamp_t(u8, value * 100 / 255, 0, 255);
 		return true;
 	case FAN_SPEED_UNIT_PERCENT_NEAREST:
-		*speed = clamp_t(u8, (value * 100 + (255 / 2)) / 255,
-				 0, 100);
+		*speed = clamp_t(u8, (value * 100 + (255 / 2)) / 255, 0, 100);
 		return true;
 	case FAN_SPEED_UNIT_PWM:
 		*speed = clamp_t(u8, value, 0, 255);
 		return true;
-	case FAN_SPEED_UNIT_RPM_HUNDRED:
-		*speed = clamp_t(u8, (value * MAX_RPM + (100 * 255) - 1) / (100 * 255), 0, 255);
+	case FAN_SPEED_UNIT_RPM_HUNDRED: {
+		u32 max_rpm = fancurve->max_rpm ? fancurve->max_rpm : MAX_RPM;
+
+		*speed = clamp_t(
+			u8, (value * max_rpm + (100 * 255) - 1) / (100 * 255),
+			0, 255);
 		return true;
+	}
+	case FAN_SPEED_UNIT_LEVEL: {
+		int level = DIV_ROUND_CLOSEST(value * MAX_FAN_LEVEL, 255);
+
+		if (level < fancurve_level_min[point_id]) {
+			pr_err("Level %d (pwm %d) is below the minimum %d for pwm1_auto_point%d_pwm\n",
+			       level, value, fancurve_level_min[point_id],
+			       point_id + 1);
+			return false;
+		}
+		*speed = level;
+		return true;
+	}
 	default:
 		pr_info("No method to set for fan_speed_unit %d.",
 			fancurve->fan_speed_unit);
@@ -3132,8 +5485,14 @@ static bool fancurve_get_speed_pwm(const struct fancurve *fancurve,
 	case FAN_SPEED_UNIT_PWM:
 		*value = speed;
 		return true;
-	case FAN_SPEED_UNIT_RPM_HUNDRED:
-		*value = speed * 255 * 100 / MAX_RPM;
+	case FAN_SPEED_UNIT_RPM_HUNDRED: {
+		u32 max_rpm = fancurve->max_rpm ? fancurve->max_rpm : MAX_RPM;
+
+		*value = speed * 255 * 100 / max_rpm;
+		return true;
+	}
+	case FAN_SPEED_UNIT_LEVEL:
+		*value = min_t(int, speed, MAX_FAN_LEVEL) * 255 / MAX_FAN_LEVEL;
 		return true;
 	default:
 		pr_info("No method to get for fan_speed_unit %d.",
@@ -3248,6 +5607,11 @@ static bool fancurve_set_size(struct fancurve *fancurve, int size,
 		for (i = fancurve->size; i < size; ++i)
 			fancurve->points[i] = fancurve->points[last];
 	}
+	// The blocks above compare against the *old* size, so only publish the new
+	// one once they are done. Without this the store is accepted, points[] is
+	// reshaped, but fancurve->size - and therefore EXT_FAN_POINTS_SIZE - keeps
+	// the value the EC reported, making a resize a silent no-op.
+	fancurve->size = size;
 	return true;
 }
 
@@ -3300,6 +5664,25 @@ struct light {
 /* =============================  */
 // Implemented like ideapad-laptop.c but currently still
 // without dynamic memory allocation (instead global _priv)
+/*
+ * Rows of the LENOVO_FAN_TABLE_DATA WMI data block carry the firmware's
+ * per-level RPM table; known models always have 10 levels (Lenovo
+ * Legion Toolkit rejects tables with a different length).
+ */
+#define FANTABLE_MAX_LEVELS 10
+
+/*
+ * Per-fan RPM ladder for one power mode, derived from a matching row of
+ * the LENOVO_FAN_TABLE_DATA WMI data block (see the fantable section
+ * below for the row layout and refresh logic).
+ */
+struct fantable_ladder {
+	u16 rpms[FANTABLE_MAX_LEVELS];
+	/* current_fan_max_speed from the row, or the ladder's top RPM */
+	u16 max_rpm;
+	u8 level_count;
+};
+
 struct legion_private {
 	struct platform_device *platform_device;
 	// TODO: remove or keep? init?
@@ -3347,8 +5730,24 @@ struct legion_private {
 	int capdata_count;
 	int current_powermode;
 
+	/* last fan table written through hwmon, for restore_fancurve_on_resume */
+	struct fancurve resume_fancurve;
+	int resume_fancurve_mode;
+	bool resume_fancurve_valid;
+	struct delayed_work resume_fancurve_work;
+
+	// Fan ceiling unlock state (cached: firmware exposes no clean read-back)
+	u8 fan_unlock_state;
+
 	struct discrete_feature discrete_features[MAX_DISCRETE_FEATURES];
 	int discrete_feature_count;
+
+	/* LENOVO_FAN_TABLE_DATA cache (models with has_fancurve_defaults) */
+	struct fantable_ladder fantable_fan1;
+	struct fantable_ladder fantable_fan2;
+	bool fantable_fan1_valid;
+	bool fantable_fan2_valid;
+	int fantable_powermode;
 };
 
 // keep state of fancurve defaults powermode
@@ -3409,9 +5808,6 @@ static int get_simple_wmi_attribute(struct legion_private *priv,
 	if (err)
 		return err;
 
-	// TODO: remove later
-	pr_debug("%swith raw value: %ld\n", __func__, state);
-
 	state = state * scale;
 
 	if (invert)
@@ -3425,17 +5821,18 @@ static int get_simple_wmi_attribute_bool(struct legion_private *priv,
 					 u32 method_id, bool invert,
 					 unsigned long scale, bool *value)
 {
-	unsigned long int_val = *value;
+	unsigned long int_val = 0;
 	int err = get_simple_wmi_attribute(priv, guid, instance, method_id,
 					   invert, scale, &int_val);
-	*value = int_val;
+	if (!err)
+		*value = int_val;
 	return err;
 }
 
 static int set_simple_wmi_attribute(struct legion_private *priv,
 				    const char *guid, u8 instance,
 				    u32 method_id, bool invert, int scale,
-				    int state)
+				    unsigned int state)
 {
 	int err;
 	u8 in_param;
@@ -3448,6 +5845,11 @@ static int set_simple_wmi_attribute(struct legion_private *priv,
 	if (invert)
 		state = !state;
 
+	// state is passed to the firmware as a u8 (state / scale); reject
+	// inputs that would silently truncate instead of writing garbage.
+	if (scale * 255U < state)
+		return -EINVAL;
+
 	in_param = state / scale;
 
 	err = wmi_exec_arg(guid, instance, method_id, &in_param,
@@ -3459,37 +5861,64 @@ static int set_simple_wmi_attribute(struct legion_private *priv,
 /* Sensor value reading/writing */
 /* ============================= */
 
+// Temperature registers the driver has always read, independent of model.
+#define EC_TEMP_INPUT_CPU 0xC5E6
+#define EC_TEMP_INPUT_GPU 0xC5E7
+#define EC_TEMP_INPUT_IC 0xC5E8
+
+// Pick the register to read a temperature from: the model's own offset once
+// that register is validated for the model, otherwise the address the driver
+// has always used.
+static u16 temp_input_register(const struct model_config *model, u8 bit,
+			       u16 model_register, u16 fallback)
+{
+	if (model->validated_temp_registers & bit)
+		return model_register;
+	return fallback;
+}
+
+static int ec_read_fan_rpm(struct ecram *ecram,
+			   const struct model_config *model, u16 lsb, u16 msb)
+{
+	if (model->ec_fanspeed_unit_100rpm)
+		return 100 * ecram_read(ecram, lsb);
+	return ecram_read(ecram, lsb) + (((int)ecram_read(ecram, msb)) << 8);
+}
+
 static int ec_read_sensor_values(struct ecram *ecram,
 				 const struct model_config *model,
 				 struct sensor_values *values)
 {
-	int fan_target_mult = model->fan_target_is_duty ? 100 :
-			      (model->acpi_fanspeed_is_rpm ? 1 : 100);
+	int fan_target_mult = model->fan_target_is_duty ?
+				      100 :
+				      (model->acpi_fanspeed_is_rpm ? 1 : 100);
 
 	values->fan1_target_rpm =
-		fan_target_mult * ecram_read(ecram, model->registers->EXT_FAN1_TARGET_RPM);
+		fan_target_mult *
+		ecram_read(ecram, model->registers->EXT_FAN1_TARGET_RPM);
 	values->fan2_target_rpm =
-		fan_target_mult * ecram_read(ecram, model->registers->EXT_FAN2_TARGET_RPM);
+		fan_target_mult *
+		ecram_read(ecram, model->registers->EXT_FAN2_TARGET_RPM);
 
 	values->fan1_rpm =
-		ecram_read(ecram, model->registers->EXT_FAN1_RPM_LSB) +
-		(((int)ecram_read(ecram, model->registers->EXT_FAN1_RPM_MSB))
-		 << 8);
+		ec_read_fan_rpm(ecram, model, model->registers->EXT_FAN1_RPM_LSB,
+				model->registers->EXT_FAN1_RPM_MSB);
 	values->fan2_rpm =
-		ecram_read(ecram, model->registers->EXT_FAN2_RPM_LSB) +
-		(((int)ecram_read(ecram, model->registers->EXT_FAN2_RPM_MSB))
-		 << 8);
+		ec_read_fan_rpm(ecram, model, model->registers->EXT_FAN2_RPM_LSB,
+				model->registers->EXT_FAN2_RPM_MSB);
 
-	values->cpu_temp_celsius =
-		ecram_read(ecram, model->registers->EXT_CPU_TEMP_INPUT);
-	values->gpu_temp_celsius =
-		ecram_read(ecram, model->registers->EXT_GPU_TEMP_INPUT);
-	values->ic_temp_celsius =
-		ecram_read(ecram, model->registers->EXT_IC_TEMP_INPUT);
-
-	values->cpu_temp_celsius = ecram_read(ecram, 0xC5E6);
-	values->gpu_temp_celsius = ecram_read(ecram, 0xC5E7);
-	values->ic_temp_celsius = ecram_read(ecram, 0xC5E8);
+	values->cpu_temp_celsius = ecram_read(
+		ecram, temp_input_register(model, TEMP_REGISTER_CPU,
+					   model->registers->EXT_CPU_TEMP_INPUT,
+					   EC_TEMP_INPUT_CPU));
+	values->gpu_temp_celsius = ecram_read(
+		ecram, temp_input_register(model, TEMP_REGISTER_GPU,
+					   model->registers->EXT_GPU_TEMP_INPUT,
+					   EC_TEMP_INPUT_GPU));
+	values->ic_temp_celsius = ecram_read(
+		ecram, temp_input_register(model, TEMP_REGISTER_IC,
+					   model->registers->EXT_IC_TEMP_INPUT,
+					   EC_TEMP_INPUT_IC));
 
 	return 0;
 }
@@ -3498,46 +5927,48 @@ static ssize_t ec_read_temperature(struct ecram *ecram,
 				   const struct model_config *model,
 				   int sensor_id, int *temperature)
 {
-	int err = 0;
 	unsigned long res;
 
 	if (sensor_id == 0) {
-		res = ecram_read(ecram, 0xC5E6);
+		res = ecram_read(ecram,
+				 temp_input_register(
+					 model, TEMP_REGISTER_CPU,
+					 model->registers->EXT_CPU_TEMP_INPUT,
+					 EC_TEMP_INPUT_CPU));
 	} else if (sensor_id == 1) {
-		res = ecram_read(ecram, 0xC5E7);
+		res = ecram_read(ecram,
+				 temp_input_register(
+					 model, TEMP_REGISTER_GPU,
+					 model->registers->EXT_GPU_TEMP_INPUT,
+					 EC_TEMP_INPUT_GPU));
 	} else {
 		// TODO: use all correct error codes
 		return -EEXIST;
 	}
-	if (!err)
-		*temperature = res;
-	return err;
+	*temperature = res;
+	return 0;
 }
 
 static ssize_t ec_read_fanspeed(struct ecram *ecram,
 				const struct model_config *model, int fan_id,
 				int *fanspeed_rpm)
 {
-	int err = 0;
 	unsigned long res;
 
 	if (fan_id == 0) {
-		res = ecram_read(ecram, model->registers->EXT_FAN1_RPM_LSB) +
-		      (((int)ecram_read(ecram,
-					model->registers->EXT_FAN1_RPM_MSB))
-		       << 8);
+		res = ec_read_fan_rpm(ecram, model,
+				      model->registers->EXT_FAN1_RPM_LSB,
+				      model->registers->EXT_FAN1_RPM_MSB);
 	} else if (fan_id == 1) {
-		res = ecram_read(ecram, model->registers->EXT_FAN2_RPM_LSB) +
-		      (((int)ecram_read(ecram,
-					model->registers->EXT_FAN2_RPM_MSB))
-		       << 8);
+		res = ec_read_fan_rpm(ecram, model,
+				      model->registers->EXT_FAN2_RPM_LSB,
+				      model->registers->EXT_FAN2_RPM_MSB);
 	} else {
 		// TODO: use all correct error codes
 		return -EEXIST;
 	}
-	if (!err)
-		*fanspeed_rpm = res;
-	return err;
+	*fanspeed_rpm = res;
+	return 0;
 }
 
 // '\_SB.PCI0.LPC0.EC0.FANS
@@ -3557,8 +5988,11 @@ static ssize_t acpi_read_fanspeed(struct legion_private *priv, int fan_id,
 	const char *acpi_path;
 
 	if (fan_id == 0) {
-		acpi_path = get_model_acpi_path(_model, ACPI_PATH_READ_FANSPEED1);
-		acpi_path = get_model_acpi_path(_model, ACPI_PATH_READ_FANSPEED2);
+		acpi_path =
+			get_model_acpi_path(_model, ACPI_PATH_READ_FANSPEED1);
+	} else if (fan_id == 1) {
+		acpi_path =
+			get_model_acpi_path(_model, ACPI_PATH_READ_FANSPEED2);
 	} else if (fan_id == 2) {
 		acpi_path = ACPI_PATH_FAN_SPEED3;
 	} else if (fan_id == 3) {
@@ -3569,7 +6003,8 @@ static ssize_t acpi_read_fanspeed(struct legion_private *priv, int fan_id,
 	err = eval_int(priv->adev, acpi_path, &acpi_value);
 	if (!err)
 		*value = priv->conf->acpi_fanspeed_is_rpm ?
-			 (int)acpi_value : (int)acpi_value * 100;
+				 (int)acpi_value :
+				 (int)acpi_value * 100;
 	return err;
 }
 
@@ -3586,9 +6021,11 @@ static ssize_t acpi_read_temperature(struct legion_private *priv, int fan_id,
 	const char *acpi_path;
 
 	if (fan_id == 0) {
-		acpi_path = get_model_acpi_path(_model, ACPI_PATH_READ_CPU_TEMP);
+		acpi_path =
+			get_model_acpi_path(_model, ACPI_PATH_READ_CPU_TEMP);
 	} else if (fan_id == 1) {
-		acpi_path = get_model_acpi_path(_model, ACPI_PATH_READ_GPU_TEMP);
+		acpi_path =
+			get_model_acpi_path(_model, ACPI_PATH_READ_GPU_TEMP);
 	} else {
 		// TODO: use all correct error codes
 		return -EEXIST;
@@ -3690,7 +6127,7 @@ static ssize_t wmi_read_temperature_gz(int sensor_id, int *temperature)
 	return err;
 }
 
-// fan_id: 0 or 1
+// fan_id: 0, 1 or 2 (the third fan, firmware fan 4)
 static ssize_t wmi_read_fanspeed_other(int fan_id, int *fanspeed_rpm)
 {
 	int err;
@@ -3701,6 +6138,8 @@ static ssize_t wmi_read_fanspeed_other(int fan_id, int *fanspeed_rpm)
 		featured_id = OtherMethodFeature_FAN_SPEED_1;
 	else if (fan_id == 1)
 		featured_id = OtherMethodFeature_FAN_SPEED_2;
+	else if (fan_id == 2)
+		featured_id = OtherMethodFeature_FAN_SPEED_4;
 	else {
 		// TODO: use all correct error codes
 		return -EEXIST;
@@ -3797,9 +6236,142 @@ struct wmi_fan_table_read {
 	__le32 sensor_value[MAXFANCURVESIZE];
 } __packed;
 
-static ssize_t wmi_read_fancurve_custom(const struct model_config *model,
+/*
+ * JYCN GZFD.WMAC aborts with AE_AML_BUFFER_LIMIT before reaching Fan_Set_Table
+ * (id 6) and omits Fan_Get_Table (id 5). Access the same EC bytes WMAC and
+ * H_EC.THMC use in ECF2 (EC 0xC400..0xC4FF): F9F0..F9F9 @0xC4D0, F9FA (SFMD)
+ * @0xC4DA, and CUFT (bit 1 of 0xC4DF) under \_SB.PC00.LPCB.H_EC.ECMT.
+ */
+#define JYCN_ECMT_PATH "\\_SB.PC00.LPCB.H_EC.ECMT"
+#define JYCN_ECMT_TIMEOUT_MS 1000
+#define JYCN_F9F0_ADDR 0xC4D0
+#define JYCN_F9FA_ADDR 0xC4DA
+#define JYCN_FLAG_ADDR 0xC4DF
+#define JYCN_CUFT_BIT 0x02
+
+static int jycn_ec_lock(bool *locked)
+{
+	acpi_status status;
+
+	*locked = false;
+	status = acpi_acquire_mutex(NULL, JYCN_ECMT_PATH, JYCN_ECMT_TIMEOUT_MS);
+	if (ACPI_SUCCESS(status)) {
+		*locked = true;
+		return 0;
+	}
+	if (status == AE_NOT_FOUND)
+		return 0;
+	return -EBUSY;
+}
+
+static void jycn_ec_unlock(bool locked)
+{
+	if (locked)
+		acpi_release_mutex(NULL, JYCN_ECMT_PATH);
+}
+
+static int jycn_read_fancurve_levels(struct ecram *ecram,
+				     const struct model_config *model,
+				     struct fancurve *fancurve)
+{
+	bool locked = false;
+	size_t i;
+	int err;
+
+	fancurve_init(fancurve, model);
+	fancurve->current_point_i = 0;
+	fancurve->size = MAXFANCURVESIZE;
+	fancurve->fan_speed_unit = FAN_SPEED_UNIT_LEVEL;
+
+	err = jycn_ec_lock(&locked);
+	for (i = 0; i < MAXFANCURVESIZE; i++) {
+		u8 lv = err ? 0 : ecram_read(ecram, JYCN_F9F0_ADDR + i);
+
+		if (lv < 1 || lv > MAX_FAN_LEVEL)
+			lv = i + 1;
+		fancurve->points[i].speed1 = lv;
+		fancurve->points[i].speed2 = lv;
+	}
+	jycn_ec_unlock(locked);
+	return 0;
+}
+
+static int jycn_write_fancurve_levels(struct ecram *ecram, u8 mode,
+				      const u8 *speeds)
+{
+	bool locked = false;
+	size_t i;
+	u8 flags;
+	int err;
+
+	if (ec_readonly)
+		return -EPERM;
+
+	err = jycn_ec_lock(&locked);
+	if (err)
+		return err;
+
+	for (i = 0; i < MAXFANCURVESIZE; i++)
+		ecram_write(ecram, JYCN_F9F0_ADDR + i, speeds[i]);
+	ecram_write(ecram, JYCN_F9FA_ADDR, mode);
+	flags = ecram_read(ecram, JYCN_FLAG_ADDR);
+	ecram_write(ecram, JYCN_FLAG_ADDR, flags | JYCN_CUFT_BIT);
+	jycn_ec_unlock(locked);
+	return 0;
+}
+
+static enum fan_speed_unit
+wmi_fancurve_speed_unit(const struct model_config *model)
+{
+	return model == &model_n2cn	 ? FAN_SPEED_UNIT_PERCENT_NEAREST :
+	       model == &model_secn	 ? FAN_SPEED_UNIT_RPM_HUNDRED :
+	       model == &model_kwcn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_q7cn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_q6cn_lu	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_q6cn_f3	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_q6cn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_qncn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_rxcn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_s2cn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_recn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_recn_83f6 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_rycn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_rlcn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_rgcn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_r3cn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_r8cn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_t2cn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_nscn_83fd ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_m3cn_8227 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_macn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_smcn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_uacn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_m2cn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_lpcn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_m0cn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_m1cn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_nrcn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_nmcn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_jycn	 ? FAN_SPEED_UNIT_LEVEL :
+	       model == &model_n0cn	 ? FAN_SPEED_UNIT_LEVEL :
+					   FAN_SPEED_UNIT_PERCENT;
+}
+
+/* See model_config.fancurve_write_unvalidated. */
+static int fancurve_write_allowed(const struct model_config *model)
+{
+	if (!model->fancurve_write_unvalidated || allow_unvalidated_fancurve)
+		return 0;
+
+	pr_warn_once(
+		"fan curve writes are disabled on this model until validated; load with allow_unvalidated_fancurve=1 to test\n");
+	return -EPERM;
+}
+
+static ssize_t wmi_read_fancurve_custom(struct legion_private *priv,
 					struct fancurve *fancurve)
 {
+	const struct model_config *model = priv->conf;
 	struct wmi_fan_table_read fan_table;
 	u8 params_data[2] = { 0, 0 };
 	struct acpi_buffer params = {
@@ -3809,6 +6381,9 @@ static ssize_t wmi_read_fancurve_custom(const struct model_config *model,
 	size_t size;
 	size_t i;
 	int err;
+
+	if (model == &model_jycn)
+		return jycn_read_fancurve_levels(&priv->ecram, model, fancurve);
 
 	// Pass two zero parameter bytes: required by some firmwares
 	// (e.g. NXCN / Legion 9 16IRX9, see #393), ignored by others.
@@ -3827,27 +6402,406 @@ static ssize_t wmi_read_fancurve_custom(const struct model_config *model,
 		size = MAXFANCURVESIZE;
 	}
 
-	memset(fancurve, 0, sizeof(*fancurve));
+	fancurve_init(fancurve, model);
 	fancurve->current_point_i = 0;
 	fancurve->size = size;
-	fancurve->fan_speed_unit = model == &model_n2cn ?
-		FAN_SPEED_UNIT_PERCENT_NEAREST : FAN_SPEED_UNIT_PERCENT;
+	fancurve->fan_speed_unit = wmi_fancurve_speed_unit(model);
 
 	for (i = 0; i < size; i++) {
 		u32 speed = le32_to_cpu(fan_table.fan_speed[i]);
 
 		if (speed > U8_MAX)
 			return -ERANGE;
+		if (fancurve->fan_speed_unit == FAN_SPEED_UNIT_LEVEL &&
+		    speed > MAX_FAN_LEVEL)
+			pr_warn_once(
+				"fan table point %zu holds %u, above level %d (stale percent write?)\n",
+				i + 1, speed, MAX_FAN_LEVEL);
 		fancurve->points[i].speed1 = speed;
+		/* Fan_Set_Table carries one table for all fans (FSID = 0). */
+		fancurve->points[i].speed2 = speed;
 	}
 
 	return 0;
 }
 
-static ssize_t wmi_write_fancurve_custom(const struct model_config *model,
+/* ================================ */
+/* WMI fan table data (per-level    */
+/* fan RPM ladders)                 */
+/* ================================ */
+
+/*
+ * LENOVO_FAN_TABLE_DATA (WMI data block GUID; the ACPI query method is
+ * \_SB_.GZFD.WQA3/WQA7/... depending on the DSDT) publishes the
+ * firmware's per-level RPM table: one row per power mode, fan and
+ * sensor. Row layout as in PR #509 (struct WMIFanTableDefaultData,
+ * validated on LZCN) and the fields Lenovo Legion Toolkit reads via
+ * WQL. Tables always have 10 levels, so rows are parsed with an
+ * exact-size struct through wmi_exec_query_ints(), which rejects rows
+ * whose buffer size does not match.
+ */
+#define WMI_GUID_LENOVO_FANTABLE_DATA "87FB2A6D-D802-48E7-9208-4576C5F5C8D8"
+
+#define FANTABLE_SENSOR_IC 0x01
+#define FANTABLE_SENSOR_CPU 0x04
+#define FANTABLE_SENSOR_GPU 0x05
+
+struct wmi_fantable_row {
+	u16 mode;
+	u16 fan_id;
+	u32 fan_table_len;
+	u16 fan_speed[FANTABLE_MAX_LEVELS];
+	u32 sensor_id;
+	u32 sensor_table_len;
+	u16 sensor_temp[FANTABLE_MAX_LEVELS];
+	u8 start_only_upward_adjust_nbr;
+	u8 end_only_upward_adjust_nbr;
+	u16 current_fan_max_speed;
+	u8 design_max_fan_speed_nbr;
+	u8 reserved;
+	u16 current_fan_min_speed;
+	u16 fan_speed_step;
+	u16 max_sensor_temp;
+	u16 min_sensor_temp;
+	u16 sensor_temp_step;
+} __packed;
+
+static int wmi_query_fantable_row(u8 index, struct wmi_fantable_row *row)
+{
+	int err = wmi_exec_query_ints(WMI_GUID_LENOVO_FANTABLE_DATA, index,
+				      (u8 *)row, sizeof(*row));
+
+	if (!err && (row->fan_table_len > FANTABLE_MAX_LEVELS ||
+		     row->sensor_table_len > FANTABLE_MAX_LEVELS))
+		return -ERANGE;
+
+	return err;
+}
+
+/*
+ * Entry i is firmware level i + 1, including zero-RPM or repeated steps.
+ * Dropping a leading zero shifts every requested level (T2CN SFAN indexes
+ * FNT[level + 2], while SFTW exports FNT[3..12] verbatim).
+ */
+static bool fantable_row_to_ladder(const struct wmi_fantable_row *row,
+				   struct fantable_ladder *ladder)
+{
+	u32 count = row->fan_table_len;
+	u8 i;
+
+	if (count < 1 || count > FANTABLE_MAX_LEVELS)
+		return false;
+
+	for (i = 0; i < count; i++) {
+		u16 rpm = row->fan_speed[i];
+
+		if (i > 0 && rpm < ladder->rpms[i - 1])
+			return false;
+		ladder->rpms[i] = rpm;
+	}
+	if (!ladder->rpms[count - 1])
+		return false;
+
+	ladder->level_count = count;
+	ladder->max_rpm = row->current_fan_max_speed;
+	if (!ladder->max_rpm)
+		ladder->max_rpm = ladder->rpms[count - 1];
+	return true;
+}
+
+static bool fantable_row_matches_mode(const struct wmi_fantable_row *row,
+				      int powermode)
+{
+	/* Standard mode rows carry the power mode id (1 quiet .. 3 perf). */
+	if (row->mode == powermode)
+		return true;
+	/* Legion Zone firmware numbers custom mode rows as 0x100 and, by
+	 * the same convention, extreme mode rows as 0xE1.
+	 */
+	if (powermode == 0xFF && row->mode == 0x100)
+		return true;
+	if (powermode == 0xE0 && row->mode == 0xE1)
+		return true;
+	return false;
+}
+
+/*
+ * JYCN WQA4 FACT rows declare a u32 FNID at offset 0 (overlaying mode + fan_id)
+ * and share one 10-level FNS RPM ladder across all three rows.
+ */
+static bool fantable_mode_agnostic(const struct model_config *conf)
+{
+	return conf == &model_jycn;
+}
+
+/*
+ * Rebuild the per-fan RPM ladders for the current power mode. Rows are
+ * scanned by index until the block runs out of entries; the fan/sensor
+ * pairs are the ones Lenovo Legion Toolkit documents. Only matching-mode
+ * rows are usable: never substitute a different power mode's RPMs.
+ */
+static void fantable_refresh(struct legion_private *priv, int powermode)
+{
+	struct wmi_fantable_row row;
+	struct fantable_ladder fan1_ic, fan2_ic;
+	bool fan1_ic_valid = false, fan2_ic_valid = false;
+	int rows, index;
+
+	priv->fantable_fan1_valid = false;
+	priv->fantable_fan2_valid = false;
+
+	/*
+	 * The block holds one row per power mode, fan and state (AC/DC,
+	 * hybrid mode, ...); the instance count is the exact row count
+	 * (15 on current models, 50+ on some), so query it instead of
+	 * scanning a fixed range.
+	 */
+	rows = wmi_instance_count(WMI_GUID_LENOVO_FANTABLE_DATA);
+	if (rows <= 0)
+		return;
+
+	if (fantable_mode_agnostic(priv->conf)) {
+		struct fantable_ladder shared;
+
+		for (index = 0; index < rows; index++) {
+			if (wmi_query_fantable_row(index, &row))
+				continue;
+			if (fantable_row_to_ladder(&row, &shared)) {
+				priv->fantable_fan1 = shared;
+				priv->fantable_fan2 = shared;
+				priv->fantable_fan1_valid = true;
+				priv->fantable_fan2_valid = true;
+				dev_info(&priv->platform_device->dev,
+					 "fan table data (mode-agnostic): %u levels, %u..%u RPM\n",
+					 shared.level_count, shared.rpms[0],
+					 shared.rpms[shared.level_count - 1]);
+				break;
+			}
+		}
+		priv->fantable_powermode = powermode;
+		return;
+	}
+
+	for (index = 0; index < rows; index++) {
+		bool want_fan1, want_fan2;
+
+		if (wmi_query_fantable_row(index, &row) ||
+		    !fantable_row_matches_mode(&row, powermode))
+			continue;
+
+		want_fan1 = row.fan_id == 1 &&
+			    row.sensor_id == FANTABLE_SENSOR_CPU;
+		want_fan2 = row.fan_id == 2 &&
+			    row.sensor_id == FANTABLE_SENSOR_GPU;
+		if (want_fan1 && !priv->fantable_fan1_valid)
+			priv->fantable_fan1_valid = fantable_row_to_ladder(
+				&row, &priv->fantable_fan1);
+		if (want_fan2 && !priv->fantable_fan2_valid)
+			priv->fantable_fan2_valid = fantable_row_to_ladder(
+				&row, &priv->fantable_fan2);
+		/* Lenovo Legion Toolkit maps (fan 1, sensor 1) to the CPU fan
+		 * as well; it is fan 1's only row on the Legion Pro 7 16IAX10H
+		 * (Q7CN WQA3), where sensor 4 belongs to fan 4.
+		 */
+		if (row.fan_id == 1 && row.sensor_id == FANTABLE_SENSOR_IC &&
+		    !fan1_ic_valid)
+			fan1_ic_valid = fantable_row_to_ladder(&row, &fan1_ic);
+		/* Units without a discrete GPU publish fan 2 against sensor 1
+		 * only (UACN WQA3 with GDMF == 0): there is no GPU row.
+		 */
+		if (row.fan_id == 2 && row.sensor_id == FANTABLE_SENSOR_IC &&
+		    !fan2_ic_valid)
+			fan2_ic_valid = fantable_row_to_ladder(&row, &fan2_ic);
+	}
+
+	/* Prefer the (fan 1, CPU sensor) row whenever the firmware has one. */
+	if (!priv->fantable_fan1_valid && fan1_ic_valid) {
+		priv->fantable_fan1 = fan1_ic;
+		priv->fantable_fan1_valid = true;
+	}
+	/* Likewise the (fan 2, GPU sensor) row. */
+	if (!priv->fantable_fan2_valid && fan2_ic_valid) {
+		priv->fantable_fan2 = fan2_ic;
+		priv->fantable_fan2_valid = true;
+	}
+
+	if (priv->fantable_fan1_valid) {
+		dev_info(&priv->platform_device->dev,
+			 "fan table data: fan 1 has %u levels, %u..%u RPM\n",
+			 priv->fantable_fan1.level_count,
+			 priv->fantable_fan1.rpms[0],
+			 priv->fantable_fan1
+				 .rpms[priv->fantable_fan1.level_count - 1]);
+	}
+	if (priv->fantable_fan2_valid) {
+		dev_info(&priv->platform_device->dev,
+			 "fan table data: fan 2 has %u levels, %u..%u RPM\n",
+			 priv->fantable_fan2.level_count,
+			 priv->fantable_fan2.rpms[0],
+			 priv->fantable_fan2
+				 .rpms[priv->fantable_fan2.level_count - 1]);
+	}
+
+	priv->fantable_powermode = powermode;
+}
+
+static int sync_powermode_locked(struct legion_private *priv);
+static int wmi_fancurve_mode(struct legion_private *priv);
+
+/*
+ * SFAN firmware that selects the RPM ladder from the payload mode byte and
+ * drops writes in extreme mode (GZ44 == 7): the mode byte and the RPM
+ * calibration must both follow the live thermal mode.
+ */
+static bool wmi_sfan_uses_thermal_mode(const struct model_config *conf)
+{
+	return conf == &model_t2cn || conf == &model_nscn_83fd ||
+	       conf == &model_r8cn;
+}
+
+/*
+ * Return the ladders for the current power mode, refreshing the cache
+ * when the power mode changed since the last scan. -ENODATA when the
+ * block is unavailable or holds no usable row (transient failures keep
+ * the cache invalid so the next call rescans). Caller holds
+ * fancurve_mutex.
+ */
+static int fantable_ensure(struct legion_private *priv)
+{
+	int powermode, err;
+
+	if (wmi_sfan_uses_thermal_mode(priv->conf)) {
+		/* Calibration and SFAN must select the same live-mode ladder. */
+		powermode = wmi_fancurve_mode(priv);
+		if (powermode < 0)
+			return powermode;
+	} else {
+		err = sync_powermode_locked(priv);
+		if (err)
+			return err;
+		powermode = priv->current_powermode;
+	}
+
+	if (priv->fantable_fan1_valid && priv->fantable_fan2_valid &&
+	    priv->fantable_powermode == powermode)
+		return 0;
+
+	fantable_refresh(priv, powermode);
+
+	return priv->fantable_fan1_valid || priv->fantable_fan2_valid ?
+		       0 :
+		       -ENODATA;
+}
+
+/*
+ * Make a level table safe to send. Fan_Get_Table returns ten zeros until
+ * something has written the table (EC RAM untouched since boot), and an
+ * older driver may have left percent-unit values above MAX_FAN_LEVEL
+ * behind. Unset points get Legion Toolkit's default curve (1..10), the
+ * rest is pulled inside [fancurve_level_min, MAX_FAN_LEVEL].
+ */
+static void fancurve_level_table_sanitize(u8 speeds[MAXFANCURVESIZE])
+{
+	size_t i;
+
+	for (i = 0; i < MAXFANCURVESIZE; i++) {
+		u8 fixed = speeds[i];
+
+		if (fixed == 0)
+			fixed = i + 1;
+		fixed = clamp_t(u8, fixed, fancurve_level_min[i],
+				MAX_FAN_LEVEL);
+		if (fixed != speeds[i]) {
+			pr_info("fan table point %zu: level %u sent as %u\n",
+				i + 1, speeds[i], fixed);
+			speeds[i] = fixed;
+		}
+	}
+}
+
+enum legion_wmi_powermode {
+	LEGION_WMI_POWERMODE_LOW_POWER = 1,
+	LEGION_WMI_POWERMODE_BALANCED = 2,
+	LEGION_WMI_POWERMODE_PERFORMANCE = 3,
+	LEGION_WMI_POWERMODE_CUSTOM = 255,
+	LEGION_WMI_POWERMODE_MAX_POWER = 224
+};
+
+static ssize_t read_powermode(struct legion_private *priv, int *powermode);
+
+static int read_fan_control_mode(struct legion_private *priv, int *powermode)
+{
+	unsigned long value;
+	int err;
+
+	if (!wmi_sfan_uses_thermal_mode(priv->conf) &&
+	    priv->conf != &model_r3cn)
+		return read_powermode(priv, powermode);
+
+	/* SmartFanMode is a saved request; ThermalMode reads live GZ44. */
+	err = wmi_exec_noarg_int(LEGION_WMI_GAMEZONE_GUID, 0,
+				 WMI_METHOD_ID_GETTHERMALMODE, &value);
+	if (err)
+		return err;
+	if (value > U8_MAX)
+		return -ERANGE;
+	*powermode = value;
+	return 0;
+}
+
+/* These SFAN implementations dereference an unset local for mode 0. */
+static int wmi_fancurve_mode(struct legion_private *priv)
+{
+	int powermode, err;
+
+	/*
+	 * R3CN uses this only for WMI default restoration, not its EC3 curve.
+	 * M2CN (82YA, EC 0x8227) shares model_m3cn_8227's WMI3 Fan_Set_Table:
+	 * the firmware reads the first buffer byte as the active power mode and
+	 * aborts \_SB.GZFD.SFAN with AE_AML_OPERAND_TYPE when it is 0 (PR #584
+	 * for m3cn_8227, issue #582 for the 82Y9 twin of this EC).
+	 */
+	if (priv->conf != &model_m3cn_8227 &&
+	    priv->conf != &model_m2cn &&
+	    priv->conf != &model_jycn &&
+	    !wmi_sfan_uses_thermal_mode(priv->conf) &&
+	    priv->conf != &model_r3cn && priv->conf != &model_nmcn)
+		return 0;
+
+	err = read_fan_control_mode(priv, &powermode);
+	if (err)
+		return err;
+	if (priv->conf == &model_jycn) {
+		switch (powermode) {
+		case LEGION_WMI_POWERMODE_LOW_POWER:
+		case LEGION_WMI_POWERMODE_BALANCED:
+		case LEGION_WMI_POWERMODE_PERFORMANCE:
+			return powermode;
+		case LEGION_WMI_POWERMODE_CUSTOM:
+			return LEGION_WMI_POWERMODE_BALANCED;
+		default:
+			return -EOPNOTSUPP;
+		}
+	}
+	switch (powermode) {
+	case LEGION_WMI_POWERMODE_LOW_POWER:
+	case LEGION_WMI_POWERMODE_BALANCED:
+	case LEGION_WMI_POWERMODE_PERFORMANCE:
+	case LEGION_WMI_POWERMODE_CUSTOM:
+		return powermode;
+	default:
+		/* Do not report success for ignored/unsupported mode writes. */
+		return -EOPNOTSUPP;
+	}
+}
+
+static ssize_t wmi_write_fancurve_custom(struct legion_private *priv,
 					 const struct fancurve *fancurve)
 {
-	u8 buffer[0x20];
+	const struct model_config *model = priv->conf;
+	u8 buffer[0x40];
+	u8 speeds[MAXFANCURVESIZE];
+	size_t point;
 	int err;
 
 	// The buffer is read like this in ACPI firmware
@@ -3867,16 +6821,20 @@ static ssize_t wmi_write_fancurve_custom(const struct model_config *model,
 	// CreateByteField (Arg2, 0x18, FSS9)
 
 	memset(buffer, 0, sizeof(buffer));
-	buffer[0x06] = fancurve->points[0].speed1;
-	buffer[0x08] = fancurve->points[1].speed1;
-	buffer[0x0A] = fancurve->points[2].speed1;
-	buffer[0x0C] = fancurve->points[3].speed1;
-	buffer[0x0E] = fancurve->points[4].speed1;
-	buffer[0x10] = fancurve->points[5].speed1;
-	buffer[0x12] = fancurve->points[6].speed1;
-	buffer[0x14] = fancurve->points[7].speed1;
-	buffer[0x16] = fancurve->points[8].speed1;
-	buffer[0x18] = fancurve->points[9].speed1;
+	err = wmi_fancurve_mode(priv);
+	if (err < 0)
+		return err;
+	buffer[0] = err;
+	for (point = 0; point < MAXFANCURVESIZE; point++)
+		speeds[point] = fancurve->points[point].speed1;
+	if (fancurve->fan_speed_unit == FAN_SPEED_UNIT_LEVEL)
+		fancurve_level_table_sanitize(speeds);
+	for (point = 0; point < MAXFANCURVESIZE; point++)
+		buffer[0x06 + 2 * point] = speeds[point];
+
+	if (model == &model_jycn)
+		return jycn_write_fancurve_levels(&priv->ecram, buffer[0],
+						  speeds);
 
 	print_hex_dump(KERN_DEBUG, "legion_laptop fan table wmi write buffer",
 		       DUMP_PREFIX_ADDRESS, 16, 1, buffer, sizeof(buffer),
@@ -3890,11 +6848,12 @@ static ssize_t wmi_write_fancurve_custom(const struct model_config *model,
 		struct fancurve readback;
 		size_t i;
 
-		err = wmi_read_fancurve_custom(model, &readback);
+		err = wmi_read_fancurve_custom(priv, &readback);
 		if (err)
 			return err;
 		for (i = 0; i < MAXFANCURVESIZE; i++) {
-			if (readback.points[i].speed1 != fancurve->points[i].speed1)
+			if (readback.points[i].speed1 !=
+			    fancurve->points[i].speed1)
 				return -EIO;
 		}
 	}
@@ -3902,7 +6861,8 @@ static ssize_t wmi_write_fancurve_custom(const struct model_config *model,
 	return err;
 }
 
-static ssize_t wmi_write_fancurve_defaults(struct legion_private *priv, int value)
+static ssize_t wmi_write_fancurve_defaults(struct legion_private *priv,
+					   int value)
 {
 	int err = -1;
 	struct {
@@ -3919,12 +6879,24 @@ static ssize_t wmi_write_fancurve_defaults(struct legion_private *priv, int valu
 		u16 F00B; /* 9 */
 		u16 F00C; /* Index Point 10 */
 		u8 notused1[26]; /* F00D - F019 */
-} __packed fan_table = { 0 };
+	} __packed fan_table = { 0 };
 
 	if (!priv->conf->has_fancurve_defaults) {
 		pr_info("fancurve_defaults_powermode not supported for your model\n");
 		return err;
 	};
+	err = fancurve_write_allowed(priv->conf);
+	if (err)
+		return err;
+	err = wmi_fancurve_mode(priv);
+	if (err < 0)
+		return err;
+	if (priv->conf == &model_jycn) {
+		static const u8 defaults[MAXFANCURVESIZE] = { 1, 2, 3, 4, 5,
+							      6, 7, 8, 9, 10 };
+
+		return jycn_write_fancurve_levels(&priv->ecram, err, defaults);
+	}
 	fan_table.F000 = value;
 	fan_table.F003 = 0x01;
 	fan_table.F004 = 0x02;
@@ -3938,7 +6910,8 @@ static ssize_t wmi_write_fancurve_defaults(struct legion_private *priv, int valu
 	fan_table.F00C = 0x0A;
 
 	err = wmi_exec_arg(WMI_GUID_LENOVO_FAN_METHOD, 0,
-						WMI_METHOD_ID_FAN_SET_TABLE, (u8 *)&fan_table, sizeof(fan_table));
+			   WMI_METHOD_ID_FAN_SET_TABLE, (u8 *)&fan_table,
+			   sizeof(fan_table));
 	return err;
 }
 
@@ -4176,6 +7149,31 @@ static int ec_read_fancurve_loq(struct ecram *ecram,
 	fancurve->fan_speed_unit = FAN_SPEED_UNIT_RPM_HUNDRED;
 	for (i = 0; i < FANCURVESIZE_LOQ; ++i) {
 		struct fancurve_point *point = &fancurve->points[i];
+		size_t sys = i * struct_offset_ecramsys;
+
+		if (model->ec3_fancurve_shared_table) {
+			/* read back the block ec_write_fancurve_loq writes */
+			point->speed1 = ecram_read(
+				ecram, model->registers->EXT_FAN1_BASE + sys);
+			point->speed2 = ecram_read(
+				ecram, model->registers->EXT_FAN2_BASE + sys);
+			point->cpu_max_temp_celsius = ecram_read(
+				ecram, model->registers->EXT_CPU_TEMP + sys);
+			point->cpu_min_temp_celsius = ecram_read(
+				ecram,
+				model->registers->EXT_CPU_TEMP_HYST + sys);
+			point->gpu_max_temp_celsius = ecram_read(
+				ecram, model->registers->EXT_GPU_TEMP + sys);
+			point->gpu_min_temp_celsius = ecram_read(
+				ecram,
+				model->registers->EXT_GPU_TEMP_HYST + sys);
+			point->ic_max_temp_celsius = ecram_read(
+				ecram, model->registers->EXT_VRM_TEMP + sys);
+			point->ic_min_temp_celsius = ecram_read(
+				ecram,
+				model->registers->EXT_VRM_TEMP_HYST + sys);
+			continue;
+		}
 
 		point->speed1 =
 			ecram_read(ecram, model->registers->EXT_FAN1_RPM_LSB +
@@ -4186,18 +7184,18 @@ static int ec_read_fancurve_loq(struct ecram *ecram,
 
 		point->accel = 0;
 		point->decel = 0;
-		point->cpu_max_temp_celsius =
-			ecram_read(ecram, model->registers->EXT_FAN1_RPM_LSB +
-						  (i * struct_offset_ecram) - 1);
-		point->cpu_min_temp_celsius =
-			ecram_read(ecram, model->registers->EXT_FAN1_RPM_LSB +
-						  (i * struct_offset_ecram) - 2);
-		point->gpu_max_temp_celsius =
-			ecram_read(ecram, model->registers->EXT_FAN2_RPM_LSB +
-						  (i * struct_offset_ecram) - 1);
-		point->gpu_min_temp_celsius =
-			ecram_read(ecram, model->registers->EXT_FAN2_RPM_LSB +
-						  (i * struct_offset_ecram) - 2);
+		point->cpu_max_temp_celsius = ecram_read(
+			ecram, model->registers->EXT_FAN1_RPM_LSB +
+				       (i * struct_offset_ecram) - 1);
+		point->cpu_min_temp_celsius = ecram_read(
+			ecram, model->registers->EXT_FAN1_RPM_LSB +
+				       (i * struct_offset_ecram) - 2);
+		point->gpu_max_temp_celsius = ecram_read(
+			ecram, model->registers->EXT_FAN2_RPM_LSB +
+				       (i * struct_offset_ecram) - 1);
+		point->gpu_min_temp_celsius = ecram_read(
+			ecram, model->registers->EXT_FAN2_RPM_LSB +
+				       (i * struct_offset_ecram) - 2);
 		point->ic_max_temp_celsius =
 			ecram_read(ecram, model->registers->EXT_VRM_TEMP +
 						  (i * struct_offset_ecramsys));
@@ -4229,13 +7227,17 @@ static int ec_write_fancurve_loq(struct ecram *ecram,
 	for (i = 0; i < FANCURVESIZE_LOQ; ++i) {
 		const struct fancurve_point *point = &fancurve->points[i];
 
-		ecram_write(ecram, model->registers->EXT_FAN1_BASE
-							+ (i * struct_offset_ecramsys), point->speed1);
-		valr1 = ecram_read(ecram, model->registers->EXT_FAN1_BASE
-							+ (i * struct_offset_ecramsys));
+		ecram_write(ecram,
+			    model->registers->EXT_FAN1_BASE +
+				    (i * struct_offset_ecramsys),
+			    point->speed1);
+		valr1 = ecram_read(ecram, model->registers->EXT_FAN1_BASE +
+						  (i * struct_offset_ecramsys));
 
-		ecram_write(ecram, model->registers->EXT_FAN2_BASE
-							+ (i * struct_offset_ecramsys), point->speed2);
+		ecram_write(ecram,
+			    model->registers->EXT_FAN2_BASE +
+				    (i * struct_offset_ecramsys),
+			    point->speed2);
 		valr2 = ecram_read(ecram, model->registers->EXT_FAN2_BASE +
 						  (i * struct_offset_ecramsys));
 
@@ -4244,19 +7246,30 @@ static int ec_write_fancurve_loq(struct ecram *ecram,
 		pr_info("Writing fan2: %d; reading fan2: %d\n", point->speed2,
 			valr2);
 
-		ecram_write(ecram, model->registers->EXT_CPU_TEMP
-							+ (i * struct_offset_ecramsys), point->cpu_max_temp_celsius);
-		ecram_write(ecram, model->registers->EXT_CPU_TEMP_HYST
-							+ (i * struct_offset_ecramsys), point->cpu_min_temp_celsius);
-		ecram_write(ecram, model->registers->EXT_GPU_TEMP
-							+ (i * struct_offset_ecramsys), point->gpu_max_temp_celsius);
-		ecram_write(ecram, model->registers->EXT_GPU_TEMP_HYST
-							+ (i * struct_offset_ecramsys), point->gpu_min_temp_celsius);
-		ecram_write(ecram, model->registers->EXT_VRM_TEMP
-							+ (i * struct_offset_ecramsys), point->ic_max_temp_celsius);
-		ecram_write(ecram, model->registers->EXT_VRM_TEMP_HYST
-							+ (i * struct_offset_ecramsys), point->ic_min_temp_celsius);
-
+		ecram_write(ecram,
+			    model->registers->EXT_CPU_TEMP +
+				    (i * struct_offset_ecramsys),
+			    point->cpu_max_temp_celsius);
+		ecram_write(ecram,
+			    model->registers->EXT_CPU_TEMP_HYST +
+				    (i * struct_offset_ecramsys),
+			    point->cpu_min_temp_celsius);
+		ecram_write(ecram,
+			    model->registers->EXT_GPU_TEMP +
+				    (i * struct_offset_ecramsys),
+			    point->gpu_max_temp_celsius);
+		ecram_write(ecram,
+			    model->registers->EXT_GPU_TEMP_HYST +
+				    (i * struct_offset_ecramsys),
+			    point->gpu_min_temp_celsius);
+		ecram_write(ecram,
+			    model->registers->EXT_VRM_TEMP +
+				    (i * struct_offset_ecramsys),
+			    point->ic_max_temp_celsius);
+		ecram_write(ecram,
+			    model->registers->EXT_VRM_TEMP_HYST +
+				    (i * struct_offset_ecramsys),
+			    point->ic_min_temp_celsius);
 	}
 	// execute
 	cmrd = ecram_read(ecram, LOQ_CMDR_ADDR);
@@ -4266,72 +7279,12 @@ static int ec_write_fancurve_loq(struct ecram *ecram,
 	return 0;
 }
 
-
-#define EC4_FANCURVE_SIZE 10
-#define EC4_FAN1_BASE 0xC50A
-#define EC4_FAN2_BASE 0xC531
-#define EC4_POINT_STRIDE 3
-
-static int ec_read_fancurve_legion2024(struct ecram *ecram,
-				       const struct model_config *model,
-				       struct fancurve *fancurve)
-{
-	int i;
-
-	fancurve->fan_speed_unit = FAN_SPEED_UNIT_RPM_HUNDRED;
-	fancurve->size = EC4_FANCURVE_SIZE;
-	fancurve->current_point_i = 0;
-	for (i = 0; i < EC4_FANCURVE_SIZE; i++) {
-		struct fancurve_point *p = &fancurve->points[i];
-		u8 off = EC4_POINT_STRIDE * i;
-
-		p->cpu_max_temp_celsius =
-			ecram_read(ecram, EC4_FAN1_BASE + off);
-		p->gpu_max_temp_celsius =
-			ecram_read(ecram, EC4_FAN1_BASE + off + 1);
-		p->speed1 = ecram_read(ecram, EC4_FAN1_BASE + off + 2);
-		p->speed2 = ecram_read(ecram, EC4_FAN2_BASE + off + 2);
-		// Not stored in this EC layout
-		p->cpu_min_temp_celsius = 0;
-		p->gpu_min_temp_celsius = 0;
-		p->ic_max_temp_celsius = 0;
-		p->ic_min_temp_celsius = 0;
-		p->accel = 0;
-		p->decel = 0;
-	}
-	return 0;
-}
-
-static int ec_write_fancurve_legion2024(struct ecram *ecram,
-					const struct model_config *model,
-					const struct fancurve *fancurve)
-{
-	int i;
-
-	for (i = 0; i < EC4_FANCURVE_SIZE; i++) {
-		const struct fancurve_point *p = &fancurve->points[i];
-		u8 off = EC4_POINT_STRIDE * i;
-
-		// fan1 curve: cpu_max, gpu_max, speed1
-		ecram_write(ecram, EC4_FAN1_BASE + off,
-			    p->cpu_max_temp_celsius);
-		ecram_write(ecram, EC4_FAN1_BASE + off + 1,
-			    p->gpu_max_temp_celsius);
-		ecram_write(ecram, EC4_FAN1_BASE + off + 2, p->speed1);
-		// fan2 curve: same temperature thresholds, speed2
-		ecram_write(ecram, EC4_FAN2_BASE + off,
-			    p->cpu_max_temp_celsius);
-		ecram_write(ecram, EC4_FAN2_BASE + off + 1,
-			    p->gpu_max_temp_celsius);
-		ecram_write(ecram, EC4_FAN2_BASE + off + 2, p->speed2);
-	}
-	return 0;
-}
-
-
 static int read_fancurve(struct legion_private *priv, struct fancurve *fancurve)
 {
 	int err;
+
+	/* Native backends fill only the fields present in their EC layout. */
+	fancurve_init(fancurve, priv->conf);
 
 	// TODO: use enums or function pointers?
 	switch (priv->conf->access_method_fancurve) {
@@ -4346,12 +7299,8 @@ static int read_fancurve(struct legion_private *priv, struct fancurve *fancurve)
 	case ACCESS_METHOD_EC3:
 		err = ec_read_fancurve_loq(&priv->ecram, priv->conf, fancurve);
 		break;
-	case ACCESS_METHOD_EC4:
-		err = ec_read_fancurve_legion2024(&priv->ecram, priv->conf,
-						  fancurve);
-		break;
 	case ACCESS_METHOD_WMI3:
-		err = wmi_read_fancurve_custom(priv->conf, fancurve);
+		err = wmi_read_fancurve_custom(priv, fancurve);
 		break;
 	default:
 		pr_info("No access method for fancurve: %d\n",
@@ -4376,6 +7325,10 @@ static int write_fancurve(struct legion_private *priv,
 {
 	int err;
 
+	err = fancurve_write_allowed(priv->conf);
+	if (err)
+		return err;
+
 	// TODO: use enums or function pointers?
 	switch (priv->conf->access_method_fancurve) {
 	case ACCESS_METHOD_EC:
@@ -4387,15 +7340,10 @@ static int write_fancurve(struct legion_private *priv,
 						fancurve);
 		break;
 	case ACCESS_METHOD_EC3:
-		err = ec_write_fancurve_loq(&priv->ecram, priv->conf,
-					    fancurve);
-		break;
-	case ACCESS_METHOD_EC4:
-		err = ec_write_fancurve_legion2024(&priv->ecram, priv->conf,
-						   fancurve);
+		err = ec_write_fancurve_loq(&priv->ecram, priv->conf, fancurve);
 		break;
 	case ACCESS_METHOD_WMI3:
-		err = wmi_write_fancurve_custom(priv->conf, fancurve);
+		err = wmi_write_fancurve_custom(priv, fancurve);
 		break;
 	default:
 		pr_info("No access method for fancurve: %d\n",
@@ -4406,9 +7354,77 @@ static int write_fancurve(struct legion_private *priv,
 	if (!err) {
 		priv->fancurve = *fancurve;
 		priv->fancurve_valid = true;
+		/* remember it with its power mode for the resume re-apply */
+		if (priv->conf->restore_fancurve_on_resume &&
+		    !sync_powermode_locked(priv)) {
+			priv->resume_fancurve = *fancurve;
+			priv->resume_fancurve_mode = priv->current_powermode;
+			priv->resume_fancurve_valid = true;
+		}
 	}
 
 	return err;
+}
+
+/*
+ * Delayed after resume, like legiond's resume hook: the EC applies its
+ * per-point floor during wake-up and would overwrite an earlier write.
+ * Only re-applied in the power mode the table was written in, since
+ * another mode's table must not be replaced by it.
+ */
+static void legion_resume_fancurve_fn(struct work_struct *work)
+{
+	struct legion_private *priv = container_of(to_delayed_work(work),
+						   struct legion_private,
+						   resume_fancurve_work);
+	struct device *dev = &priv->platform_device->dev;
+	int err;
+
+	mutex_lock(&priv->fancurve_mutex);
+	if (!priv->resume_fancurve_valid) {
+		mutex_unlock(&priv->fancurve_mutex);
+		return;
+	}
+	err = sync_powermode_locked(priv);
+	if (err || priv->current_powermode != priv->resume_fancurve_mode) {
+		dev_info(dev,
+			 "Fan curve not re-applied: mode %d, set in %d (%d)\n",
+			 priv->current_powermode, priv->resume_fancurve_mode,
+			 err);
+		mutex_unlock(&priv->fancurve_mutex);
+		return;
+	}
+	{
+		struct fancurve fancurve = priv->resume_fancurve;
+
+		err = write_fancurve(priv, &fancurve, false);
+	}
+	mutex_unlock(&priv->fancurve_mutex);
+	if (err)
+		dev_warn(dev, "Fan curve re-apply after resume failed: %d\n",
+			 err);
+	else
+		dev_info(dev, "Re-applied the fan curve set before suspend\n");
+}
+
+/* the work checks resume_fancurve_valid under fancurve_mutex */
+static void legion_resume_fancurve(struct legion_private *priv)
+{
+	if (priv && priv->conf && priv->conf->restore_fancurve_on_resume)
+		schedule_delayed_work(&priv->resume_fancurve_work,
+				      msecs_to_jiffies(3000));
+}
+
+static bool minifancurve_supported(const struct model_config *model)
+{
+	return model->has_minifancurve &&
+	       model->registers->EXT_MINIFANCURVE_ON_COOL;
+}
+
+static bool lockfancontroller_supported(const struct model_config *model)
+{
+	return !model->skip_lockfancontroller &&
+	       model->registers->EXT_LOCKFANCONTROLLER;
 }
 
 #define MINIFANCUVE_ON_COOL_ON 0x04
@@ -4417,8 +7433,11 @@ static int write_fancurve(struct legion_private *priv,
 static int ec_read_minifancurve(struct ecram *ecram,
 				const struct model_config *model, bool *state)
 {
-	int value =
-		ecram_read(ecram, model->registers->EXT_MINIFANCURVE_ON_COOL);
+	int value;
+
+	if (!minifancurve_supported(model))
+		return -EOPNOTSUPP;
+	value = ecram_read(ecram, model->registers->EXT_MINIFANCURVE_ON_COOL);
 
 	switch (value) {
 	case MINIFANCUVE_ON_COOL_ON:
@@ -4430,7 +7449,7 @@ static int ec_read_minifancurve(struct ecram *ecram,
 	default:
 		pr_info("Unexpected value in MINIFANCURVE register: %d\n",
 			value);
-		return -1;
+		return -EIO;
 	}
 	return 0;
 }
@@ -4441,6 +7460,8 @@ static ssize_t ec_write_minifancurve(struct ecram *ecram,
 {
 	u8 val = state ? MINIFANCUVE_ON_COOL_ON : MINIFANCUVE_ON_COOL_OFF;
 
+	if (!minifancurve_supported(model))
+		return -EOPNOTSUPP;
 	ecram_write(ecram, model->registers->EXT_MINIFANCURVE_ON_COOL, val);
 	return 0;
 }
@@ -4454,6 +7475,8 @@ static ssize_t ec_write_lockfancontroller(struct ecram *ecram,
 {
 	u8 val = state ? EC_LOCKFANCONTROLLER_ON : EC_LOCKFANCONTROLLER_OFF;
 
+	if (!lockfancontroller_supported(model))
+		return -EOPNOTSUPP;
 	ecram_write(ecram, model->registers->EXT_LOCKFANCONTROLLER, val);
 	return 0;
 }
@@ -4462,7 +7485,11 @@ static int ec_read_lockfancontroller(struct ecram *ecram,
 				     const struct model_config *model,
 				     bool *state)
 {
-	int value = ecram_read(ecram, model->registers->EXT_LOCKFANCONTROLLER);
+	int value;
+
+	if (!lockfancontroller_supported(model))
+		return -EOPNOTSUPP;
+	value = ecram_read(ecram, model->registers->EXT_LOCKFANCONTROLLER);
 
 	switch (value) {
 	case EC_LOCKFANCONTROLLER_ON:
@@ -4474,7 +7501,7 @@ static int ec_read_lockfancontroller(struct ecram *ecram,
 	default:
 		pr_info("Unexpected value in lockfanspeed register: %d\n",
 			value);
-		return -1;
+		return -EIO;
 	}
 	return 0;
 }
@@ -4512,7 +7539,7 @@ static int ec_read_fanfullspeed(struct ecram *ecram,
 	default:
 		pr_info("Unexpected value in maximumfanspeed register: %d\n",
 			value);
-		return -1;
+		return -EIO;
 	}
 	return 0;
 }
@@ -4526,35 +7553,6 @@ static ssize_t ec_write_fanfullspeed(struct ecram *ecram,
 	ecram_write(ecram, model->registers->EXT_MAXIMUMFANSPEED, val);
 	return 0;
 }
-
-
-#define EC4_FANFULLSPEED_REG 0xCFB6
-#define EC4_FANFULLSPEED_FFON_BIT 0
-
-static int ec_read_fanfullspeed_legion2024(struct ecram *ecram,
-					   const struct model_config *model,
-					   bool *state)
-{
-	int value = ecram_read(ecram, EC4_FANFULLSPEED_REG);
-
-	*state = (value >> EC4_FANFULLSPEED_FFON_BIT) & 0x1;
-	return 0;
-}
-
-static ssize_t ec_write_fanfullspeed_legion2024(struct ecram *ecram,
-						const struct model_config *model,
-						bool state)
-{
-	int value = ecram_read(ecram, EC4_FANFULLSPEED_REG);
-
-	if (state)
-		value |= (1 << EC4_FANFULLSPEED_FFON_BIT);
-	else
-		value &= ~(1 << EC4_FANFULLSPEED_FFON_BIT);
-	ecram_write(ecram, EC4_FANFULLSPEED_REG, (u8)value);
-	return 0;
-}
-
 
 static ssize_t wmi_read_fanfullspeed(struct legion_private *priv, bool *state)
 {
@@ -4575,7 +7573,8 @@ static int wmi_read_fanfullspeed_other(struct legion_private *priv, bool *state)
 	int err;
 	int res;
 
-	err = wmi_other_method_get_value(OtherMethodFeature_FAN_FULLSPEED, &res);
+	err = wmi_other_method_get_value(OtherMethodFeature_FAN_FULLSPEED,
+					 &res);
 	if (!err)
 		*state = (res != 0); // ON
 	return err;
@@ -4584,9 +7583,10 @@ static int wmi_read_fanfullspeed_other(struct legion_private *priv, bool *state)
 static int wmi_write_fanfullspeed_other(struct legion_private *priv, bool state)
 {
 	int res;
-	int value = (state)?1:0;
+	int value = (state) ? 1 : 0;
 
-	return wmi_other_method_set_value(OtherMethodFeature_FAN_FULLSPEED, value, &res);
+	return wmi_other_method_set_value(OtherMethodFeature_FAN_FULLSPEED,
+					  value, &res);
 }
 
 static ssize_t read_fanfullspeed(struct legion_private *priv, bool *state)
@@ -4595,9 +7595,6 @@ static ssize_t read_fanfullspeed(struct legion_private *priv, bool *state)
 	switch (priv->conf->access_method_fanfullspeed) {
 	case ACCESS_METHOD_EC:
 		return ec_read_fanfullspeed(&priv->ecram, priv->conf, state);
-	case ACCESS_METHOD_EC4:
-		return ec_read_fanfullspeed_legion2024(&priv->ecram, priv->conf,
-						       state);
 	case ACCESS_METHOD_WMI:
 		return wmi_read_fanfullspeed(priv, state);
 	case ACCESS_METHOD_WMI3:
@@ -4617,9 +7614,6 @@ static ssize_t write_fanfullspeed(struct legion_private *priv, bool state)
 	case ACCESS_METHOD_EC:
 		res = ec_write_fanfullspeed(&priv->ecram, priv->conf, state);
 		return res;
-	case ACCESS_METHOD_EC4:
-		return ec_write_fanfullspeed_legion2024(&priv->ecram,
-							priv->conf, state);
 	case ACCESS_METHOD_WMI:
 		return wmi_write_fanfullspeed(priv, state);
 	case ACCESS_METHOD_WMI3:
@@ -4641,14 +7635,6 @@ enum legion_ec_powermode {
 	LEGION_EC_POWERMODE_PERFORMANCE = 1,
 	LEGION_EC_POWERMODE_CUSTOM = 3,
 	LEGION_EC_POWERMODE_EXTREME = 7 // based on GZ44
-};
-
-enum legion_wmi_powermode {
-	LEGION_WMI_POWERMODE_LOW_POWER = 1,
-	LEGION_WMI_POWERMODE_BALANCED = 2,
-	LEGION_WMI_POWERMODE_PERFORMANCE = 3,
-	LEGION_WMI_POWERMODE_CUSTOM = 255,
-	LEGION_WMI_POWERMODE_MAX_POWER = 224
 };
 
 static enum legion_wmi_powermode ec_to_wmi_powermode(int ec_mode)
@@ -4692,18 +7678,20 @@ static ssize_t ec_read_powermode(struct legion_private *priv, int *powermode)
 {
 	*powermode =
 		ecram_read(&priv->ecram, priv->conf->registers->EXT_POWERMODE);
+	if (priv->conf->ec_powermode_mask)
+		*powermode &= priv->conf->ec_powermode_mask;
 	return 0;
 }
 
 static ssize_t ec_write_powermode(struct legion_private *priv, u8 value)
 {
 	if (value != LEGION_EC_POWERMODE_BALANCED &&
-			value != LEGION_EC_POWERMODE_PERFORMANCE &&
-			value != LEGION_EC_POWERMODE_QUIET &&
-			value != LEGION_EC_POWERMODE_CUSTOM &&
-			value != LEGION_EC_POWERMODE_EXTREME) {
+	    value != LEGION_EC_POWERMODE_PERFORMANCE &&
+	    value != LEGION_EC_POWERMODE_QUIET &&
+	    value != LEGION_EC_POWERMODE_CUSTOM &&
+	    value != LEGION_EC_POWERMODE_EXTREME) {
 		pr_info("Unexpected power mode value ignored: %d\n", value);
-		return -ENOMEM;
+		return -EINVAL;
 	}
 	ecram_write(&priv->ecram, priv->conf->registers->EXT_POWERMODE, value);
 	return 0;
@@ -4717,7 +7705,8 @@ static ssize_t acpi_read_powermode(struct legion_private *priv, int *powermode)
 	// spmo method not always available
 	// \_SB.PCI0.LPC0.EC0.SPMO
 	err = eval_spmo(priv->adev, &acpi_powermode);
-	*powermode = (int)acpi_powermode;
+	if (!err)
+		*powermode = (int)acpi_powermode;
 	return err;
 }
 
@@ -4737,16 +7726,59 @@ static ssize_t wmi_read_powermode(int *powermode)
 static ssize_t wmi_write_powermode(u8 value)
 {
 	if (value != LEGION_WMI_POWERMODE_BALANCED &&
-		value != LEGION_WMI_POWERMODE_PERFORMANCE &&
-		value != LEGION_WMI_POWERMODE_LOW_POWER &&
-		value != LEGION_WMI_POWERMODE_CUSTOM &&
-		value != LEGION_WMI_POWERMODE_MAX_POWER) {
+	    value != LEGION_WMI_POWERMODE_PERFORMANCE &&
+	    value != LEGION_WMI_POWERMODE_LOW_POWER &&
+	    value != LEGION_WMI_POWERMODE_CUSTOM &&
+	    value != LEGION_WMI_POWERMODE_MAX_POWER) {
 		pr_info("Unexpected power mode value ignored: %d\n", value);
-		return -ENOMEM;
+		return -EINVAL;
 	}
 	return wmi_exec_arg(LEGION_WMI_GAMEZONE_GUID, 0,
 			    WMI_METHOD_ID_SETSMARTFANMODE, &value,
 			    sizeof(value));
+}
+
+#define EC_CUSTOM_MODE_ACTIVE BIT(0) /* CTMD */
+#define EC_CUSTOM_MODE_PENDING_AC BIT(1) /* CTPA */
+
+/*
+ * A custom request the firmware parked for AC: custom not active, custom
+ * pending, and the EC running balanced. The GameZone get method reports
+ * custom for this state, but the EC runs balanced.
+ */
+static bool ec_custom_request_parked(u8 custom_mode, int ec_powermode)
+{
+	return !(custom_mode & EC_CUSTOM_MODE_ACTIVE) &&
+	       (custom_mode & EC_CUSTOM_MODE_PENDING_AC) &&
+	       ec_powermode == LEGION_EC_POWERMODE_BALANCED;
+}
+
+static void fixup_parked_custom_powermode(struct legion_private *priv,
+					  int *powermode)
+{
+	int ec_powermode;
+	u8 custom_mode;
+
+	if (!priv->conf->ec_custom_mode_register ||
+	    *powermode != LEGION_WMI_POWERMODE_CUSTOM)
+		return;
+
+	custom_mode =
+		ecram_read(&priv->ecram, priv->conf->ec_custom_mode_register);
+	ec_read_powermode(priv, &ec_powermode);
+	if (ec_custom_request_parked(custom_mode, ec_powermode))
+		*powermode = LEGION_WMI_POWERMODE_BALANCED;
+}
+
+/*
+ * The firmware cannot enter custom mode right now: it would only park the
+ * request (see custom_powermode_requires_ac). An unknown supply state
+ * (no power supply registered) does not block the request.
+ */
+static bool custom_powermode_blocked(struct legion_private *priv)
+{
+	return priv->conf->custom_powermode_requires_ac &&
+	       power_supply_is_system_supplied() == 0;
 }
 
 static ssize_t read_powermode(struct legion_private *priv, int *powermode)
@@ -4761,12 +7793,41 @@ static ssize_t read_powermode(struct legion_private *priv, int *powermode)
 	case ACCESS_METHOD_ACPI:
 		return acpi_read_powermode(priv, powermode);
 	case ACCESS_METHOD_WMI:
-		return wmi_read_powermode(powermode);
+		res = wmi_read_powermode(powermode);
+		if (!res)
+			fixup_parked_custom_powermode(priv, powermode);
+		return res;
 	default:
 		pr_info("No access method for powermode: %d\n",
 			priv->conf->access_method_powermode);
 		return -EINVAL;
 	}
+}
+
+/*
+ * powermode_store() is the only mode write that also updates
+ * priv->current_powermode; the mode changes without it too:
+ * legion_platform_profile_set() writes it directly (platform_profile
+ * sysfs, power-profiles-daemon), the mainline lenovo-wmi-gamezone
+ * driver owns the platform profile when legion_laptop runs with
+ * enable_platformprofile=0, and Fn+Q goes through lenovo-wmi-events
+ * when both are loaded. So anything that selects per-mode firmware
+ * data (capability rows for clamping, the fan table ladders) refreshes
+ * the cache through this helper first. Caller holds fancurve_mutex, as
+ * does powermode_store() when it writes the cache. On a read error the
+ * cached value is kept. Consumers sync right before they use the value,
+ * so a read that lands in the firmware's settling window after a mode
+ * write only affects that one call.
+ */
+static int sync_powermode_locked(struct legion_private *priv)
+{
+	int powermode;
+	int err = read_powermode(priv, &powermode);
+
+	if (err < 0)
+		return err;
+	priv->current_powermode = powermode;
+	return 0;
 }
 
 static ssize_t write_powermode(struct legion_private *priv,
@@ -4776,6 +7837,12 @@ static ssize_t write_powermode(struct legion_private *priv,
 
 	//TODO: remove again
 	pr_info("Set powermode\n");
+
+	if (value == LEGION_WMI_POWERMODE_CUSTOM &&
+	    custom_powermode_blocked(priv)) {
+		pr_info("Custom powermode needs AC on this model; the firmware would only park the request\n");
+		return -EOPNOTSUPP;
+	}
 
 	switch (priv->conf->access_method_powermode) {
 	case ACCESS_METHOD_EC:
@@ -4798,8 +7865,13 @@ static void toggle_powermode(struct legion_private *priv)
 {
 	int old_powermode;
 	int next_powermode;
+	int err;
 
-	read_powermode(priv, &old_powermode);
+	err = read_powermode(priv, &old_powermode);
+	if (err) {
+		pr_info("Failed to read powermode, skipping toggle: %d\n", err);
+		return;
+	}
 	next_powermode = old_powermode == 0 ? 1 : 0;
 
 	write_powermode(priv, next_powermode);
@@ -4815,6 +7887,11 @@ static void toggle_powermode(struct legion_private *priv)
 #define FCT_RAPID_CHARGE_OFF 0x08
 #define RAPID_CHARGE_ON 0x0
 #define RAPID_CHARGE_OFF 0x1
+
+#define FCT_CONSERVATION_ON 0x03
+#define FCT_CONSERVATION_OFF 0x05
+#define CONSERVATION_ON 0x0
+#define CONSERVATION_OFF 0x1
 
 static int acpi_read_rapidcharge(struct acpi_device *adev, bool *state)
 {
@@ -4846,6 +7923,31 @@ static int acpi_write_rapidcharge(struct acpi_device *adev, bool state)
 
 	err = exec_sbmc(adev, fct_nr);
 	pr_info("Set rapidcharge to %d by calling %lu: result: %d\n", state,
+		fct_nr, err);
+	return err;
+}
+
+static int acpi_read_conservation(struct acpi_device *adev, bool *state)
+{
+	unsigned long result;
+	int err;
+
+	err = eval_gbmd(adev, &result);
+	if (err)
+		return err;
+
+	*state = result & 0x20;
+	return 0;
+}
+
+static int acpi_write_conservation(struct acpi_device *adev, bool state)
+{
+	int err;
+	unsigned long fct_nr = state > 0 ? FCT_CONSERVATION_ON :
+					   FCT_CONSERVATION_OFF;
+
+	err = exec_sbmc(adev, fct_nr);
+	pr_info("Set conservation to %d by calling %lu: result: %d\n", state,
 		fct_nr, err);
 	return err;
 }
@@ -5016,19 +8118,20 @@ static void seq_file_print_with_error(struct seq_file *s, const char *name,
 				      ssize_t err, int value)
 {
 	seq_printf(s, "%s error: %ld\n", name, err);
-	seq_printf(s, "%s: %d\n", name, value);
+	if (!err)
+		seq_printf(s, "%s: %d\n", name, value);
 }
 
 static int debugfs_fancurve_show(struct seq_file *s, void *unused)
 {
 	struct legion_private *priv = s->private;
-	bool is_minifancurve;
-	bool is_lockfancontroller;
-	bool is_maximumfanspeed;
+	bool is_minifancurve = false;
+	bool is_lockfancontroller = false;
+	bool is_maximumfanspeed = false;
 	bool is_rapidcharge = false;
-	int powermode;
-	int temperature;
-	int fanspeed;
+	int powermode = 0;
+	int temperature = 0;
+	int fanspeed = 0;
 	int err;
 	unsigned long cfg;
 	struct fancurve wmi_fancurve;
@@ -5047,7 +8150,8 @@ static int debugfs_fancurve_show(struct seq_file *s, void *unused)
 	acpi_path = get_model_acpi_path(_model, ACPI_PATH_CFG);
 	err = eval_int(priv->adev, acpi_path, &cfg);
 	seq_printf(s, "ACPI CFG error: %d\n", err);
-	seq_printf(s, "ACPI CFG: %lu\n", cfg);
+	if (!err)
+		seq_printf(s, "ACPI CFG: %lu\n", cfg);
 
 	seq_printf(s, "temperature access method: %d\n",
 		   priv->conf->access_method_temperature);
@@ -5115,6 +8219,10 @@ static int debugfs_fancurve_show(struct seq_file *s, void *unused)
 	seq_file_print_with_error(s, "powermode ACPI", err, powermode);
 	err = wmi_read_powermode(&powermode);
 	seq_file_print_with_error(s, "powermode WMI", err, powermode);
+	if (priv->conf->ec_custom_mode_register)
+		seq_printf(s, "EC custom mode flags: 0x%02x\n",
+			   ecram_read(&priv->ecram,
+				      priv->conf->ec_custom_mode_register));
 	seq_printf(s, "has custom powermode: %d\n",
 		   priv->conf->has_custom_powermode);
 
@@ -5134,7 +8242,7 @@ static int debugfs_fancurve_show(struct seq_file *s, void *unused)
 		   legion_wmi_light_get(priv, LIGHT_ID_YLOGO, 0, 4));
 
 	seq_printf(s, "EC minifancurve feature enabled: %d\n",
-		   priv->conf->has_minifancurve);
+		   minifancurve_supported(priv->conf));
 	err = ec_read_minifancurve(&priv->ecram, priv->conf, &is_minifancurve);
 	seq_printf(s, "EC minifancurve on cool: %s\n",
 		   err ? "error" : (is_minifancurve ? "true" : "false"));
@@ -5163,8 +8271,11 @@ static int debugfs_fancurve_show(struct seq_file *s, void *unused)
 
 	seq_puts(s, "Current fan curve in hardware (WMI; might be empty)\n");
 	wmi_fancurve.size = 0;
-	err = wmi_read_fancurve_custom(priv->conf, &wmi_fancurve);
-	fancurve_print_seqfile(&wmi_fancurve, s);
+	err = wmi_read_fancurve_custom(priv, &wmi_fancurve);
+	if (err)
+		seq_printf(s, "WMI fancurve error: %d\n", err);
+	else
+		fancurve_print_seqfile(&wmi_fancurve, s);
 	seq_puts(s, "=====================\n");
 	return 0;
 }
@@ -5245,7 +8356,7 @@ static int show_simple_wmi_attribute_from_buffer(struct device *dev,
 
 	mutex_lock(&priv->fancurve_mutex);
 	err = wmi_exec_noarg_int_or_buffer(guid, instance, method_id, ressize,
-					     i, &value);
+					   i, &value);
 	mutex_unlock(&priv->fancurve_mutex);
 	if (err)
 		return err;
@@ -5259,7 +8370,7 @@ static int store_simple_wmi_attribute(struct device *dev,
 				      const char *guid, u8 instance,
 				      u32 method_id, bool invert, int scale)
 {
-	int state;
+	unsigned int state;
 	int err;
 	struct legion_private *priv = dev_get_drvdata(dev);
 
@@ -5319,12 +8430,31 @@ static DEVICE_ATTR_RW(lockfancontroller);
 // Fan ceiling unlock — see WMI_METHOD_ID_FAN_EXTREME_TOGGLE comment for context.
 // Cached state because the firmware exposes no clean read-back path; the value
 // reflects the last value successfully written through this attribute.
-static u8 fan_unlock_state;
+// Models with has_fan_unlock_readback report the live firmware state instead.
 
-static ssize_t fan_unlock_show(struct device *dev, struct device_attribute *attr,
-			       char *buf)
+static ssize_t fan_unlock_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%d\n", fan_unlock_state);
+	struct legion_private *priv = dev_get_drvdata(dev);
+	unsigned long res;
+	u8 state;
+	int err;
+
+	if (priv->conf->has_fan_unlock_readback) {
+		mutex_lock(&priv->fancurve_mutex);
+		err = wmi_exec_noarg_int(LEGION_WMI_GAMEZONE_GUID, 0,
+					 WMI_METHOD_ID_GETFANEXTREMESTATUS,
+					 &res);
+		mutex_unlock(&priv->fancurve_mutex);
+		if (err)
+			return err;
+		return sysfs_emit(buf, "%lu\n", res & 1);
+	}
+
+	mutex_lock(&priv->fancurve_mutex);
+	state = priv->fan_unlock_state;
+	mutex_unlock(&priv->fancurve_mutex);
+	return sysfs_emit(buf, "%d\n", state);
 }
 
 static ssize_t fan_unlock_store(struct device *dev,
@@ -5345,7 +8475,7 @@ static ssize_t fan_unlock_store(struct device *dev,
 	err = wmi_exec_arg(LEGION_WMI_GAMEZONE_GUID, 0,
 			   WMI_METHOD_ID_FAN_EXTREME_TOGGLE, &arg, sizeof(arg));
 	if (!err)
-		fan_unlock_state = arg;
+		priv->fan_unlock_state = arg;
 	mutex_unlock(&priv->fancurve_mutex);
 	if (err)
 		return -EIO;
@@ -5375,10 +8505,10 @@ static ssize_t rapidcharge_store(struct device *dev,
 				 size_t count)
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
-	int state;
+	bool state;
 	int err;
 
-	err = kstrtouint(buf, 0, &state);
+	err = kstrtobool(buf, &state);
 	if (err)
 		return err;
 
@@ -5392,6 +8522,157 @@ static ssize_t rapidcharge_store(struct device *dev,
 }
 
 static DEVICE_ATTR_RW(rapidcharge);
+
+static ssize_t battery_conservation_show(struct device *dev,
+					 struct device_attribute *attr,
+					 char *buf)
+{
+	bool state = false;
+	int err;
+	struct legion_private *priv = dev_get_drvdata(dev);
+
+	mutex_lock(&priv->fancurve_mutex);
+	err = acpi_read_conservation(priv->adev, &state);
+	mutex_unlock(&priv->fancurve_mutex);
+	if (err)
+		return err;
+
+	return sysfs_emit(buf, "%d\n", state);
+}
+
+static ssize_t battery_conservation_store(struct device *dev,
+					  struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	struct legion_private *priv = dev_get_drvdata(dev);
+	bool state;
+	int err;
+
+	err = kstrtobool(buf, &state);
+	if (err)
+		return err;
+
+	mutex_lock(&priv->fancurve_mutex);
+	/*
+	 * Conservation and rapid charge are mutually exclusive. The firmware
+	 * clears conservation when rapid charge is enabled, but not the other
+	 * way round; leaving both set makes ideapad-laptop's charge_types read
+	 * fail with -EINVAL. Turn rapid charge off first, as ideapad-laptop
+	 * does, and leave it alone when disabling conservation. If its state
+	 * can't be read, leave it alone too and still set conservation; only
+	 * a failed rapid charge write aborts.
+	 */
+	if (state) {
+		bool rapid;
+
+		if (!acpi_read_rapidcharge(priv->adev, &rapid) && rapid) {
+			err = acpi_write_rapidcharge(priv->adev, false);
+			if (err)
+				goto unlock;
+		}
+	}
+	err = acpi_write_conservation(priv->adev, state);
+unlock:
+	mutex_unlock(&priv->fancurve_mutex);
+	if (err)
+		return err;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(battery_conservation);
+
+static ssize_t fn_lock_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct legion_private *priv = dev_get_drvdata(dev);
+	unsigned long result;
+	int err;
+
+	mutex_lock(&priv->fancurve_mutex);
+	err = eval_hals(priv->adev, &result);
+	mutex_unlock(&priv->fancurve_mutex);
+	if (err)
+		return err;
+
+	return sysfs_emit(buf, "%d\n", !!(result & 0x0400));
+}
+
+static ssize_t fn_lock_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct legion_private *priv = dev_get_drvdata(dev);
+	bool enable;
+	int err;
+
+	if (kstrtobool(buf, &enable))
+		return -EINVAL;
+
+	mutex_lock(&priv->fancurve_mutex);
+	err = exec_sals(priv->adev, enable ? 0x0E : 0x0F);
+	mutex_unlock(&priv->fancurve_mutex);
+	if (err)
+		return err;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(fn_lock);
+
+#define FBSWIF_GUID                                                        \
+	EFI_GUID(0xD743491E, 0xF484, 0x4952, 0xA8, 0x7D, 0x8D, 0x5D, 0xD1, \
+		 0x89, 0xB7, 0x0C)
+#define FBSWIF_NAME L"FBSWIF"
+
+static ssize_t flip_to_start_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	u8 data[4] = { 0 };
+	efi_status_t status;
+	unsigned long size = sizeof(data);
+	u32 efi_attr;
+
+	status = efi.get_variable(FBSWIF_NAME, &FBSWIF_GUID, &efi_attr, &size,
+				  data);
+	if (status != EFI_SUCCESS)
+		return -EIO;
+
+	return sysfs_emit(buf, "%d\n", data[0] ? 1 : 0);
+}
+
+static ssize_t flip_to_start_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	bool state;
+	int err;
+	u8 data[4] = { 0 };
+	efi_status_t status;
+	unsigned long size;
+	u32 efi_attr;
+
+	err = kstrtobool(buf, &state);
+	if (err)
+		return err;
+
+	size = sizeof(data);
+	status = efi.get_variable(FBSWIF_NAME, &FBSWIF_GUID, &efi_attr, &size,
+				  data);
+	if (status != EFI_SUCCESS)
+		return -EIO;
+
+	data[0] = state ? 1 : 0;
+
+	size = sizeof(data);
+	status = efi.set_variable(FBSWIF_NAME, &FBSWIF_GUID, efi_attr, size,
+				  data);
+	if (status != EFI_SUCCESS)
+		return -EIO;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(flip_to_start);
 
 static ssize_t issupportgpuoc_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
@@ -5465,9 +8746,209 @@ static ssize_t touchpad_store(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR_RW(touchpad);
 
+/* On allowlisted 83LT/RLCN BIOS versions, WMAA 0x29 reads EC.MSMF;
+ * WMAA 0x2a issues SMI 0xca/0x25 (hybrid) or 0xca/0x26 (discrete).
+ * This requests a next-boot mode, not a live DRM connector switch.
+ */
+static const char * const rlcn_mux_bios_versions[] = {
+	"RLCN20WW", "RLCN21WW", "RLCN25WW", "RLCN26WW", "RLCN27WW",
+	"RLCN29WW", "RLCN31WW", "RLCN32WW", "RLCN33WW", "RLCN34WW",
+};
+
+static bool rlcn20_mux_supported(struct legion_private *priv)
+{
+	const char *bios = dmi_get_system_info(DMI_BIOS_VERSION);
+	size_t i;
+
+	if (priv->conf != &model_rlcn ||
+	    !dmi_match(DMI_PRODUCT_NAME, "83LT") || !bios)
+		return false;
+
+	for (i = 0; i < ARRAY_SIZE(rlcn_mux_bios_versions); i++)
+		if (!strcmp(bios, rlcn_mux_bios_versions[i]))
+			return true;
+
+	return false;
+}
+
+#define RLCN20_SETUP_GUID \
+	EFI_GUID(0xA04A27F4, 0xDF00, 0x4D42, 0xB5, 0x52, 0x39, 0x51, 0x13, \
+		 0x02, 0x11, 0x3D)
+#define RLCN20_SETUP_SIZE 700
+#define RLCN20_GRAPHICS_OFFSET 0x259
+
+enum rlcn20_graphics_mode {
+	RLCN20_UMA = 0,
+	RLCN20_DISCRETE = 1,
+	RLCN20_HYBRID = 4,
+};
+
+/* BIOS SetupUtility IFR: Graphics Device is Setup/SystemConfig byte 0x259.
+ * EC.MSMF is only one bit and cannot distinguish UMA from Hybrid.
+ */
+static int rlcn20_get_graphics_mode(u8 *mode)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	u8 setup[RLCN20_SETUP_SIZE];
+	unsigned long size = sizeof(setup);
+	efi_status_t status;
+	u32 attributes;
+	int err;
+
+	if (!efivar_is_available())
+		return -EOPNOTSUPP;
+
+	err = efivar_lock();
+	if (err)
+		return err;
+	status = efivar_get_variable(L"Setup", &RLCN20_SETUP_GUID,
+				     &attributes, &size, setup);
+	efivar_unlock();
+	if (status != EFI_SUCCESS)
+		return -EIO;
+	if (size != sizeof(setup))
+		return -EPROTO;
+
+	*mode = setup[RLCN20_GRAPHICS_OFFSET];
+	if (*mode != RLCN20_UMA && *mode != RLCN20_DISCRETE &&
+	    *mode != RLCN20_HYBRID)
+		return -EIO;
+	return 0;
+#else
+	/* The binary WMI status cannot distinguish UMA from hybrid. */
+	return -EOPNOTSUPP;
+#endif
+}
+
+/* These RLCN BIOSes expect a 32-bit WMI argument and Integer(0) acknowledgement.
+ * The acknowledgement does not indicate that the physical MUX has switched.
+ */
+static int rlcn20_wmi_set_gsync(u32 discrete)
+{
+	__le32 input = cpu_to_le32(discrete);
+	struct acpi_buffer params = { sizeof(input), &input };
+	unsigned long acknowledgement;
+	int err;
+
+	err = wmi_exec_int(LEGION_WMI_GAMEZONE_GUID, 0,
+			   WMI_METHOD_ID_SETGSYNCSTATUS, &params,
+			   &acknowledgement);
+	if (err)
+		return err;
+	return acknowledgement == 0 ? 0 : -EIO;
+}
+
+static int rlcn20_wmi_get_gsync(unsigned long *state)
+{
+	unsigned long capability;
+	int err;
+
+	err = wmi_exec_noarg_int(LEGION_WMI_GAMEZONE_GUID, 0,
+				 WMI_METHOD_ID_ISSUPPORTGSYNC, &capability);
+	if (err)
+		return err;
+	/* This BIOS implements WMAA(0x28) as a constant 0x02. */
+	if (capability != 2)
+		return -EOPNOTSUPP;
+
+	err = wmi_exec_noarg_int(LEGION_WMI_GAMEZONE_GUID, 0,
+				 WMI_METHOD_ID_GETGSYNCSTATUS, state);
+	if (err)
+		return err;
+	return *state <= 1 ? 0 : -EIO;
+}
+
+static int rlcn20_request_graphics_mode(struct legion_private *priv,
+					enum rlcn20_graphics_mode mode)
+{
+	unsigned long state;
+	int err;
+
+	if (ec_readonly || !allow_rlcn20_mux_write)
+		return -EPERM;
+	if (mode == RLCN20_UMA)
+		return -EOPNOTSUPP;
+	if (mode != RLCN20_DISCRETE && mode != RLCN20_HYBRID)
+		return -EINVAL;
+
+	mutex_lock(&priv->fancurve_mutex);
+	err = rlcn20_wmi_get_gsync(&state);
+	/* MSMF is the current mode, not the pending request. */
+	if (!err)
+		err = rlcn20_wmi_set_gsync(mode == RLCN20_DISCRETE);
+	mutex_unlock(&priv->fancurve_mutex);
+	if (!err)
+		dev_notice(&priv->platform_device->dev,
+			   "Requested %s graphics mode; verify PCI and eDP routing after reboot\n",
+			   mode == RLCN20_DISCRETE ? "discrete" : "hybrid");
+	return err;
+}
+
+static ssize_t graphics_mode_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct legion_private *priv = dev_get_drvdata(dev);
+	u8 raw;
+	int err;
+
+	if (!rlcn20_mux_supported(priv))
+		return -EOPNOTSUPP;
+
+	mutex_lock(&priv->fancurve_mutex);
+	err = rlcn20_get_graphics_mode(&raw);
+	mutex_unlock(&priv->fancurve_mutex);
+	if (err)
+		return err;
+
+	return sysfs_emit(buf, "%s\n",
+			  raw == RLCN20_UMA ? "integrated" :
+			  raw == RLCN20_DISCRETE ? "discrete" : "hybrid");
+}
+
+static ssize_t graphics_mode_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct legion_private *priv = dev_get_drvdata(dev);
+	enum rlcn20_graphics_mode mode;
+	int err;
+
+	if (!rlcn20_mux_supported(priv))
+		return -EOPNOTSUPP;
+	if (sysfs_streq(buf, "discrete"))
+		mode = RLCN20_DISCRETE;
+	else if (sysfs_streq(buf, "hybrid"))
+		mode = RLCN20_HYBRID;
+	else if (sysfs_streq(buf, "integrated"))
+		mode = RLCN20_UMA;
+	else
+		return -EINVAL;
+
+	err = rlcn20_request_graphics_mode(priv, mode);
+	return err ? err : count;
+}
+
+static DEVICE_ATTR_RW(graphics_mode);
+
 static ssize_t gsync_show(struct device *dev, struct device_attribute *attr,
 			  char *buf)
 {
+	struct legion_private *priv = dev_get_drvdata(dev);
+	u8 mode;
+	int err;
+
+	/* The legacy boolean cannot represent a third, UMA-only mode. */
+	if (rlcn20_mux_supported(priv)) {
+		mutex_lock(&priv->fancurve_mutex);
+		err = rlcn20_get_graphics_mode(&mode);
+		mutex_unlock(&priv->fancurve_mutex);
+		/* Keep the historical WMI read if EFI is unavailable. */
+		if (err == -EINTR || err == -ERESTARTSYS)
+			return err;
+		if (!err && mode == RLCN20_UMA)
+			return -EOPNOTSUPP;
+	}
+
 	return show_simple_wmi_attribute(dev, attr, buf,
 					 LEGION_WMI_GAMEZONE_GUID, 0,
 					 WMI_METHOD_ID_GETGSYNCSTATUS, true, 1);
@@ -5476,6 +8957,22 @@ static ssize_t gsync_show(struct device *dev, struct device_attribute *attr,
 static ssize_t gsync_store(struct device *dev, struct device_attribute *attr,
 			   const char *buf, size_t count)
 {
+	struct legion_private *priv = dev_get_drvdata(dev);
+	bool hybrid;
+	int err;
+
+	/* The existing GUI/CLI uses gsync as a Hybrid Mode boolean. Do not
+	 * let it bypass the RLCN BIOS opt-in or accept non-boolean values.
+	 */
+	if (rlcn20_mux_supported(priv)) {
+		err = kstrtobool(buf, &hybrid);
+		if (err)
+			return err;
+		err = rlcn20_request_graphics_mode(priv, hybrid ? RLCN20_HYBRID :
+							  RLCN20_DISCRETE);
+		return err ? err : count;
+	}
+
 	return store_simple_wmi_attribute(dev, attr, buf, count,
 					  LEGION_WMI_GAMEZONE_GUID, 0,
 					  WMI_METHOD_ID_SETGSYNCSTATUS, true,
@@ -5677,7 +9174,8 @@ static ssize_t issupportgsync_show(struct device *dev,
 {
 	return show_simple_wmi_attribute(dev, attr, buf,
 					 LEGION_WMI_GAMEZONE_GUID, 0,
-					 WMI_METHOD_ID_ISSUPPORTGSYNC, false, 1);
+					 WMI_METHOD_ID_ISSUPPORTGSYNC, false,
+					 1);
 }
 
 static DEVICE_ATTR_RO(issupportgsync);
@@ -5701,8 +9199,8 @@ static ssize_t cpu_oc_store(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR_RW(cpu_oc);
 
-static ssize_t wmi_common_method_other_show(struct legion_private *priv, char *buf,
-				      int feature_id)
+static ssize_t wmi_common_method_other_show(struct legion_private *priv,
+					    char *buf, int feature_id)
 {
 	int err, out;
 
@@ -5716,22 +9214,79 @@ static ssize_t wmi_common_method_other_show(struct legion_private *priv, char *b
 	return sysfs_emit(buf, "%d\n", out);
 }
 
+/*
+ * The capdata01 row for a feature (id bits 31..16) in a power mode (bits
+ * 15..8) with sub-id 0 (bits 7..0), if the firmware marks it supported.
+ * Shared by the write clamping and the exported per-mode defaults, so both
+ * always agree on which row applies.
+ */
+static const struct capdata01 *
+capdata01_lookup(const struct legion_private *priv, u32 fkey, int powermode)
+{
+	int i;
+
+	for (i = 0; i < priv->capdata_count; i++) {
+		const struct capdata01 *p = &priv->capdata[i];
+
+		if ((p->id >> 16) == fkey &&
+		    ((p->id >> 8) & 0xFF) == (u32)powermode &&
+		    (p->id & 0xFF) == 0 && (p->supported & BIT(0)))
+			return p;
+	}
+	return NULL;
+}
+
+static int clamped_value(struct legion_private *priv,
+			 enum OtherMethodFeature feature, const char *buf,
+			 int *value)
+{
+	const struct capdata01 *cd = NULL;
+	const struct discrete_feature *df = NULL;
+	u32 fkey = (u32)feature >> 16;
+	int powermode;
+	int i, err;
+
+	err = kstrtoint(buf, 10, value);
+	if (err)
+		return err;
+
+	/* Snapshot: powermode_store() may update the cache once we unlock. */
+	mutex_lock(&priv->fancurve_mutex);
+	sync_powermode_locked(priv);
+	powermode = priv->current_powermode;
+	mutex_unlock(&priv->fancurve_mutex);
+
+	cd = capdata01_lookup(priv, fkey, powermode);
+
+	for (i = 0; i < priv->discrete_feature_count; i++) {
+		if ((priv->discrete_features[i].feature_id >> 16) == fkey) {
+			df = &priv->discrete_features[i];
+			break;
+		}
+	}
+
+	*value = capdata_clamp(cd, *value, df);
+	return 0;
+}
+
 static ssize_t wmi_common_method_other_store(struct legion_private *priv,
 					     const char *buf, size_t count,
-					     int feature_id)
+					     enum OtherMethodFeature feature_id)
 {
-	// TODO:  use DEV, TYP, FEA, plus Powermode as key to lookup
-	// on capability data CD0, CD1 for :
-	//  - if feature is enabled for laptop model
-	//  - if value (DAT1) is valid (on/off, exact value, step, range)
+	/*
+	 * Writes are clamped to the ranges the firmware publishes in
+	 * LENOVO_CAPABILITY_DATA_01 / LENOVO_DISCRETE_DATA for the current
+	 * power mode; features without a capability row pass through
+	 * unchanged (see clamped_value).
+	 */
 	int err, value, output;
 
-	err = kstrtoint(buf, 0, &value);
+	err = clamped_value(priv, feature_id, buf, &value);
 	if (err)
 		return err;
 
 	if (priv->conf->power_writes_custom_only) {
-		int powermode;
+		int powermode = -1;
 
 		err = read_powermode(priv, &powermode);
 		if (err || powermode != LEGION_WMI_POWERMODE_CUSTOM) {
@@ -5751,57 +9306,66 @@ static ssize_t wmi_common_method_other_store(struct legion_private *priv,
 	return count;
 }
 
-static int clamped_value(struct legion_private *priv,
-			 enum OtherMethodFeature feature,
-			 const char *buf, int *value)
+/*
+ * Like wmi_common_method_other_store(), but for a boolean: parsed with
+ * kstrtobool, so no capability-data clamping is needed. Keep the two in
+ * step if the common store changes.
+ */
+static ssize_t instant_boot_store(struct device *dev, const char *buf,
+				  size_t count,
+				  enum OtherMethodFeature feature_id)
 {
-	const struct capdata01 *cd = NULL;
-	const struct discrete_feature *df = NULL;
-	u32 fkey = (u32)feature >> 16;
-	int i, err;
+	struct legion_private *priv = dev_get_drvdata(dev);
+	bool enable;
+	int err, output;
 
-	err = kstrtoint(buf, 10, value);
+	if (kstrtobool(buf, &enable))
+		return -EINVAL;
+
+	mutex_lock(&priv->fancurve_mutex);
+	err = wmi_other_method_set_value(feature_id, enable, &output);
+	mutex_unlock(&priv->fancurve_mutex);
 	if (err)
-		return err;
+		return -EINVAL;
 
-	for (i = 0; i < priv->capdata_count; i++) {
-		const struct capdata01 *p = &priv->capdata[i];
-
-		if ((p->id >> 16) == fkey &&
-		    ((p->id >> 8) & 0xFF) == (u32)priv->current_powermode &&
-		    (p->id & 0xFF) == 0 && (p->supported & BIT(0))) {
-			cd = p;
-			break;
-		}
-	}
-
-	for (i = 0; i < priv->discrete_feature_count; i++) {
-		if ((priv->discrete_features[i].feature_id >> 16) == fkey) {
-			df = &priv->discrete_features[i];
-			break;
-		}
-	}
-
-	*value = capdata_clamp(cd, *value, df);
-	return 0;
+	return count;
 }
 
-static ssize_t wmi_clamped_store(struct legion_private *priv,
-				 const char *buf, size_t count,
-				 enum OtherMethodFeature feature)
+static ssize_t instant_boot_ac_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
 {
-	char clamped_buf[16];
-	int value, err;
-
-	err = clamped_value(priv, feature, buf, &value);
-	if (err)
-		return err;
-
-	snprintf(clamped_buf, sizeof(clamped_buf), "%d", value);
-	err = wmi_common_method_other_store(priv, clamped_buf,
-					    strlen(clamped_buf), feature);
-	return err < 0 ? err : count;
+	return wmi_common_method_other_show(dev_get_drvdata(dev), buf,
+					    OtherMethodFeature_INSTANT_BOOT_AC);
 }
+
+static ssize_t instant_boot_ac_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	return instant_boot_store(dev, buf, count,
+				  OtherMethodFeature_INSTANT_BOOT_AC);
+}
+
+static DEVICE_ATTR_RW(instant_boot_ac);
+
+static ssize_t instant_boot_usb_pd_show(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	return wmi_common_method_other_show(
+		dev_get_drvdata(dev), buf,
+		OtherMethodFeature_INSTANT_BOOT_USB_PD);
+}
+
+static ssize_t instant_boot_usb_pd_store(struct device *dev,
+					 struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	return instant_boot_store(dev, buf, count,
+				  OtherMethodFeature_INSTANT_BOOT_USB_PD);
+}
+
+static DEVICE_ATTR_RW(instant_boot_usb_pd);
 
 static ssize_t cpu_shortterm_powerlimit_show(struct device *dev,
 					     struct device_attribute *attr,
@@ -5811,13 +9375,14 @@ static ssize_t cpu_shortterm_powerlimit_show(struct device *dev,
 	struct legion_private *priv = dev_get_drvdata(dev);
 
 	switch (priv->conf->access_method_powerlimits) {
-	case ACCESS_METHOD_WMI3_CLAMPED:
 	case ACCESS_METHOD_WMI3:
-		return wmi_common_method_other_show(priv, buf, OtherMethodFeature_CPU_SHORT_TERM_POWER_LIMIT);
+		return wmi_common_method_other_show(
+			priv, buf,
+			OtherMethodFeature_CPU_SHORT_TERM_POWER_LIMIT);
 	default:
 		err = show_simple_wmi_attribute_from_buffer(
-				dev, attr, buf, WMI_GUID_LENOVO_CPU_METHOD, 0,
-				WMI_METHOD_ID_CPU_GET_SHORTTERM_POWERLIMIT, 16, 0, 1);
+			dev, attr, buf, WMI_GUID_LENOVO_CPU_METHOD, 0,
+			WMI_METHOD_ID_CPU_GET_SHORTTERM_POWERLIMIT, 16, 0, 1);
 	}
 	return err;
 }
@@ -5829,40 +9394,36 @@ static ssize_t cpu_shortterm_powerlimit_store(struct device *dev,
 	int value, err;
 	struct legion_private *priv = dev_get_drvdata(dev);
 
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3_CLAMPED) {
-		char clamped_buf[16];
-
-		err = clamped_value(priv,
-				    OtherMethodFeature_CPU_SHORT_TERM_POWER_LIMIT,
-				    buf, &value);
-		if (err)
-			return err;
-
+	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3) {
+		/*
+		 * PL1/PL2 coupling: keep the long-term limit at or below
+		 * the short-term one (only models with has_pl_coupling).
+		 * Both writes go through wmi_common_method_other_store(),
+		 * which clamps against the capability data.
+		 */
 		if (priv->cpu_pl_coupling) {
 			int pl1;
 
-			if (!wmi_other_method_get_value(
-				    OtherMethodFeature_CPU_LONG_TERM_POWER_LIMIT, &pl1)
-			    && pl1 > value) {
-				char pl1_buf[16];
+			err = clamped_value(
+				priv,
+				OtherMethodFeature_CPU_SHORT_TERM_POWER_LIMIT,
+				buf, &value);
+			if (err)
+				return err;
 
-				snprintf(pl1_buf, sizeof(pl1_buf), "%d", value);
-				wmi_common_method_other_store(priv, pl1_buf,
-							      strlen(pl1_buf),
-							      OtherMethodFeature_CPU_LONG_TERM_POWER_LIMIT);
-			}
+			if (!wmi_other_method_get_value(
+				    OtherMethodFeature_CPU_LONG_TERM_POWER_LIMIT,
+				    &pl1) &&
+			    pl1 > value)
+				wmi_common_method_other_store(
+					priv, buf, count,
+					OtherMethodFeature_CPU_LONG_TERM_POWER_LIMIT);
 		}
 
-		snprintf(clamped_buf, sizeof(clamped_buf), "%d", value);
-		err = wmi_common_method_other_store(priv, clamped_buf,
-						    strlen(clamped_buf),
-						    OtherMethodFeature_CPU_SHORT_TERM_POWER_LIMIT);
-		return err < 0 ? err : count;
+		return wmi_common_method_other_store(
+			priv, buf, count,
+			OtherMethodFeature_CPU_SHORT_TERM_POWER_LIMIT);
 	}
-
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
-		return wmi_common_method_other_store(priv, buf, count,
-						     OtherMethodFeature_CPU_SHORT_TERM_POWER_LIMIT);
 
 	return store_simple_wmi_attribute(
 		dev, attr, buf, count, WMI_GUID_LENOVO_CPU_METHOD, 0,
@@ -5879,13 +9440,14 @@ static ssize_t cpu_longterm_powerlimit_show(struct device *dev,
 	struct legion_private *priv = dev_get_drvdata(dev);
 
 	switch (priv->conf->access_method_powerlimits) {
-	case ACCESS_METHOD_WMI3_CLAMPED:
 	case ACCESS_METHOD_WMI3:
-		return wmi_common_method_other_show(priv, buf, OtherMethodFeature_CPU_LONG_TERM_POWER_LIMIT);
+		return wmi_common_method_other_show(
+			priv, buf,
+			OtherMethodFeature_CPU_LONG_TERM_POWER_LIMIT);
 	default:
-	  err = show_simple_wmi_attribute_from_buffer(
-				dev, attr, buf, WMI_GUID_LENOVO_CPU_METHOD, 0,
-				WMI_METHOD_ID_CPU_GET_LONGTERM_POWERLIMIT, 16, 0, 1);
+		err = show_simple_wmi_attribute_from_buffer(
+			dev, attr, buf, WMI_GUID_LENOVO_CPU_METHOD, 0,
+			WMI_METHOD_ID_CPU_GET_LONGTERM_POWERLIMIT, 16, 0, 1);
 	}
 	return err;
 }
@@ -5897,40 +9459,36 @@ static ssize_t cpu_longterm_powerlimit_store(struct device *dev,
 	int value, err;
 	struct legion_private *priv = dev_get_drvdata(dev);
 
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3_CLAMPED) {
-		char clamped_buf[16];
-
-		err = clamped_value(priv,
-				    OtherMethodFeature_CPU_LONG_TERM_POWER_LIMIT,
-				    buf, &value);
-		if (err)
-			return err;
-
+	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3) {
+		/*
+		 * PL1/PL2 coupling: keep the short-term limit at or above
+		 * the long-term one (only models with has_pl_coupling).
+		 * Both writes go through wmi_common_method_other_store(),
+		 * which clamps against the capability data.
+		 */
 		if (priv->cpu_pl_coupling) {
 			int pl2;
 
-			if (!wmi_other_method_get_value(
-				    OtherMethodFeature_CPU_SHORT_TERM_POWER_LIMIT, &pl2)
-			    && value > pl2) {
-				char pl2_buf[16];
+			err = clamped_value(
+				priv,
+				OtherMethodFeature_CPU_LONG_TERM_POWER_LIMIT,
+				buf, &value);
+			if (err)
+				return err;
 
-				snprintf(pl2_buf, sizeof(pl2_buf), "%d", value);
-				wmi_common_method_other_store(priv, pl2_buf,
-							      strlen(pl2_buf),
-							      OtherMethodFeature_CPU_SHORT_TERM_POWER_LIMIT);
-			}
+			if (!wmi_other_method_get_value(
+				    OtherMethodFeature_CPU_SHORT_TERM_POWER_LIMIT,
+				    &pl2) &&
+			    value > pl2)
+				wmi_common_method_other_store(
+					priv, buf, count,
+					OtherMethodFeature_CPU_SHORT_TERM_POWER_LIMIT);
 		}
 
-		snprintf(clamped_buf, sizeof(clamped_buf), "%d", value);
-		err = wmi_common_method_other_store(priv, clamped_buf,
-						    strlen(clamped_buf),
-						    OtherMethodFeature_CPU_LONG_TERM_POWER_LIMIT);
-		return err < 0 ? err : count;
+		return wmi_common_method_other_store(
+			priv, buf, count,
+			OtherMethodFeature_CPU_LONG_TERM_POWER_LIMIT);
 	}
-
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
-		return wmi_common_method_other_store(priv, buf, count,
-						     OtherMethodFeature_CPU_LONG_TERM_POWER_LIMIT);
 
 	return store_simple_wmi_attribute(
 		dev, attr, buf, count, WMI_GUID_LENOVO_CPU_METHOD, 0,
@@ -5981,14 +9539,15 @@ static ssize_t cpu_peak_powerlimit_show(struct device *dev,
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
 
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
-		return wmi_common_method_other_show(priv, buf,
-						    OtherMethodFeature_CPU_PEAK_POWER_LIMIT);
-
-	return show_simple_wmi_attribute(dev, attr, buf,
-					 WMI_GUID_LENOVO_GPU_METHOD, 0,
-					 WMI_METHOD_ID_CPU_GET_PEAK_POWERLIMIT,
-					 false, 1);
+	switch (priv->conf->access_method_powerlimits) {
+	case ACCESS_METHOD_WMI3:
+		return wmi_common_method_other_show(
+			priv, buf, OtherMethodFeature_CPU_PEAK_POWER_LIMIT);
+	default:
+		return show_simple_wmi_attribute(
+			dev, attr, buf, WMI_GUID_LENOVO_GPU_METHOD, 0,
+			WMI_METHOD_ID_CPU_GET_PEAK_POWERLIMIT, false, 1);
+	}
 }
 
 static ssize_t cpu_peak_powerlimit_store(struct device *dev,
@@ -5998,8 +9557,9 @@ static ssize_t cpu_peak_powerlimit_store(struct device *dev,
 	struct legion_private *priv = dev_get_drvdata(dev);
 
 	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
-		return wmi_common_method_other_store(priv, buf, count,
-						     OtherMethodFeature_CPU_PEAK_POWER_LIMIT);
+		return wmi_common_method_other_store(
+			priv, buf, count,
+			OtherMethodFeature_CPU_PEAK_POWER_LIMIT);
 
 	return store_simple_wmi_attribute(dev, attr, buf, count,
 					  WMI_GUID_LENOVO_GPU_METHOD, 0,
@@ -6015,13 +9575,15 @@ static ssize_t cpu_apu_sppt_powerlimit_show(struct device *dev,
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
 
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
-		return wmi_common_method_other_show(priv, buf,
-						    OtherMethodFeature_APU_PPT_POWER_LIMIT);
-
-	return show_simple_wmi_attribute(
-		dev, attr, buf, WMI_GUID_LENOVO_GPU_METHOD, 0,
-		WMI_METHOD_ID_CPU_GET_APU_SPPT_POWERLIMIT, false, 1);
+	switch (priv->conf->access_method_powerlimits) {
+	case ACCESS_METHOD_WMI3:
+		return wmi_common_method_other_show(
+			priv, buf, OtherMethodFeature_APU_PPT_POWER_LIMIT);
+	default:
+		return show_simple_wmi_attribute(
+			dev, attr, buf, WMI_GUID_LENOVO_GPU_METHOD, 0,
+			WMI_METHOD_ID_CPU_GET_APU_SPPT_POWERLIMIT, false, 1);
+	}
 }
 
 static ssize_t cpu_apu_sppt_powerlimit_store(struct device *dev,
@@ -6031,8 +9593,9 @@ static ssize_t cpu_apu_sppt_powerlimit_store(struct device *dev,
 	struct legion_private *priv = dev_get_drvdata(dev);
 
 	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
-		return wmi_common_method_other_store(priv, buf, count,
-						     OtherMethodFeature_APU_PPT_POWER_LIMIT);
+		return wmi_common_method_other_store(
+			priv, buf, count,
+			OtherMethodFeature_APU_PPT_POWER_LIMIT);
 
 	return store_simple_wmi_attribute(
 		dev, attr, buf, count, WMI_GUID_LENOVO_GPU_METHOD, 0,
@@ -6049,13 +9612,15 @@ static ssize_t cpu_cross_loading_powerlimit_show(struct device *dev,
 	struct legion_private *priv = dev_get_drvdata(dev);
 
 	switch (priv->conf->access_method_powerlimits) {
-	case ACCESS_METHOD_WMI3_CLAMPED:
 	case ACCESS_METHOD_WMI3:
-		return wmi_common_method_other_show(priv, buf, OtherMethodFeature_CPU_CROSS_LOAD_POWER_LIMIT);
+		return wmi_common_method_other_show(
+			priv, buf,
+			OtherMethodFeature_CPU_CROSS_LOAD_POWER_LIMIT);
 	default:
 		err = show_simple_wmi_attribute(
-				dev, attr, buf, WMI_GUID_LENOVO_GPU_METHOD, 0,
-				WMI_METHOD_ID_CPU_GET_CROSS_LOADING_POWERLIMIT, false, 1);
+			dev, attr, buf, WMI_GUID_LENOVO_GPU_METHOD, 0,
+			WMI_METHOD_ID_CPU_GET_CROSS_LOADING_POWERLIMIT, false,
+			1);
 	}
 	return err;
 }
@@ -6066,13 +9631,10 @@ static ssize_t cpu_cross_loading_powerlimit_store(struct device *dev,
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
 
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3_CLAMPED)
-		return wmi_clamped_store(priv, buf, count,
-					 OtherMethodFeature_CPU_CROSS_LOAD_POWER_LIMIT);
-
 	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
-		return wmi_common_method_other_store(priv, buf, count,
-						     OtherMethodFeature_CPU_CROSS_LOAD_POWER_LIMIT);
+		return wmi_common_method_other_store(
+			priv, buf, count,
+			OtherMethodFeature_CPU_CROSS_LOAD_POWER_LIMIT);
 
 	return store_simple_wmi_attribute(
 		dev, attr, buf, count, WMI_GUID_LENOVO_GPU_METHOD, 0,
@@ -6084,31 +9646,20 @@ static DEVICE_ATTR_RW(cpu_cross_loading_powerlimit);
 static ssize_t gpu_oc_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
-	int err;
-	struct legion_private *priv = dev_get_drvdata(dev);
-
-	switch (priv->conf->access_method_powerlimits) {
-	case ACCESS_METHOD_WMI3_CLAMPED:
-		return wmi_common_method_other_show(priv, buf,
-						    OtherMethodFeature_GPU_POWER_BOOST);
-	default:
-		err = show_simple_wmi_attribute(dev, attr, buf,
-						WMI_GUID_LENOVO_GPU_METHOD, 0,
-						WMI_METHOD_ID_GPU_GET_OC_STATUS, false,
-						1);
-	}
-	return err;
+	/*
+	 * The Other Method GUID has no GPU OC feature; on models using it
+	 * for power limits the boost budget is gpu_ppab_powerlimit instead
+	 * (0x0201), and gpu_oc is hidden there (legion_attribute_uses_gpu_wmi).
+	 */
+	return show_simple_wmi_attribute(dev, attr, buf,
+					 WMI_GUID_LENOVO_GPU_METHOD, 0,
+					 WMI_METHOD_ID_GPU_GET_OC_STATUS, false,
+					 1);
 }
 
 static ssize_t gpu_oc_store(struct device *dev, struct device_attribute *attr,
 			    const char *buf, size_t count)
 {
-	struct legion_private *priv = dev_get_drvdata(dev);
-
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3_CLAMPED)
-		return wmi_clamped_store(priv, buf, count,
-					 OtherMethodFeature_GPU_POWER_BOOST);
-
 	return store_simple_wmi_attribute(dev, attr, buf, count,
 					  WMI_GUID_LENOVO_GPU_METHOD, 0,
 					  WMI_METHOD_ID_GPU_SET_OC_STATUS,
@@ -6123,13 +9674,9 @@ static ssize_t gpu_ppab_powerlimit_show(struct device *dev,
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
 
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3_CLAMPED)
-		return wmi_common_method_other_show(priv, buf,
-						    OtherMethodFeature_GPU_POWER_BOOST);
-
 	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
-		return wmi_common_method_other_show(priv, buf,
-						    OtherMethodFeature_GPU_POWER_BOOST);
+		return wmi_common_method_other_show(
+			priv, buf, OtherMethodFeature_GPU_POWER_BOOST);
 
 	return show_simple_wmi_attribute_from_buffer(
 		dev, attr, buf, WMI_GUID_LENOVO_GPU_METHOD, 0,
@@ -6142,13 +9689,9 @@ static ssize_t gpu_ppab_powerlimit_store(struct device *dev,
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
 
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3_CLAMPED)
-		return wmi_clamped_store(priv, buf, count,
-					 OtherMethodFeature_GPU_POWER_BOOST);
-
 	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
-		return wmi_common_method_other_store(priv, buf, count,
-						     OtherMethodFeature_GPU_POWER_BOOST);
+		return wmi_common_method_other_store(
+			priv, buf, count, OtherMethodFeature_GPU_POWER_BOOST);
 
 	return store_simple_wmi_attribute(dev, attr, buf, count,
 					  WMI_GUID_LENOVO_GPU_METHOD, 0,
@@ -6166,13 +9709,13 @@ static ssize_t gpu_ctgp_powerlimit_show(struct device *dev,
 	struct legion_private *priv = dev_get_drvdata(dev);
 
 	switch (priv->conf->access_method_powerlimits) {
-	case ACCESS_METHOD_WMI3_CLAMPED:
 	case ACCESS_METHOD_WMI3:
-		return wmi_common_method_other_show(priv, buf, OtherMethodFeature_GPU_cTGP);
+		return wmi_common_method_other_show(
+			priv, buf, OtherMethodFeature_GPU_cTGP);
 	default:
 		err = show_simple_wmi_attribute_from_buffer(
-				dev, attr, buf, WMI_GUID_LENOVO_GPU_METHOD, 0,
-				WMI_METHOD_ID_GPU_GET_CTGP_POWERLIMIT, 16, 0, 1);
+			dev, attr, buf, WMI_GUID_LENOVO_GPU_METHOD, 0,
+			WMI_METHOD_ID_GPU_GET_CTGP_POWERLIMIT, 16, 0, 1);
 	}
 	return err;
 }
@@ -6183,13 +9726,9 @@ static ssize_t gpu_ctgp_powerlimit_store(struct device *dev,
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
 
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3_CLAMPED)
-		return wmi_clamped_store(priv, buf, count,
-					 OtherMethodFeature_GPU_cTGP);
-
 	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
-		return wmi_common_method_other_store(priv, buf, count,
-						     OtherMethodFeature_GPU_cTGP);
+		return wmi_common_method_other_store(
+			priv, buf, count, OtherMethodFeature_GPU_cTGP);
 
 	return store_simple_wmi_attribute(dev, attr, buf, count,
 					  WMI_GUID_LENOVO_GPU_METHOD, 0,
@@ -6229,13 +9768,13 @@ static ssize_t gpu_temperature_limit_show(struct device *dev,
 	struct legion_private *priv = dev_get_drvdata(dev);
 
 	switch (priv->conf->access_method_powerlimits) {
-	case ACCESS_METHOD_WMI3_CLAMPED:
 	case ACCESS_METHOD_WMI3:
-		return wmi_common_method_other_show(priv, buf, OtherMethodFeature_GPU_TEMPERATURE_LIMIT);
+		return wmi_common_method_other_show(
+			priv, buf, OtherMethodFeature_GPU_TEMPERATURE_LIMIT);
 	default:
 		err = show_simple_wmi_attribute(
-				dev, attr, buf, WMI_GUID_LENOVO_GPU_METHOD, 0,
-				WMI_METHOD_ID_GPU_GET_TEMPERATURE_LIMIT, false, 1);
+			dev, attr, buf, WMI_GUID_LENOVO_GPU_METHOD, 0,
+			WMI_METHOD_ID_GPU_GET_TEMPERATURE_LIMIT, false, 1);
 	}
 	return err;
 }
@@ -6246,13 +9785,10 @@ static ssize_t gpu_temperature_limit_store(struct device *dev,
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
 
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3_CLAMPED)
-		return wmi_clamped_store(priv, buf, count,
-					 OtherMethodFeature_GPU_TEMPERATURE_LIMIT);
-
 	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
-		return wmi_common_method_other_store(priv, buf, count,
-						     OtherMethodFeature_GPU_TEMPERATURE_LIMIT);
+		return wmi_common_method_other_store(
+			priv, buf, count,
+			OtherMethodFeature_GPU_TEMPERATURE_LIMIT);
 
 	return store_simple_wmi_attribute(
 		dev, attr, buf, count, WMI_GUID_LENOVO_GPU_METHOD, 0,
@@ -6263,17 +9799,15 @@ static ssize_t cpu_temperature_limit_show(struct device *dev,
 					  struct device_attribute *attr,
 					  char *buf)
 {
-	int err;
 	struct legion_private *priv = dev_get_drvdata(dev);
 
 	switch (priv->conf->access_method_powerlimits) {
-	case ACCESS_METHOD_WMI3_CLAMPED:
 	case ACCESS_METHOD_WMI3:
-		return wmi_common_method_other_show(priv, buf, OtherMethodFeature_CPU_TEMPERATURE_LIMIT);
+		return wmi_common_method_other_show(
+			priv, buf, OtherMethodFeature_CPU_TEMPERATURE_LIMIT);
 	default:
 		return -EINVAL;
 	}
-	return err;
 }
 
 static ssize_t cpu_temperature_limit_store(struct device *dev,
@@ -6282,69 +9816,67 @@ static ssize_t cpu_temperature_limit_store(struct device *dev,
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
 
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3_CLAMPED)
-		return wmi_clamped_store(priv, buf, count,
-					 OtherMethodFeature_CPU_TEMPERATURE_LIMIT);
+	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
+		return wmi_common_method_other_store(
+			priv, buf, count,
+			OtherMethodFeature_CPU_TEMPERATURE_LIMIT);
 
 	return -EINVAL;
 }
 
 static ssize_t cpu_l1_tau_show(struct device *dev,
-					  struct device_attribute *attr,
-					  char *buf)
+			       struct device_attribute *attr, char *buf)
 {
-	int err;
 	struct legion_private *priv = dev_get_drvdata(dev);
 
 	switch (priv->conf->access_method_powerlimits) {
-	case ACCESS_METHOD_WMI3_CLAMPED:
 	case ACCESS_METHOD_WMI3:
-		return wmi_common_method_other_show(priv, buf, OtherMethodFeature_CPU_L1_TAU);
+		return wmi_common_method_other_show(
+			priv, buf, OtherMethodFeature_CPU_L1_TAU);
 	default:
 		return -EINVAL;
 	}
-	return err;
 }
 
 static ssize_t cpu_l1_tau_store(struct device *dev,
-					   struct device_attribute *attr,
-					   const char *buf, size_t count)
+				struct device_attribute *attr, const char *buf,
+				size_t count)
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
 
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3_CLAMPED)
-		return wmi_clamped_store(priv, buf, count,
-					 OtherMethodFeature_CPU_L1_TAU);
+	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
+		return wmi_common_method_other_store(
+			priv, buf, count, OtherMethodFeature_CPU_L1_TAU);
 
 	return -EINVAL;
 }
 
 static ssize_t gpu_power_target_offset_show(struct device *dev,
-					  struct device_attribute *attr,
-					  char *buf)
+					    struct device_attribute *attr,
+					    char *buf)
 {
-	int err;
 	struct legion_private *priv = dev_get_drvdata(dev);
 
 	switch (priv->conf->access_method_powerlimits) {
-	case ACCESS_METHOD_WMI3_CLAMPED:
 	case ACCESS_METHOD_WMI3:
-		return wmi_common_method_other_show(priv, buf, OtherMethodFeature_GPU_POWER_TARGET_ON_AC_OFFSET_FROM_BASELINE);
+		return wmi_common_method_other_show(
+			priv, buf,
+			OtherMethodFeature_GPU_POWER_TARGET_ON_AC_OFFSET_FROM_BASELINE);
 	default:
 		return -EINVAL;
 	}
-	return err;
 }
 
 static ssize_t gpu_power_target_offset_store(struct device *dev,
-					   struct device_attribute *attr,
-					   const char *buf, size_t count)
+					     struct device_attribute *attr,
+					     const char *buf, size_t count)
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
 
-	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3_CLAMPED)
-		return wmi_clamped_store(priv, buf, count,
-					 OtherMethodFeature_GPU_POWER_TARGET_ON_AC_OFFSET_FROM_BASELINE);
+	if (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3)
+		return wmi_common_method_other_store(
+			priv, buf, count,
+			OtherMethodFeature_GPU_POWER_TARGET_ON_AC_OFFSET_FROM_BASELINE);
 
 	return -EINVAL;
 }
@@ -6381,20 +9913,43 @@ static ssize_t fan_fullspeed_show(struct device *dev,
 	return sysfs_emit(buf, "%d\n", state);
 }
 
+static int fanfullspeed_write_allowed(struct legion_private *priv, bool state)
+{
+	int powermode;
+	int err;
+
+	if (!state || !priv->conf->fanfullspeed_requires_custom_powermode)
+		return 0;
+
+	err = read_fan_control_mode(priv, &powermode);
+	if (err)
+		return err;
+
+	if (powermode != LEGION_WMI_POWERMODE_CUSTOM) {
+		pr_info("fan_fullspeed needs powermode %d (custom), current is %d\n",
+			LEGION_WMI_POWERMODE_CUSTOM, powermode);
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
 static ssize_t fan_fullspeed_store(struct device *dev,
 				   struct device_attribute *attr,
 				   const char *buf, size_t count)
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
-	int state;
+	bool state;
 	int err;
 
-	err = kstrtouint(buf, 0, &state);
+	err = kstrtobool(buf, &state);
 	if (err)
 		return err;
 
 	mutex_lock(&priv->fancurve_mutex);
 	err = fan_control_write_allowed(priv);
+	if (!err)
+		err = fanfullspeed_write_allowed(priv, state);
 	if (!err)
 		err = write_fanfullspeed(priv, state);
 	mutex_unlock(&priv->fancurve_mutex);
@@ -6434,7 +9989,8 @@ static ssize_t powermode_show(struct device *dev, struct device_attribute *attr,
 	int power_mode;
 
 	mutex_lock(&priv->fancurve_mutex);
-	read_powermode(priv, &power_mode);
+	sync_powermode_locked(priv);
+	power_mode = priv->current_powermode;
 	mutex_unlock(&priv->fancurve_mutex);
 	return sysfs_emit(buf, "%d\n", power_mode);
 }
@@ -6450,20 +10006,31 @@ static ssize_t powermode_store(struct device *dev,
 			       size_t count)
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
-	int powermode;
+	unsigned int powermode;
 	int err;
 
 	err = kstrtouint(buf, 0, &powermode);
 	if (err)
 		return err;
 
+	switch (powermode) {
+	case LEGION_WMI_POWERMODE_LOW_POWER:
+	case LEGION_WMI_POWERMODE_BALANCED:
+	case LEGION_WMI_POWERMODE_PERFORMANCE:
+	case LEGION_WMI_POWERMODE_CUSTOM:
+	case LEGION_WMI_POWERMODE_MAX_POWER:
+		break;
+	default:
+		return -EINVAL;
+	}
+
 	mutex_lock(&priv->fancurve_mutex);
 	err = write_powermode(priv, powermode);
+	if (!err)
+		priv->current_powermode = powermode;
 	mutex_unlock(&priv->fancurve_mutex);
 	if (err)
 		return -EINVAL;
-
-	priv->current_powermode = powermode;
 
 	// TODO: better?
 	// we have to wait a bit before change is done in hardware and
@@ -6481,14 +10048,179 @@ static ssize_t powermode_store(struct device *dev,
 
 static DEVICE_ATTR_RW(powermode);
 
+static ssize_t fantable_ladder_show(const struct fantable_ladder *ladder,
+				    char *buf)
+{
+	ssize_t count = 0;
+	int i;
+
+	for (i = 0; i < ladder->level_count; i++)
+		count += sysfs_emit_at(buf, count, i ? " %u" : "%u",
+				       ladder->rpms[i]);
+	count += sysfs_emit_at(buf, count, "\n");
+
+	return count;
+}
+
+static ssize_t fan1_level_rpm_table_show(struct device *dev,
+					 struct device_attribute *attr,
+					 char *buf)
+{
+	struct legion_private *priv = dev_get_drvdata(dev);
+	ssize_t err;
+
+	mutex_lock(&priv->fancurve_mutex);
+	err = fantable_ensure(priv);
+	if (!err) {
+		if (priv->fantable_fan1_valid)
+			err = fantable_ladder_show(&priv->fantable_fan1, buf);
+		else
+			err = -ENODATA;
+	}
+	mutex_unlock(&priv->fancurve_mutex);
+
+	return err;
+}
+
+static ssize_t fan2_level_rpm_table_show(struct device *dev,
+					 struct device_attribute *attr,
+					 char *buf)
+{
+	struct legion_private *priv = dev_get_drvdata(dev);
+	ssize_t err;
+
+	mutex_lock(&priv->fancurve_mutex);
+	err = fantable_ensure(priv);
+	if (!err) {
+		if (priv->fantable_fan2_valid)
+			err = fantable_ladder_show(&priv->fantable_fan2, buf);
+		else
+			err = -ENODATA;
+	}
+	mutex_unlock(&priv->fancurve_mutex);
+
+	return err;
+}
+
+static DEVICE_ATTR_RO(fan1_level_rpm_table);
+static DEVICE_ATTR_RO(fan2_level_rpm_table);
+
+/*
+ * Firmware defaults of a CPU power limit per power mode, from
+ * LENOVO_CAPABILITY_DATA_01 (feature id in bits 31..16, mode in bits
+ * 15..8). Some firmware applies power limits itself only in custom mode
+ * (Q7CN: the WMAE setters update the live EC limits only when ODV1 == 3)
+ * and leaves the other modes to OEM software, so userspace (legiond) needs
+ * these values to apply the right limits on a mode change.
+ */
+static const struct {
+	u8 mode;
+	const char *profile;
+} powerlimit_default_modes[] = {
+	{ LEGION_WMI_POWERMODE_LOW_POWER, "low-power" },
+	{ LEGION_WMI_POWERMODE_BALANCED, "balanced" },
+	{ LEGION_WMI_POWERMODE_PERFORMANCE, "performance" },
+	{ LEGION_WMI_POWERMODE_MAX_POWER, "max-power" },
+	{ LEGION_WMI_POWERMODE_CUSTOM, "custom" },
+};
+
+static bool powerlimit_defaults_available(const struct legion_private *priv,
+					  enum OtherMethodFeature feature)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(powerlimit_default_modes); i++) {
+		if (capdata01_lookup(priv, (u32)feature >> 16,
+				     powerlimit_default_modes[i].mode))
+			return true;
+	}
+	return false;
+}
+
+/* "profile:watts" for every mode the firmware publishes a default for */
+static ssize_t powerlimit_defaults_show(const struct legion_private *priv,
+					char *buf,
+					enum OtherMethodFeature feature)
+{
+	ssize_t count = 0;
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(powerlimit_default_modes); i++) {
+		const struct capdata01 *cd =
+			capdata01_lookup(priv, (u32)feature >> 16,
+					 powerlimit_default_modes[i].mode);
+
+		if (!cd)
+			continue;
+		count += sysfs_emit_at(buf, count, "%s%s:%u", count ? " " : "",
+				       powerlimit_default_modes[i].profile,
+				       cd->default_value);
+	}
+	if (!count)
+		return -ENODATA;
+	count += sysfs_emit_at(buf, count, "\n");
+
+	return count;
+}
+
+static ssize_t
+cpu_longterm_powerlimit_defaults_show(struct device *dev,
+				      struct device_attribute *attr, char *buf)
+{
+	return powerlimit_defaults_show(
+		dev_get_drvdata(dev), buf,
+		OtherMethodFeature_CPU_LONG_TERM_POWER_LIMIT);
+}
+
+static ssize_t
+cpu_shortterm_powerlimit_defaults_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	return powerlimit_defaults_show(
+		dev_get_drvdata(dev), buf,
+		OtherMethodFeature_CPU_SHORT_TERM_POWER_LIMIT);
+}
+
+static DEVICE_ATTR_RO(cpu_longterm_powerlimit_defaults);
+static DEVICE_ATTR_RO(cpu_shortterm_powerlimit_defaults);
+
+static ssize_t fancurve_speed_unit_show(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	struct legion_private *priv = dev_get_drvdata(dev);
+	enum fan_speed_unit unit = FAN_SPEED_UNIT_RPM_HUNDRED;
+
+	if (priv->conf->access_method_fancurve == ACCESS_METHOD_WMI3)
+		unit = wmi_fancurve_speed_unit(priv->conf);
+	if (unit == FAN_SPEED_UNIT_LEVEL)
+		return sysfs_emit(buf, "level\n");
+	if (unit == FAN_SPEED_UNIT_RPM_HUNDRED)
+		return sysfs_emit(buf, "rpm\n");
+	return sysfs_emit(buf, "percent\n");
+}
+
+static DEVICE_ATTR_RO(fancurve_speed_unit);
+
 static struct attribute *legion_sysfs_attributes[] = {
+	&dev_attr_fancurve_speed_unit.attr,
+	&dev_attr_fan1_level_rpm_table.attr,
+	&dev_attr_fan2_level_rpm_table.attr,
+	&dev_attr_cpu_longterm_powerlimit_defaults.attr,
+	&dev_attr_cpu_shortterm_powerlimit_defaults.attr,
 	&dev_attr_powermode.attr,
 	&dev_attr_lockfancontroller.attr,
 	&dev_attr_fan_unlock.attr,
 	&dev_attr_rapidcharge.attr,
+	&dev_attr_battery_conservation.attr,
+	&dev_attr_fn_lock.attr,
+	&dev_attr_flip_to_start.attr,
+	&dev_attr_instant_boot_ac.attr,
+	&dev_attr_instant_boot_usb_pd.attr,
 	&dev_attr_winkey.attr,
 	&dev_attr_touchpad.attr,
 	&dev_attr_gsync.attr,
+	&dev_attr_graphics_mode.attr,
 	&dev_attr_powerchargemode.attr,
 	&dev_attr_overdrive.attr,
 	&dev_attr_cpumaxfrequency.attr,
@@ -6527,11 +10259,13 @@ static struct attribute *legion_sysfs_attributes[] = {
 static bool legion_rapidcharge_is_supported(struct legion_private *priv)
 {
 	return acpi_method_exists(
-		priv->adev, get_model_acpi_path(priv->conf,
-						 ACPI_PATH_READ_RAPIDCHARGE)) &&
+		       priv->adev,
+		       get_model_acpi_path(priv->conf,
+					   ACPI_PATH_READ_RAPIDCHARGE)) &&
 	       acpi_method_exists(
-		priv->adev, get_model_acpi_path(priv->conf,
-						 ACPI_PATH_WRITE_RAPIDCHARGE));
+		       priv->adev,
+		       get_model_acpi_path(priv->conf,
+					   ACPI_PATH_WRITE_RAPIDCHARGE));
 }
 
 static bool legion_attribute_uses_cpu_wmi(const struct attribute *attr)
@@ -6633,6 +10367,20 @@ static bool legion_gamezone_feature_supported(struct legion_private *priv,
 	return !err && value != 0;
 }
 
+/*
+ * These three are read and written as Other Method feature ids, so their
+ * show/store handlers only implement ACCESS_METHOD_WMI3 and return -EINVAL
+ * for every other access method. Gate them here: on configs with no
+ * access_method_powerlimits set (model_v0, model_efcn, ...) they would
+ * otherwise appear in sysfs as permanently unreadable files.
+ */
+static bool legion_attribute_uses_wmi3_powerlimits(const struct attribute *attr)
+{
+	return attr == &dev_attr_cpu_temperature_limit.attr ||
+	       attr == &dev_attr_cpu_l1_tau.attr ||
+	       attr == &dev_attr_gpu_power_target_offset.attr;
+}
+
 static umode_t legion_sysfs_is_visible(struct kobject *kobj,
 				       struct attribute *attr, int idx)
 {
@@ -6641,6 +10389,10 @@ static umode_t legion_sysfs_is_visible(struct kobject *kobj,
 
 	if (!priv)
 		return attr->mode;
+	if (attr == &dev_attr_graphics_mode.attr)
+		return rlcn20_mux_supported(priv) &&
+		       wmi_has_guid(LEGION_WMI_GAMEZONE_GUID) ?
+		       attr->mode : 0;
 
 	if (attr == &dev_attr_rapidcharge.attr)
 		return legion_rapidcharge_is_supported(priv) ? attr->mode : 0;
@@ -6657,26 +10409,78 @@ static umode_t legion_sysfs_is_visible(struct kobject *kobj,
 		return 0;
 
 	if (legion_power_limit_attribute(attr) &&
-	    (priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3 ||
-	     priv->conf->access_method_powerlimits ==
-		     ACCESS_METHOD_WMI3_CLAMPED) &&
+	    priv->conf->access_method_powerlimits == ACCESS_METHOD_WMI3 &&
 	    !legion_wmi3_power_limit_supported(priv, attr))
 		return 0;
 
+	if (attr == &dev_attr_battery_conservation.attr)
+		return legion_rapidcharge_is_supported(priv) ? attr->mode : 0;
+	if (attr == &dev_attr_overdrive.attr) {
+		unsigned long supported;
+
+		/*
+		 * Hide it only when the firmware answers that the panel has no
+		 * overdrive (Q7CN OLED: IsSupportOD checks PANT & 0x02 and the
+		 * get/set methods then do nothing); keep it when the query
+		 * fails, as before.
+		 */
+		if (!wmi_exec_noarg_int(LEGION_WMI_GAMEZONE_GUID, 0,
+					WMI_METHOD_ID_ISSUPPORTOD,
+					&supported) &&
+		    supported == 0)
+			return 0;
+	}
+	if (attr == &dev_attr_fn_lock.attr)
+		return priv->conf->has_fn_lock ? attr->mode : 0;
+	if (attr == &dev_attr_flip_to_start.attr)
+		return priv->conf->has_flip_to_start ? attr->mode : 0;
+	if (attr == &dev_attr_instant_boot_ac.attr ||
+	    attr == &dev_attr_instant_boot_usb_pd.attr)
+		return priv->conf->has_instant_boot ? attr->mode : 0;
 	if (legion_attribute_uses_cpu_wmi(attr) &&
 	    !wmi_has_guid(WMI_GUID_LENOVO_CPU_METHOD))
 		return 0;
 	if (legion_attribute_uses_gpu_wmi(attr) &&
 	    !wmi_has_guid(WMI_GUID_LENOVO_GPU_METHOD))
 		return 0;
+	if (legion_attribute_uses_wmi3_powerlimits(attr) &&
+	    priv->conf->access_method_powerlimits != ACCESS_METHOD_WMI3)
+		return 0;
+
+	if (attr == &dev_attr_powermode.attr &&
+	    priv->conf->access_method_powermode == ACCESS_METHOD_NO_ACCESS)
+		return 0;
 
 	if (attr == &dev_attr_fan_fullspeed.attr &&
 	    priv->conf->access_method_fanfullspeed == ACCESS_METHOD_NO_ACCESS)
 		return 0;
 
+	if (attr == &dev_attr_fancurve_speed_unit.attr &&
+	    priv->conf->access_method_fancurve == ACCESS_METHOD_NO_ACCESS)
+		return 0;
+
+	if (attr == &dev_attr_cpu_longterm_powerlimit_defaults.attr)
+		return powerlimit_defaults_available(
+			       priv,
+			       OtherMethodFeature_CPU_LONG_TERM_POWER_LIMIT) ?
+			       attr->mode :
+			       0;
+	if (attr == &dev_attr_cpu_shortterm_powerlimit_defaults.attr)
+		return powerlimit_defaults_available(
+			       priv,
+			       OtherMethodFeature_CPU_SHORT_TERM_POWER_LIMIT) ?
+			       attr->mode :
+			       0;
+
+	if ((attr == &dev_attr_fan1_level_rpm_table.attr ||
+	     attr == &dev_attr_fan2_level_rpm_table.attr) &&
+	    !(priv->conf->access_method_fancurve == ACCESS_METHOD_WMI3 &&
+	      wmi_fancurve_speed_unit(priv->conf) == FAN_SPEED_UNIT_LEVEL &&
+	      wmi_has_guid(WMI_GUID_LENOVO_FANTABLE_DATA)))
+		return 0;
+
 	if (priv->conf->skip_oc_controls &&
-	    (attr == &dev_attr_cpu_oc.attr ||
-	     attr == &dev_attr_gpu_oc.attr ||
+	    (attr == &dev_attr_cpu_oc.attr || attr == &dev_attr_gpu_oc.attr ||
 	     attr == &dev_attr_cpu_shortterm_powerlimit.attr ||
 	     attr == &dev_attr_cpu_longterm_powerlimit.attr ||
 	     attr == &dev_attr_cpu_peak_powerlimit.attr ||
@@ -6691,12 +10495,30 @@ static umode_t legion_sysfs_is_visible(struct kobject *kobj,
 	     attr == &dev_attr_gpu_boost_clock.attr))
 		return 0;
 
+	if (priv->conf->skip_unusable_oc_attrs &&
+	    (attr == &dev_attr_cpu_oc.attr || attr == &dev_attr_gpu_oc.attr ||
+	     attr == &dev_attr_cpu_peak_powerlimit.attr ||
+	     attr == &dev_attr_cpu_default_powerlimit.attr ||
+	     attr == &dev_attr_cpu_apu_sppt_powerlimit.attr ||
+	     attr == &dev_attr_cpu_cross_loading_powerlimit.attr ||
+	     attr == &dev_attr_gpu_default_ppab_ctrgp_powerlimit.attr ||
+	     attr == &dev_attr_gpu_temperature_limit.attr ||
+	     attr == &dev_attr_gpu_boost_clock.attr))
+		return 0;
+
 	if (attr == &dev_attr_cpu_pl_coupling.attr &&
 	    !priv->conf->has_pl_coupling)
 		return 0;
 
-	if (attr == &dev_attr_fan_unlock.attr &&
-	    !priv->conf->has_fan_unlock)
+	if (attr == &dev_attr_fan_unlock.attr && !priv->conf->has_fan_unlock)
+		return 0;
+
+	if (attr == &dev_attr_fan_maxspeed.attr &&
+	    priv->conf->skip_fan_maxspeed)
+		return 0;
+
+	if (attr == &dev_attr_lockfancontroller.attr &&
+	    !lockfancontroller_supported(priv->conf))
 		return 0;
 
 	return attr->mode;
@@ -6740,6 +10562,10 @@ enum LEGION_WMI_EVENT {
 
 struct legion_wmi_private {
 	enum LEGION_WMI_EVENT event;
+	/* GameZone method block: it has no notify id, so binding it never
+	 * delivers events; this driver calls its methods by GUID either way.
+	 */
+	bool gamezone_method_block;
 };
 
 //static void legion_wmi_notify2(u32 value, void *context)
@@ -6747,10 +10573,62 @@ struct legion_wmi_private {
 //	pr_info("WMI notify\n" );
 //    }
 
+
+/* =============================  */
+/* FN hotkeys (gamezone event)    */
+/* =============================  */
+/*
+ * The EC reports FN-key presses as the scancode in the payload of the
+ * GAMEZONE WMI event (the "8FC0DE0C-..." device on Legion 5/7). Only the
+ * event type used to be logged, so nothing reached userspace. Report the
+ * known scancodes as proper input keys; the desktop then decides what a
+ * refresh-rate toggle means.
+ */
+static const struct key_entry legion_fn_keymap[] = {
+	{ KE_KEY, 0x10, { KEY_REFRESH_RATE_TOGGLE } },	/* Fn+R on Legion 5/7 */
+	{ KE_KEY, 0x0a, { KEY_REFRESH_RATE_TOGGLE } },	/* Fn+R on some Yogas */
+	{ KE_END },
+};
+
+static struct input_dev *legion_fn_input;
+
+static void legion_fn_report(u32 scancode)
+{
+	int err;
+
+	if (!legion_fn_input) {
+		struct input_dev *idev = input_allocate_device();
+
+		if (!idev)
+			return;
+		idev->name = "Legion WMI hotkeys";
+		idev->phys = "legion/input0";
+		idev->id.bustype = BUS_HOST;
+
+		err = sparse_keymap_setup(idev, legion_fn_keymap, NULL);
+		if (err) {
+			input_free_device(idev);
+			return;
+		}
+		err = input_register_device(idev);
+		if (err) {
+			input_free_device(idev);
+			return;
+		}
+		legion_fn_input = idev;
+	}
+
+	sparse_keymap_report_event(legion_fn_input, scancode, 1, true);
+}
+
 static void legion_wmi_notify(struct wmi_device *wdev, union acpi_object *data)
 {
 	struct legion_wmi_private *wpriv;
 	struct legion_private *priv;
+	u32 scancode = 0;
+
+	if (data && data->type == ACPI_TYPE_INTEGER)
+		scancode = (u32)data->integer.value;
 
 	mutex_lock(&legion_shared_mutex);
 	priv = legion_shared;
@@ -6769,8 +10647,10 @@ static void legion_wmi_notify(struct wmi_device *wdev, union acpi_object *data)
 		//legion_platform_profile_notify();
 		break;
 	default:
-		pr_info("Event: legion type: %d;  acpi type: %d (%d=integer)",
-			wpriv->event, data->type, ACPI_TYPE_INTEGER);
+		pr_info("Event: legion type: %d;  acpi type: %d (%d=integer) scancode=0x%x",
+			wpriv->event, data ? data->type : -1, ACPI_TYPE_INTEGER, scancode);
+		if (wpriv->event == LEGION_WMI_EVENT_GAMEZONE)
+			legion_fn_report(scancode);
 		break;
 	}
 	mutex_unlock(&legion_shared_mutex);
@@ -6785,7 +10665,8 @@ static void legion_wmi_notify(struct wmi_device *wdev, union acpi_object *data)
 		return;
 	}
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
-	legion_platform_profile_notify(priv->ppdev);
+	if (priv)
+		legion_platform_profile_notify(priv->ppdev);
 #else
 	legion_platform_profile_notify();
 #endif
@@ -6794,7 +10675,21 @@ static void legion_wmi_notify(struct wmi_device *wdev, union acpi_object *data)
 
 static int legion_wmi_probe(struct wmi_device *wdev, const void *context)
 {
+	const struct legion_wmi_private *ctx = context;
 	struct legion_wmi_private *wpriv;
+	bool leave_unbound = false;
+
+	if (ctx->gamezone_method_block) {
+		mutex_lock(&legion_shared_mutex);
+		leave_unbound = legion_shared &&
+				legion_shared->conf->leave_gamezone_wmi_unbound;
+		mutex_unlock(&legion_shared_mutex);
+	}
+	if (leave_unbound) {
+		dev_info(&wdev->dev,
+			 "Leaving GameZone WMI to lenovo-wmi-gamezone\n");
+		return -ENODEV;
+	}
 
 	wpriv = devm_kzalloc(&wdev->dev, sizeof(*wpriv), GFP_KERNEL);
 	if (!wpriv)
@@ -6809,6 +10704,10 @@ static int legion_wmi_probe(struct wmi_device *wdev, const void *context)
 
 static const struct legion_wmi_private legion_wmi_context_gamezone = {
 	.event = LEGION_WMI_EVENT_GAMEZONE
+};
+static const struct legion_wmi_private legion_wmi_context_gamezone_methods = {
+	.event = LEGION_WMI_EVENT_GAMEZONE,
+	.gamezone_method_block = true
 };
 static const struct legion_wmi_private legion_wmi_context_a = {
 	.event = LEGION_EVENT_A
@@ -6841,7 +10740,7 @@ static const struct legion_wmi_private legion_wmi_context_f = {
 //#define LEGION_WMI_GUID_GAMEZONE_DATA_EVENT  "887b54e3-dddc-4b2c-8b88-68a26a8835d0"
 
 static const struct wmi_device_id legion_wmi_ids[] = {
-	{ LEGION_WMI_GAMEZONE_GUID, &legion_wmi_context_gamezone },
+	{ LEGION_WMI_GAMEZONE_GUID, &legion_wmi_context_gamezone_methods },
 	{ LEGION_WMI_GUID_FAN_EVENT, &legion_wmi_context_a },
 	{ LEGION_WMI_GUID_FAN2_EVENT, &legion_wmi_context_b },
 	{ LEGION_WMI_GUID_GAMEZONE_KEY_EVENT, &legion_wmi_context_c },
@@ -6940,11 +10839,13 @@ static int legion_platform_profile_get(struct platform_profile_handler *pprof,
 		*profile = PLATFORM_PROFILE_CUSTOM;
 		break;
 #endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
 	case LEGION_WMI_POWERMODE_MAX_POWER:
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
 		*profile = PLATFORM_PROFILE_MAX_POWER;
-		break;
+#else
+		*profile = PLATFORM_PROFILE_PERFORMANCE;
 #endif
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -7006,11 +10907,13 @@ static int legion_platform_profile_probe(void *drvdata, unsigned long *choices)
 	set_bit(PLATFORM_PROFILE_BALANCED, choices);
 	set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
-	if (conf_has_custom_powermode && conf_access_method_powermode == ACCESS_METHOD_WMI)
+	if (conf_has_custom_powermode &&
+	    conf_access_method_powermode == ACCESS_METHOD_WMI)
 		set_bit(PLATFORM_PROFILE_CUSTOM, choices);
 #endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
-	if (conf_has_extreme_powermode && conf_access_method_powermode == ACCESS_METHOD_WMI)
+	if (conf_has_extreme_powermode &&
+	    conf_access_method_powermode == ACCESS_METHOD_WMI)
 		set_bit(PLATFORM_PROFILE_MAX_POWER, choices);
 #endif
 	return 0;
@@ -7036,6 +10939,11 @@ static int legion_platform_profile_init(struct legion_private *priv)
 		return 0;
 	}
 
+	if (priv->conf->access_method_powermode == ACCESS_METHOD_NO_ACCESS) {
+		pr_info("Skipping creating platform profile support because this model has no powermode access method\n");
+		return 0;
+	}
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
 	conf_has_custom_powermode = priv->conf->has_custom_powermode;
 	conf_has_extreme_powermode = priv->conf->has_extreme_powermode;
@@ -7046,7 +10954,8 @@ static int legion_platform_profile_init(struct legion_private *priv)
 	priv->platform_profile_handler.profile_set =
 		legion_platform_profile_set;
 
-	set_bit(PLATFORM_PROFILE_LOW_POWER, priv->platform_profile_handler.choices);
+	set_bit(PLATFORM_PROFILE_LOW_POWER,
+		priv->platform_profile_handler.choices);
 	set_bit(PLATFORM_PROFILE_BALANCED,
 		priv->platform_profile_handler.choices);
 	set_bit(PLATFORM_PROFILE_PERFORMANCE,
@@ -7068,7 +10977,8 @@ static int legion_platform_profile_init(struct legion_private *priv)
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
-	priv->ppdev = devm_platform_profile_register(dev, "lenovo-legion", priv, &legion_platform_profile_ops);
+	priv->ppdev = devm_platform_profile_register(
+		dev, "lenovo-legion", priv, &legion_platform_profile_ops);
 	if (IS_ERR(priv->ppdev))
 		return PTR_ERR(priv->ppdev);
 #else
@@ -7110,37 +11020,37 @@ static ssize_t sensor_label_show(struct device *dev,
 
 	switch (sensor_id) {
 	case SENSOR_CPU_TEMP_ID:
-		label = "CPU Temperature\n";
+		label = "CPU Temperature";
 		break;
 	case SENSOR_GPU_TEMP_ID:
-		label = "GPU Temperature\n";
+		label = "GPU Temperature";
 		break;
 	case SENSOR_IC_TEMP_ID:
-		label = "IC Temperature\n";
+		label = "IC Temperature";
 		break;
 	case SENSOR_FAN1_RPM_ID:
-		label = "Fan 1\n";
+		label = "Fan 1";
 		break;
 	case SENSOR_FAN2_RPM_ID:
-		label = "Fan 2\n";
+		label = "Fan 2";
 		break;
 	case SENSOR_FAN3_RPM_ID:
-		label = "Fan 3\n";
+		label = "Fan 3";
 		break;
 	case SENSOR_FAN4_RPM_ID:
-		label = "Fan 4\n";
+		label = "Fan 4";
 		break;
 	case SENSOR_FAN1_TARGET_RPM_ID:
-		label = "Fan 1 Target\n";
+		label = "Fan 1 Target";
 		break;
 	case SENSOR_FAN2_TARGET_RPM_ID:
-		label = "Fan 2 Target\n";
+		label = "Fan 2 Target";
 		break;
 	default:
 		return -EOPNOTSUPP;
 	}
 
-	return sprintf(buf, label);
+	return sysfs_emit(buf, "%s\n", label);
 }
 
 // TODO: use one common function (like here) or one function per attribute?
@@ -7156,11 +11066,13 @@ static ssize_t sensor_show(struct device *dev, struct device_attribute *devattr,
 	switch (sensor_id) {
 	case SENSOR_CPU_TEMP_ID:
 		err = read_temperature(priv, 0, &outval);
-		outval *= 1000;
+		if (!err)
+			outval *= 1000;
 		break;
 	case SENSOR_GPU_TEMP_ID:
 		err = read_temperature(priv, 1, &outval);
-		outval *= 1000;
+		if (!err)
+			outval *= 1000;
 		break;
 	case SENSOR_IC_TEMP_ID:
 		ec_read_sensor_values(&priv->ecram, priv->conf, &values);
@@ -7196,7 +11108,7 @@ static ssize_t sensor_show(struct device *dev, struct device_attribute *devattr,
 	if (err)
 		return err;
 
-	return sprintf(buf, "%d\n", outval);
+	return sysfs_emit(buf, "%d\n", outval);
 }
 
 static SENSOR_DEVICE_ATTR_RO(temp1_input, sensor, SENSOR_CPU_TEMP_ID);
@@ -7239,7 +11151,32 @@ static struct attribute *sensor_hwmon_attributes[] = {
 static ssize_t fan_max_show(struct device *dev,
 			    struct device_attribute *devattr, char *buf)
 {
-	return sprintf(buf, "%d\n", MAX_RPM);
+	struct legion_private *priv = dev_get_drvdata(dev);
+	int channel = to_sensor_dev_attr(devattr)->index;
+	const struct fantable_ladder *ladder;
+
+	/* Prefer the firmware's per-level fan table when the model has it:
+	 * the row's current_fan_max_speed is the fan's real maximum.
+	 */
+	ladder = channel == 1 ? &priv->fantable_fan2 : &priv->fantable_fan1;
+	if (priv->conf->has_fancurve_defaults &&
+	    priv->conf->access_method_fancurve == ACCESS_METHOD_WMI3) {
+		mutex_lock(&priv->fancurve_mutex);
+		if (!fantable_ensure(priv) &&
+		    (channel == 1 ? priv->fantable_fan2_valid :
+				    priv->fantable_fan1_valid)) {
+			int max_rpm = ladder->max_rpm;
+
+			mutex_unlock(&priv->fancurve_mutex);
+			return sysfs_emit(buf, "%d\n", max_rpm);
+		}
+		mutex_unlock(&priv->fancurve_mutex);
+	}
+
+	if (priv && priv->conf->fan_max_rpm)
+		return sysfs_emit(buf, "%d\n", priv->conf->fan_max_rpm);
+
+	return sysfs_emit(buf, "%d\n", MAX_RPM);
 }
 
 static ssize_t autopoint_show(struct device *dev,
@@ -7308,7 +11245,7 @@ static ssize_t autopoint_show(struct device *dev,
 	}
 	if (!ok)
 		value = 0;
-	return sprintf(buf, "%d\n", value);
+	return sysfs_emit(buf, "%d\n", value);
 }
 
 static ssize_t autopoint_store(struct device *dev,
@@ -7324,8 +11261,9 @@ static ssize_t autopoint_store(struct device *dev,
 	int point_id = to_sensor_dev_attr_2(devattr)->index;
 	bool write_fancurve_size = false;
 
-	if (priv->conf->wmi_fancurve_speed_only &&
-	    fancurve_attr_id != FANCURVE_ATTR_PWM1)
+	if (!fancurve_attr_supported(priv->conf, fancurve_attr_id) ||
+	    (fancurve_attr_id == FANCURVE_SIZE &&
+	     priv->conf->access_method_fancurve != ACCESS_METHOD_EC))
 		return -EOPNOTSUPP;
 
 	if (!(point_id >= 0 && point_id < MAXFANCURVESIZE)) {
@@ -7343,7 +11281,9 @@ static ssize_t autopoint_store(struct device *dev,
 	}
 
 	mutex_lock(&priv->fancurve_mutex);
-	err = fan_control_write_allowed(priv);
+	err = fancurve_write_allowed(priv->conf);
+	if (!err)
+		err = fan_control_write_allowed(priv);
 	if (err)
 		goto error_mutex;
 	err = read_fancurve(priv, &fancurve);
@@ -7420,7 +11360,8 @@ error:
 	return err;
 }
 
-static ssize_t fancurve_defaults_powermode_store(struct device *dev,
+static ssize_t
+fancurve_defaults_powermode_store(struct device *dev,
 				  struct device_attribute *devattr,
 				  const char *buf, size_t count)
 {
@@ -7431,7 +11372,8 @@ static ssize_t fancurve_defaults_powermode_store(struct device *dev,
 	err = kstrtoint(buf, 0, &value);
 	if (err) {
 		err = -1;
-		pr_info("Parsing fancurve_defaults_powermode store failed: error:%d\n", err);
+		pr_info("Parsing fancurve_defaults_powermode store failed: error:%d\n",
+			err);
 		goto error;
 	}
 
@@ -7441,7 +11383,8 @@ static ssize_t fancurve_defaults_powermode_store(struct device *dev,
 	      value == LEGION_WMI_POWERMODE_CUSTOM ||
 	      value == LEGION_WMI_POWERMODE_MAX_POWER)) {
 		err = -1;
-		pr_info("Parsing fancurve_defaults_powermode store failed invalid powermode id %d: error:%d\n", value, err);
+		pr_info("Parsing fancurve_defaults_powermode store failed invalid powermode id %d: error:%d\n",
+			value, err);
 		goto error;
 	}
 
@@ -7453,6 +11396,13 @@ static ssize_t fancurve_defaults_powermode_store(struct device *dev,
 		goto error_unlock;
 	}
 	fancurve_defaults_powermode = value;
+	/*
+	 * The firmware defaults replace the table, so the remembered user
+	 * curve must not be re-applied over them after resume, nor returned
+	 * by read_fancurve() as the cached curve if a later read fails.
+	 */
+	priv->resume_fancurve_valid = false;
+	priv->fancurve_valid = false;
 	mutex_unlock(&priv->fancurve_mutex);
 	return count;
 
@@ -7462,7 +11412,8 @@ error:
 	return err;
 }
 
-static ssize_t fancurve_defaults_powermode_show(struct device *dev,
+static ssize_t
+fancurve_defaults_powermode_show(struct device *dev,
 				 struct device_attribute *devattr, char *buf)
 {
 	struct legion_private *priv = dev_get_drvdata(dev);
@@ -7474,7 +11425,7 @@ static ssize_t fancurve_defaults_powermode_show(struct device *dev,
 	// set to 0 if not in CUSTOM mode (pressed Fn-Q)
 	if (power_mode != LEGION_WMI_POWERMODE_CUSTOM)
 		fancurve_defaults_powermode = 0;
-	return sprintf(buf, "%d\n", fancurve_defaults_powermode);
+	return sysfs_emit(buf, "%d\n", fancurve_defaults_powermode);
 }
 
 // pwm1
@@ -7500,7 +11451,7 @@ static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point9_pwm, autopoint,
 static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point10_pwm, autopoint,
 			       FANCURVE_ATTR_PWM1, 9);
 // pwm2
-static SENSOR_DEVICE_ATTR_RO(fan2_max, fan_max, 0);
+static SENSOR_DEVICE_ATTR_RO(fan2_max, fan_max, 1);
 static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point1_pwm, autopoint,
 			       FANCURVE_ATTR_PWM2, 0);
 static SENSOR_DEVICE_ATTR_2_RW(pwm2_auto_point2_pwm, autopoint,
@@ -7691,7 +11642,8 @@ static SENSOR_DEVICE_ATTR_2_RW(pwm1_auto_point10_decel, autopoint,
 			       FANCURVE_ATTR_DECEL, 9);
 //size
 static SENSOR_DEVICE_ATTR_2_RW(auto_points_size, autopoint, FANCURVE_SIZE, 0);
-static SENSOR_DEVICE_ATTR_2_RW(fancurve_defaults_powermode, fancurve_defaults_powermode, 0, 0);
+static SENSOR_DEVICE_ATTR_2_RW(fancurve_defaults_powermode,
+			       fancurve_defaults_powermode, 0, 0);
 
 static ssize_t minifancurve_show(struct device *dev,
 				 struct device_attribute *devattr, char *buf)
@@ -7703,16 +11655,15 @@ static ssize_t minifancurve_show(struct device *dev,
 	mutex_lock(&priv->fancurve_mutex);
 	err = ec_read_minifancurve(&priv->ecram, priv->conf, &value);
 	if (err) {
-		err = -1;
 		pr_info("Failed to read minifancurve\n");
 		goto error_unlock;
 	}
 	mutex_unlock(&priv->fancurve_mutex);
-	return sprintf(buf, "%d\n", value);
+	return sysfs_emit(buf, "%d\n", value);
 
 error_unlock:
 	mutex_unlock(&priv->fancurve_mutex);
-	return -1;
+	return -EIO;
 }
 
 static ssize_t minifancurve_store(struct device *dev,
@@ -7854,59 +11805,81 @@ static struct attribute *fancurve_hwmon_attributes[] = {
 	//
 	&sensor_dev_attr_auto_points_size.dev_attr.attr,
 	&sensor_dev_attr_minifancurve.dev_attr.attr,
-	&sensor_dev_attr_fancurve_defaults_powermode.dev_attr.attr,
-	NULL
+	&sensor_dev_attr_fancurve_defaults_powermode.dev_attr.attr, NULL
 };
 
-static bool legion_wmi_fancurve_speed_attribute(const struct attribute *attr)
-{
-	return attr == &sensor_dev_attr_fan1_max.dev_attr.attr ||
-	       attr == &sensor_dev_attr_pwm1_auto_point1_pwm.dev_attr.attr ||
-	       attr == &sensor_dev_attr_pwm1_auto_point2_pwm.dev_attr.attr ||
-	       attr == &sensor_dev_attr_pwm1_auto_point3_pwm.dev_attr.attr ||
-	       attr == &sensor_dev_attr_pwm1_auto_point4_pwm.dev_attr.attr ||
-	       attr == &sensor_dev_attr_pwm1_auto_point5_pwm.dev_attr.attr ||
-	       attr == &sensor_dev_attr_pwm1_auto_point6_pwm.dev_attr.attr ||
-	       attr == &sensor_dev_attr_pwm1_auto_point7_pwm.dev_attr.attr ||
-	       attr == &sensor_dev_attr_pwm1_auto_point8_pwm.dev_attr.attr ||
-	       attr == &sensor_dev_attr_pwm1_auto_point9_pwm.dev_attr.attr ||
-	       attr == &sensor_dev_attr_pwm1_auto_point10_pwm.dev_attr.attr;
-}
-
 static umode_t legion_hwmon_sensor_is_visible(struct kobject *kobj,
-					      struct attribute *attr,
-					      int idx)
+					      struct attribute *attr, int idx)
 {
 	bool supported = true;
 	struct device *dev = kobj_to_dev(kobj);
 	struct legion_private *priv = dev_get_drvdata(dev);
+
+	if (priv->conf->access_method_fanspeed == ACCESS_METHOD_NO_ACCESS &&
+	    (attr == &sensor_dev_attr_fan1_input.dev_attr.attr ||
+	     attr == &sensor_dev_attr_fan1_label.dev_attr.attr ||
+	     attr == &sensor_dev_attr_fan1_target.dev_attr.attr ||
+	     attr == &sensor_dev_attr_fan2_input.dev_attr.attr ||
+	     attr == &sensor_dev_attr_fan2_label.dev_attr.attr ||
+	     attr == &sensor_dev_attr_fan2_target.dev_attr.attr))
+		supported = false;
+
+	if (attr == &sensor_dev_attr_fan1_target.dev_attr.attr ||
+	    attr == &sensor_dev_attr_fan2_target.dev_attr.attr)
+		supported = supported && !priv->conf->skip_fan_target;
 
 	if (attr == &sensor_dev_attr_temp3_input.dev_attr.attr ||
 	    attr == &sensor_dev_attr_temp3_label.dev_attr.attr)
 		supported = supported && !priv->conf->skip_ic_temp;
 
+	if (attr == &sensor_dev_attr_temp2_input.dev_attr.attr ||
+	    attr == &sensor_dev_attr_temp2_label.dev_attr.attr)
+		supported = supported && !priv->conf->skip_gpu_temp;
+
 	if (attr == &sensor_dev_attr_fan3_input.dev_attr.attr ||
-	    attr == &sensor_dev_attr_fan3_label.dev_attr.attr ||
-	    attr == &sensor_dev_attr_fan4_input.dev_attr.attr ||
+	    attr == &sensor_dev_attr_fan3_label.dev_attr.attr)
+		supported = supported && (priv->conf->has_four_fans ||
+					  priv->conf->has_third_fan);
+
+	if (attr == &sensor_dev_attr_fan4_input.dev_attr.attr ||
 	    attr == &sensor_dev_attr_fan4_label.dev_attr.attr)
 		supported = supported && priv->conf->has_four_fans;
+
+	if (attr == &sensor_dev_attr_fan2_input.dev_attr.attr ||
+	    attr == &sensor_dev_attr_fan2_label.dev_attr.attr ||
+	    attr == &sensor_dev_attr_fan2_target.dev_attr.attr)
+		supported = supported && !priv->conf->has_single_fan;
 
 	return supported ? attr->mode : 0;
 }
 
 static umode_t legion_hwmon_fancurve_is_visible(struct kobject *kobj,
-						struct attribute *attr,
-						int idx)
+						struct attribute *attr, int idx)
 {
 	bool supported = true;
 	struct device *dev = kobj_to_dev(kobj);
 	struct legion_private *priv = dev_get_drvdata(dev);
 
+	/* Retain the model-specific exclusions for auxiliary legacy controls. */
 	if (priv->conf->wmi_fancurve_speed_only &&
-	    !legion_wmi_fancurve_speed_attribute(attr))
+	    (attr == &sensor_dev_attr_minifancurve.dev_attr.attr ||
+	     attr == &sensor_dev_attr_fancurve_defaults_powermode.dev_attr.attr ||
+	     attr == &sensor_dev_attr_fan2_max.dev_attr.attr))
 		return 0;
+	if (container_of(attr, struct device_attribute, attr)->show ==
+	    autopoint_show) {
+		struct device_attribute *devattr =
+			container_of(attr, struct device_attribute, attr);
+		int id = to_sensor_dev_attr_2(devattr)->nr;
+
+		if (!fancurve_attr_supported(priv->conf, id))
+			return 0;
+		if (id == FANCURVE_SIZE &&
+		    priv->conf->access_method_fancurve != ACCESS_METHOD_EC)
+			return attr->mode & ~0222;
+	}
 	if (attr == &sensor_dev_attr_minifancurve.dev_attr.attr)
-		supported = priv->conf->has_minifancurve;
+		supported = minifancurve_supported(priv->conf);
 	if (attr == &sensor_dev_attr_fancurve_defaults_powermode.dev_attr.attr)
 		supported = priv->conf->has_fancurve_defaults;
 
@@ -7970,8 +11943,35 @@ static int acpi_init(struct legion_private *priv, struct acpi_device *adev)
 	struct device *dev = &priv->platform_device->dev;
 	const char *acpi_path;
 
-	acpi_path = get_model_acpi_path(_model, ACPI_PATH_WRITE_RAPIDCHARGE);
+	/*
+	 * Ownership of priv->adev differs by kernel: before 7.0 it is the
+	 * caller's ACPI companion reference (borrowed, never put here);
+	 * on 7.0+ the virtual platform device has no companion, so the
+	 * EC device looked up below is owned by the driver and put in
+	 * acpi_exit(). acpi_dev_put() is only called on the owned case.
+	 */
 	priv->adev = adev;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+	/*
+	 * The virtual platform device has no ACPI companion. The default
+	 * ACPI paths are names relative to the embedded controller device
+	 * (_STA, _CFG, VPC0.GBMD, ...), which is where the driver bound
+	 * before kernel 7.0, so look that device up by its HID and keep
+	 * evaluating relative to it. The reference is dropped in
+	 * acpi_exit().
+	 *
+	 * Note: this only returns the first PNP0C09 device; Legion
+	 * platforms declare a single embedded controller, but if a DSDT
+	 * ever declared more than one, the first match might not be the
+	 * right one -- absolute per-model paths are the fallback then.
+	 */
+	if (!priv->adev) {
+		priv->adev = acpi_dev_get_first_match_dev("PNP0C09", NULL, -1);
+		if (priv->adev)
+			dev_info(dev, "Using ACPI device %s for EC methods\n",
+				 dev_name(&priv->adev->dev));
+	}
+#endif
 	if (!priv->adev)
 		dev_info(dev, "No ACPI handle, will use FQN paths\n");
 	skip_acpi_sta_check = force || (!priv->conf->acpi_check_dev);
@@ -7979,17 +11979,24 @@ static int acpi_init(struct legion_private *priv, struct acpi_device *adev)
 		acpi_path = get_model_acpi_path(_model, ACPI_PATH_STA);
 		err = eval_int(priv->adev, acpi_path, &cfg);
 		if (err) {
-			dev_info(dev, "Could not evaluate ACPI _STA\n");
+			dev_info(dev, "Could not evaluate ACPI %s: %d\n",
+				 acpi_path, err);
 			goto err_acpi_init;
 		}
 
+		/*
+		 * _CFG is only reported (here and in debugfs), never used to
+		 * gate a feature, and not every Lenovo DSDT defines it on the
+		 * embedded controller device, so its absence must not stop
+		 * the probe; _STA above is the presence check.
+		 */
 		acpi_path = get_model_acpi_path(_model, ACPI_PATH_CFG);
 		err = eval_int(priv->adev, acpi_path, &cfg);
-		if (err) {
-			dev_info(dev, "Could not evaluate ACPI _CFG\n");
-			goto err_acpi_init;
-		}
-		dev_info(dev, "ACPI CFG: %lu\n", cfg);
+		if (err)
+			dev_info(dev, "Could not evaluate ACPI %s: %d\n",
+				 acpi_path, err);
+		else
+			dev_info(dev, "ACPI CFG: %lu\n", cfg);
 	} else {
 		dev_info(dev, "Skipping ACPI _STA check");
 	}
@@ -7998,6 +12005,15 @@ static int acpi_init(struct legion_private *priv, struct acpi_device *adev)
 
 err_acpi_init:
 	return err;
+}
+
+static void acpi_exit(struct legion_private *priv)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+	/* Reference taken in acpi_init(); acpi_dev_put() accepts NULL. */
+	acpi_dev_put(priv->adev);
+#endif
+	priv->adev = NULL;
 }
 
 /* =============================  */
@@ -8279,6 +12295,8 @@ static int legion_add(struct platform_device *pdev)
 		dev_info(&pdev->dev, "legion_laptop is forced to load.\n");
 		goto err_legion_shared_init;
 	}
+	INIT_DELAYED_WORK(&priv->resume_fancurve_work,
+			  legion_resume_fancurve_fn);
 	dev_set_drvdata(&pdev->dev, priv);
 
 	// TODO: remove
@@ -8302,7 +12320,7 @@ static int legion_add(struct platform_device *pdev)
 		dev_info(
 			&pdev->dev,
 			"Module not usable for this laptop because it is not in allowlist. Notify the maintainer if you want to add your device or force load with param force.\n");
-		err = -ENOMEM;
+		err = -ENODEV;
 		goto err_model_mismtach;
 	}
 
@@ -8332,16 +12350,21 @@ static int legion_add(struct platform_device *pdev)
 			int idx;
 			int loaded = 0;
 
-			for (idx = 0; idx < instances && loaded < MAX_CAPDATA_ENTRIES; idx++) {
+			for (idx = 0;
+			     idx < instances && loaded < MAX_CAPDATA_ENTRIES;
+			     idx++) {
 				union acpi_object *obj;
-				struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
+				struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER,
+							   NULL };
 
-				if (ACPI_FAILURE(wmi_query_block(LEGION_WMI_CAPDATA01_GUID,
-								 idx, &out)))
+				if (ACPI_FAILURE(wmi_query_block(
+					    LEGION_WMI_CAPDATA01_GUID, idx,
+					    &out)))
 					continue;
 				obj = out.pointer;
 				if (!obj || obj->type != ACPI_TYPE_BUFFER ||
-				    obj->buffer.length < sizeof(struct capdata01)) {
+				    obj->buffer.length <
+					    sizeof(struct capdata01)) {
 					ACPI_FREE(obj);
 					continue;
 				}
@@ -8356,7 +12379,8 @@ static int legion_add(struct platform_device *pdev)
 	}
 
 	if (wmi_has_guid(LEGION_WMI_DISCRETE_DATA_GUID)) {
-		int instances = wmi_instance_count(LEGION_WMI_DISCRETE_DATA_GUID);
+		int instances =
+			wmi_instance_count(LEGION_WMI_DISCRETE_DATA_GUID);
 
 		if (instances > 0) {
 			int idx;
@@ -8364,12 +12388,16 @@ static int legion_add(struct platform_device *pdev)
 			struct discrete_data_entry entries[MAX_DISCRETE_ENTRIES];
 			int entry_count = 0;
 
-			for (idx = 0; idx < instances && entry_count < MAX_DISCRETE_ENTRIES; idx++) {
+			for (idx = 0; idx < instances &&
+				      entry_count < MAX_DISCRETE_ENTRIES;
+			     idx++) {
 				union acpi_object *obj;
-				struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
+				struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER,
+							   NULL };
 
-				if (ACPI_FAILURE(wmi_query_block(LEGION_WMI_DISCRETE_DATA_GUID,
-								 idx, &out)))
+				if (ACPI_FAILURE(wmi_query_block(
+					    LEGION_WMI_DISCRETE_DATA_GUID, idx,
+					    &out)))
 					continue;
 				obj = out.pointer;
 				if (!obj)
@@ -8377,25 +12405,32 @@ static int legion_add(struct platform_device *pdev)
 
 				if (obj->type == ACPI_TYPE_PACKAGE &&
 				    obj->package.count >= 2 &&
-				    obj->package.elements[0].type == ACPI_TYPE_INTEGER &&
-				    obj->package.elements[1].type == ACPI_TYPE_INTEGER) {
+				    obj->package.elements[0].type ==
+					    ACPI_TYPE_INTEGER &&
+				    obj->package.elements[1].type ==
+					    ACPI_TYPE_INTEGER) {
 					entries[entry_count].id =
-						(u32)obj->package.elements[0].integer.value;
+						(u32)obj->package.elements[0]
+							.integer.value;
 					entries[entry_count].value =
-						(u32)obj->package.elements[1].integer.value;
+						(u32)obj->package.elements[1]
+							.integer.value;
 					entry_count++;
 				}
 
 				ACPI_FREE(obj);
 			}
 
-			for (i = 0; i < entry_count && fi < MAX_DISCRETE_FEATURES; i++) {
+			for (i = 0;
+			     i < entry_count && fi < MAX_DISCRETE_FEATURES;
+			     i++) {
 				struct discrete_feature *dfe;
 				u32 fid = entries[i].id;
 				int vi;
 
 				for (vi = 0; vi < fi; vi++) {
-					if (priv->discrete_features[vi].feature_id == fid)
+					if (priv->discrete_features[vi]
+						    .feature_id == fid)
 						break;
 				}
 				dfe = &priv->discrete_features[vi];
@@ -8405,7 +12440,8 @@ static int legion_add(struct platform_device *pdev)
 					fi++;
 				}
 				if (dfe->count < ARRAY_SIZE(dfe->values))
-					dfe->values[dfe->count++] = entries[i].value;
+					dfe->values[dfe->count++] =
+						entries[i].value;
 			}
 			priv->discrete_feature_count = fi;
 		}
@@ -8421,6 +12457,18 @@ static int legion_add(struct platform_device *pdev)
 	}
 #else
 	err = acpi_init(priv, NULL);
+	/*
+	 * Do not fail the probe when ACPI init fails on 7.x: the driver
+	 * binds a virtual platform device there and the per-model ACPI
+	 * paths do not match every DSDT (e.g. LPC0 vs LPCB, or a missing
+	 * VPC0._STA), so a failing _STA evaluation is a false negative.
+	 * ACPI is only one access method; EC RAM and WMI stay fully
+	 * functional without it. Check and log the error, but carry on.
+	 */
+	if (err)
+		dev_info(&pdev->dev,
+			 "Could not init ACPI access: %d; continuing without ACPI\n",
+			 err);
 #endif
 	// TODO: remove; only used for reverse engineering
 	pr_info("Creating RAM access to embedded controller\n");
@@ -8450,7 +12498,7 @@ static int legion_add(struct platform_device *pdev)
 	is_ec_id_valid = skip_ec_id_check ||
 			 (ec_read_id == priv->conf->embedded_controller_id);
 	if (!is_ec_id_valid) {
-		err = -ENOMEM;
+		err = -EIO;
 		dev_info(&pdev->dev, "Expected EC chip id 0x%x but read 0x%x\n",
 			 priv->conf->embedded_controller_id, ec_read_id);
 		goto err_ecram_id;
@@ -8506,8 +12554,9 @@ static int legion_add(struct platform_device *pdev)
 		pr_info("Init Y-Logo LED driver\n");
 		err = legion_ec_ylogo_init(priv);
 		if (err) {
-			dev_info(&pdev->dev,
-				 "Failed to init Y-Logo LED driver. Skipping ...\n");
+			dev_info(
+				&pdev->dev,
+				"Failed to init Y-Logo LED driver. Skipping ...\n");
 		}
 	} else if (!priv->conf->skip_ylogo_light) {
 		pr_info("Init Y-Logo LED driver\n");
@@ -8515,18 +12564,21 @@ static int legion_add(struct platform_device *pdev)
 					LIGHT_ID_YLOGO, 0, 1,
 					"platform::ylogo");
 		if (err) {
-			dev_info(&pdev->dev,
-				 "Failed to init Y-Logo LED driver. Skipping ...\n");
+			dev_info(
+				&pdev->dev,
+				"Failed to init Y-Logo LED driver. Skipping ...\n");
 		}
 	}
 
 	if (!priv->conf->skip_ioport_light) {
 		pr_info("Init IO-Port LED driver\n");
-		err = legion_light_init(priv, &priv->iport_light, LIGHT_ID_IOPORT,
-					0, 2, "platform::ioport");
+		err = legion_light_init(priv, &priv->iport_light,
+					LIGHT_ID_IOPORT, 0, 2,
+					"platform::ioport");
 		if (err && err != -ENODEV) {
-			dev_info(&pdev->dev,
-				 "Failed to init IO-Port LED driver. Skipping ...\n");
+			dev_info(
+				&pdev->dev,
+				"Failed to init IO-Port LED driver. Skipping ...\n");
 		}
 	}
 
@@ -8554,6 +12606,7 @@ err_ecram_memoryio_init:
 #if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
 err_acpi_init:
 #endif
+	acpi_exit(priv);
 	legion_shared_exit(priv);
 err_legion_shared_init:
 err_model_mismtach:
@@ -8569,6 +12622,7 @@ static void legion_remove(struct platform_device *pdev)
 	priv->loaded = false;
 	mutex_unlock(&legion_shared_mutex);
 
+	cancel_delayed_work_sync(&priv->resume_fancurve_work);
 	legion_light_exit(priv, &priv->iport_light);
 	legion_light_exit(priv, &priv->ylogo_light);
 	legion_kbd_bl_exit(priv);
@@ -8586,6 +12640,7 @@ static void legion_remove(struct platform_device *pdev)
 	legion_debugfs_exit(priv);
 	ecram_exit(&priv->ecram);
 	ecram_memoryio_exit(&priv->ec_memoryio);
+	acpi_exit(priv);
 	legion_shared_exit(priv);
 
 	pr_info("Legion platform unloaded\n");
@@ -8593,8 +12648,8 @@ static void legion_remove(struct platform_device *pdev)
 
 static int legion_resume(struct platform_device *pdev)
 {
-	//struct legion_private *priv = dev_get_drvdata(&pdev->dev);
 	dev_info(&pdev->dev, "Resumed in legion-laptop\n");
+	legion_resume_fancurve(dev_get_drvdata(&pdev->dev));
 
 	return 0;
 }
@@ -8602,8 +12657,8 @@ static int legion_resume(struct platform_device *pdev)
 #ifdef CONFIG_PM_SLEEP
 static int legion_pm_resume(struct device *dev)
 {
-	//struct legion_private *priv = dev_get_drvdata(dev);
 	dev_info(dev, "Resumed PM in legion-laptop\n");
+	legion_resume_fancurve(dev_get_drvdata(dev));
 
 	return 0;
 }
@@ -8612,9 +12667,9 @@ static SIMPLE_DEV_PM_OPS(legion_pm, NULL, legion_pm_resume);
 
 // same as ideapad
 static const struct acpi_device_id legion_device_ids[] = {
-	// todo: change to "VPC2004", and also ACPI paths
+// todo: change to "VPC2004", and also ACPI paths
 #if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 0)
-	    { "PNP0C09", 0 },
+	{ "PNP0C09", 0 },
 #endif
 	{ "", 0 },
 };
@@ -8664,6 +12719,10 @@ module_init(legion_init);
 
 static void __exit legion_exit(void)
 {
+	if (legion_fn_input) {
+		input_unregister_device(legion_fn_input);
+		legion_fn_input = NULL;
+	}
 	platform_driver_unregister(&legion_driver);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
 	platform_device_unregister(_priv.platform_device);

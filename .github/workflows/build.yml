@@ -57,7 +57,7 @@ jobs:
       run: ./deploy/dependencies/install_dependencies_ubuntu_24_04.sh
       shell: bash
     - name: Build
-      run: ./tests/test_kenel_dkms_install.sh || true
+      run: ./tests/test_kernel_dkms_install.sh
       shell: bash
 
   run-tests:
@@ -77,21 +77,25 @@ jobs:
         if: always()
         run: ./tests/test_python.sh
         shell: bash
+      - name: Build legiond
+        if: always()
+        run: ./tests/test_legiond_build.sh
+        shell: bash
       - name: Test python CLI
         if: always()
         run: ./tests/test_python_cli.sh
         shell: bash
-      - name: Test python library
+      - name: Test python GUI
+        if: always()
+        run: ./tests/test_python_gui.sh
+        shell: bash
+      - name: Test fan curve capabilities and GUI
         if: always()
         run: ./tests/test_python_unit.sh
         shell: bash
-          #- name: Test python GUI
-          #if: always()
-          #run: ./tests/test_python_gui.sh
-          #shell: bash
       - name: Install python package
         if: always()
-        run: ./deploy/python_install_pip_pkg.sh
+        run: sudo ./deploy/python_install_pip_pkg.sh
         shell: bash
 
   release-kernel-patch:
@@ -135,35 +139,52 @@ jobs:
       run: |
         # Tolerate an already existing release (e.g. created by release.yml)
         gh release create "${{ steps.tag.outputs.tag }}" --draft --notes "" || true
-        echo "upload_url=$(gh release view "${{ steps.tag.outputs.tag }}" --json uploadUrl --jq .uploadUrl)" >> "$GITHUB_OUTPUT"
-        echo "id=$(gh api "repos/${{ github.repository }}/releases/tags/${{ steps.tag.outputs.tag }}" --jq .id)" >> "$GITHUB_OUTPUT"
+        echo "id=$(gh release view "${{ steps.tag.outputs.tag }}" --json id --jq .id)" >> "$GITHUB_OUTPUT"
     - name: Upload Release - Kernel Patch
       if: steps.check_if_tagged.outputs.hastag == 1
-      uses: actions/upload-release-asset@v1.0.1
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: /tmp/linux/linux/0001-Add-legion-laptop-v${{ steps.tag.outputs.tag_version }}.patch
-        asset_name: 0001-Add-legion-laptop-v${{ steps.tag.outputs.tag_version }}.patch
-        asset_content_type: text/plain
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release upload "${{ steps.tag.outputs.tag }}" \
+          "/tmp/linux/linux/0001-Add-legion-laptop-v${{ steps.tag.outputs.tag_version }}.patch" \
+          --clobber
     - name: Publish Release
       if: steps.check_if_tagged.outputs.hastag == 1
-      uses: eregon/publish-release@v1
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        release_id: ${{ steps.create_release.outputs.id }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release edit "${{ steps.tag.outputs.tag }}" --draft=false
 
   test-in-docker-container:
-    needs: [build, run-tests]
+    # No `needs`: the container builds are self-contained, so start them
+    # immediately in parallel with the other jobs to keep wall time low.
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
     - name: Build containers and run tests inside them
-      run: ./deploy/build_containers.sh
-      shell: bash
+      # bake keeps the parallel compose targets and adds a persistent
+      # GitHub Actions layer cache so unchanged dependency layers
+      # (pacman/apt installs) are not rebuilt on every run.
+      uses: docker/bake-action@v7
+      with:
+        # Run bake from deploy/ so the compose build contexts ("..")
+        # resolve to the repository root, like docker compose does locally.
+        source: ./deploy
+        files: ./docker-compose.yaml
+        # Test-only builds; no registry push, so skip provenance attestations.
+        provenance: false
+        targets: legion-arch,legion-manjaro,legion-ubuntu-24-04
+        set: |
+          legion-arch.cache-from=type=gha,scope=lll-arch
+          legion-arch.cache-to=type=gha,mode=max,scope=lll-arch
+          legion-manjaro.cache-from=type=gha,scope=lll-manjaro
+          legion-manjaro.cache-to=type=gha,mode=max,scope=lll-manjaro
+          legion-ubuntu-24-04.cache-from=type=gha,scope=lll-ubuntu-24-04
+          legion-ubuntu-24-04.cache-to=type=gha,mode=max,scope=lll-ubuntu-24-04
 
   test-packages:
     # External distro package repositories can lag behind main.

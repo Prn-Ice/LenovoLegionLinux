@@ -11,10 +11,19 @@ from pathlib import Path
 import logging
 import subprocess
 import struct
+import tempfile
 import zlib
 from datetime import datetime
+from math import isfinite
 import yaml
-from PIL import Image
+
+try:
+    from PIL import Image
+
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    Image = None  # type: ignore[assignment]
 
 # import jsonrpyc
 # import inotify.adapters
@@ -43,9 +52,9 @@ def get_dmesg(only_tail=False, filter_log=True):
             cmd = "dmesg | tail -n 20" if only_tail else "dmesg"
         with subprocess.Popen(["bash", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
             out, _ = process.communicate(timeout=1)
-            out_str = out.decode(DEFAULT_ENCODING)
+            out_str = out.decode(DEFAULT_ENCODING, errors="replace")
             return out_str
-    except OSError as ex:
+    except (OSError, subprocess.SubprocessError) as ex:
         log.error(ex)
         return str(ex)
 
@@ -151,10 +160,13 @@ def write_file_with_legion_cli(name, values):
     try:
         with subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
             stdout, stderr = process.communicate(timeout=None)
-            out_str = stdout.decode(DEFAULT_ENCODING)
-            err_str = stderr.decode(DEFAULT_ENCODING)
+            out_str = stdout.decode(DEFAULT_ENCODING, errors="replace")
+            err_str = stderr.decode(DEFAULT_ENCODING, errors="replace")
             returncode = process.returncode
             log.info("FileFeature %s executed with code %d: %s; %s", name, returncode, out_str, err_str)
+        if returncode != 0:
+            log.error("FileFeature %s failed with code %d: %s; %s", name, returncode, out_str, err_str)
+            raise RuntimeError(f"legion_cli failed for {name} with code {returncode}: {err_str}")
     except IOError as err:
         log.error("FileFeature %s executed with error %s and out %s and err %s", name, str(err), out_str, err_str)
         log.error(get_dmesg(only_tail=True, filter_log=False))
@@ -233,6 +245,16 @@ class BoolSettingFeature(Feature):
         self.value = value
         self._notify()
 
+    def set_str_value(self, value: str):
+        parsed = str(value).strip().lower()
+        if parsed in ("1", "true", "yes", "on"):
+            enabled = True
+        elif parsed in ("0", "false", "no", "off"):
+            enabled = False
+        else:
+            raise ValueError(f"Invalid boolean value {value}")
+        return self.set(enabled)
+
     def get(self) -> bool:
         return self.value
 
@@ -259,7 +281,10 @@ class EnumSettingFeature(Feature):
             log.error("Setting invalid value %s", value)
             raise ValueError(f"Invalid value {value}")
 
-    def get(self) -> bool:
+    def set_str_value(self, value: str):
+        return self.set(value)
+
+    def get(self) -> str:
         return self.value
 
 
@@ -363,16 +388,17 @@ class LegionGUIAutostart(BoolFileFeature):
 
     def __init__(self):
         self.autostart_dekstop_folder_path = Path.home() / ".config" / "autostart"
-        self.desktop_file_path = Path("/usr/share/applications") / "legion_gui_user.desktop"
-        self.autostart_desktop_file_path = self.autostart_dekstop_folder_path / "legion_gui_user.desktop"
+        self.desktop_file_path = Path("/usr/share/applications") / "legion_gui.desktop"
+        self.autostart_desktop_file_path = self.autostart_dekstop_folder_path / "legion_gui.desktop"
         super().__init__(str(Path.home() / ".config"))
 
     def exists(self):
-        return self.desktop_file_path.exists() and self.autostart_dekstop_folder_path.exists()
+        return self.desktop_file_path.exists()
 
     def set(self, value: bool):
         log.info("Feature %s setting to %d", self.name(), value)
         if value:
+            self.autostart_dekstop_folder_path.mkdir(parents=True, exist_ok=True)
             src = self.desktop_file_path
             dest = self.autostart_desktop_file_path
             log.info("Feature %s: Copy %s to %s", self.name(), src, dest)
@@ -472,7 +498,7 @@ class BatteryConservation(BoolFileFeature):
         if value != self.get():
             self.set(value)
         else:
-            print(f"Already has value {value} - skip setting again.")
+            log.info("Already has value %s - skip setting again.", value)
 
 
 class RapidChargingFeature(BoolFileFeature):
@@ -1017,18 +1043,58 @@ class AlwaysOnUSBChargingFeature(BoolFileFeature):
         super().__init__(os.path.join(IDEAPAD_SYS_BASEPATH, "usb_charging"))
 
 
+class InstantBootACFeature(BoolFileFeature):
+    """Power on when an AC adapter is connected"""
+
+    def __init__(self):
+        super().__init__(os.path.join(LEGION_SYS_BASEPATH, "instant_boot_ac"))
+
+
+class InstantBootUSBPDFeature(BoolFileFeature):
+    """Power on when a USB-PD charger is connected"""
+
+    def __init__(self):
+        super().__init__(os.path.join(LEGION_SYS_BASEPATH, "instant_boot_usb_pd"))
+
+
 class MaximumFanSpeedFeature(BoolFileFeature):
     def __init__(self):
         super().__init__(os.path.join(LEGION_SYS_BASEPATH, "fan_fullspeed"))
 
 
 class PlatformProfileFeature(FileFeature):
+    """Power mode (ACPI platform profile).
+
+    Prefers legion-laptop's own platform-profile class device, which is the
+    only provider that exposes the custom/max-power modes. Falls back to any
+    other registered platform-profile handler (e.g. ideapad-laptop) and
+    finally to the global /sys/firmware/acpi/platform_profile interface, so
+    the power mode can still be shown and switched when legion-laptop is not
+    loaded (this is how versions before 0.1.0 worked).
+    """
+
     def __init__(self):
-        super().__init__(LEGION_SYS_BASEPATH + "/platform-profile/platform-profile-[0-9]/profile")
-        self.choices = StrFileFeature(LEGION_SYS_BASEPATH + "/platform-profile/platform-profile-[0-9]/choices")
+        super().__init__(
+            [
+                LEGION_SYS_BASEPATH + "/platform-profile/platform-profile-[0-9]/profile",
+                "/sys/class/platform-profile/platform-profile-[0-9]/profile",
+                "/sys/firmware/acpi/platform_profile",
+            ]
+        )
+        self.choices = StrFileFeature(
+            [
+                LEGION_SYS_BASEPATH + "/platform-profile/platform-profile-[0-9]/choices",
+                "/sys/class/platform-profile/platform-profile-[0-9]/choices",
+                "/sys/firmware/acpi/platform_profile_choices",
+            ]
+        )
+        # All names the kernel platform_profile core can report; values not
+        # listed in the firmware/driver choices file are filtered out below.
         self.all_values = [
             NamedValue("low-power", "Low Power"),
+            NamedValue("quiet", "Quiet Mode"),
             NamedValue("balanced", "Balanced Mode"),
+            NamedValue("balanced-performance", "Balanced Performance"),
             NamedValue("performance", "Performance Mode"),
             NamedValue("custom", "Custom Mode"),
             NamedValue("max-power", "Max Power"),
@@ -1038,7 +1104,7 @@ class PlatformProfileFeature(FileFeature):
         try:
             available_choices_str = self.choices.get()
         except IOError as error:
-            print(error)
+            log.error("Failed to read platform profile choices: %s", error)
             available_choices_str = ""
         available_choices = available_choices_str.split(" ")
         return [p for p in self.all_values if p.value in available_choices]
@@ -1051,32 +1117,62 @@ class PlatformProfileFeature(FileFeature):
         return value
 
 
+def _find_power_supply_dir(supply_type):
+    """Return the first power_supply entry of the given type, or None.
+
+    Legacy names (ADP0/BAT0) are only used as a fallback since the Linux
+    power_supply class names the batteries/adapters by port location.
+    """
+    for supply_dir in glob.glob("/sys/class/power_supply/*"):
+        type_file = os.path.join(supply_dir, "type")
+        if os.path.exists(type_file):
+            with open(type_file, "r", encoding=DEFAULT_ENCODING) as filepointer:
+                if filepointer.read().strip() == supply_type:
+                    return supply_dir
+    return None
+
+
 class IsOnPowerSupplyFeature(BoolFileFeature):
     def __init__(self):
-        super().__init__("/sys/class/power_supply/ADP0/online")
+        supply_dir = _find_power_supply_dir("Mains") or "/sys/class/power_supply/ADP0"
+        super().__init__(os.path.join(supply_dir, "online"))
 
     def set(self, value: str):
         raise NotImplementedError()
 
+    def get(self):
+        if not self.exists():
+            return False
+        return super().get()
+
 
 class BatteryIsCharging(BoolFileFeature):
     def __init__(self):
-        super().__init__("/sys/class/power_supply/BAT0/status")
+        supply_dir = _find_power_supply_dir("Battery") or "/sys/class/power_supply/BAT0"
+        super().__init__(os.path.join(supply_dir, "status"))
 
     def set(self, _: str):
         raise NotImplementedError()
 
     def get(self):
+        if not self.exists():
+            return False
         value = self._read_file_str(self.filename)
         return value == "Charging"
 
 
 class BatteryCurrentCapacityPercentage(FloatFileFeature):
     def __init__(self):
-        super().__init__("/sys/class/power_supply/BAT0/capacity")
+        supply_dir = _find_power_supply_dir("Battery") or "/sys/class/power_supply/BAT0"
+        super().__init__(os.path.join(supply_dir, "capacity"))
 
     def set(self, _: str):
         raise NotImplementedError()
+
+    def get(self):
+        if not self.exists():
+            return 0
+        return super().get()
 
 
 class CPUOverclock(BoolFileFeature):
@@ -1178,7 +1274,7 @@ class CommandFeature:
         try:
             with subprocess.Popen(["bash", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
                 stdout, _ = process.communicate(timeout=timeout)
-                out_str = stdout.decode(DEFAULT_ENCODING)
+                out_str = stdout.decode(DEFAULT_ENCODING, errors="replace")
                 returncode = process.returncode
                 log.info("CommandFeature %s reading with code %d: %s", self.name(), returncode, out_str)
                 return out_str, returncode
@@ -1242,7 +1338,7 @@ class SystemDServiceFeature(BoolCommandFeature):
         return False
 
 
-class PowerProfilesDeamonService(SystemDServiceFeature):
+class PowerProfilesDaemonService(SystemDServiceFeature):
     def __init__(self):
         super().__init__("power-profiles-daemon")
 
@@ -1250,6 +1346,104 @@ class PowerProfilesDeamonService(SystemDServiceFeature):
 class LenovoLegionLaptopSupportService(SystemDServiceFeature):
     def __init__(self):
         super().__init__("legiond.service legiond-onresume.service legiond-cpuset.service legiond-cpuset.timer")
+
+
+# Models whose WMI3 fan curve takes level indices 0-10 instead of percentages
+# (FAN_SPEED_UNIT_LEVEL in the kernel module, debugfs unit 5) expose the
+# firmware's per-level RPM ladders through these platform device attributes.
+# The kernel module reads them from the LENOVO_FAN_TABLE_DATA WMI data block
+# (per fan and power mode), so nothing per-model is hardcoded here and the
+# values always match the current power mode.
+FAN_LEVEL_RPM_TABLE_FILES = ("fan1_level_rpm_table", "fan2_level_rpm_table")
+FANCURVE_SPEED_UNIT_FILE = "fancurve_speed_unit"
+# Lowest level allowed by the kernel's safety policy per curve point
+# (the kernel module rejects anything below with EOPNOTSUPP).
+LEVEL_POINT_MIN = [1, 1, 1, 1, 1, 1, 1, 1, 3, 5]
+MAX_FAN_LEVEL = 10
+# Temperature bounds enforced by the kernel's fancurve_is_valid_{min,max}_temp.
+FANCURVE_MAX_TEMP_C = 127
+# BIOS prefixes whose WMI3 fan table holds level indices although kernel
+# modules before the LPCN fix report it as "percent". On a Legion Pro 5 16ARX8
+# (LPCN59WW) a percent byte above MAX_FAN_LEVEL hard-powered-off the laptop, so
+# with such a module only bytes the firmware can read as a level are written.
+LEVEL_TABLE_BIOS_PREFIXES = ("LPCN", "N0CN")
+DMI_BIOS_VERSION_FILE = "/sys/class/dmi/id/bios_version"
+
+
+def read_bios_version():
+    """DMI BIOS version (e.g. LPCN59WW), or an empty string if unreadable."""
+    try:
+        with open(DMI_BIOS_VERSION_FILE, "r", encoding=DEFAULT_ENCODING) as filepointer:
+            return filepointer.read().strip()
+    except OSError:
+        return ""
+
+
+def read_fan_level_rpm_tables():
+    """Read the per-fan level->RPM ladders from the kernel module.
+
+    Returns a tuple (fan 1 ladder, fan 2 ladder) where each ladder maps level
+    i+1 to its nominal RPM, or (None, None) when the running kernel module
+    does not expose the attributes (older module, or a model whose firmware
+    does not publish the WMI fan table data block).
+    """
+    ladders = []
+    for name in FAN_LEVEL_RPM_TABLE_FILES:
+        path = os.path.join(LEGION_SYS_BASEPATH, name)
+        try:
+            with open(path, "r", encoding=DEFAULT_ENCODING) as filepointer:
+                rpm_strings = filepointer.read().split()
+        except OSError:
+            ladders.append(None)
+            continue
+        try:
+            ladder = [int(rpm) for rpm in rpm_strings]
+            if not ladder or len(ladder) > MAX_FAN_LEVEL or ladder[0] < 0 or ladder[-1] <= 0:
+                raise ValueError("Invalid RPM ladder length or range")
+            if any(left > right for left, right in zip(ladder, ladder[1:])):
+                raise ValueError("RPM ladder is decreasing")
+            ladders.append(ladder)
+        except ValueError:
+            log.warning("Unexpected content in %s: %s", path, rpm_strings)
+            ladders.append(None)
+    if ladders[0] is None and ladders[1] is None:
+        return None, None
+    return ladders[0], ladders[1]
+
+
+def fan_level_to_pwm(level):
+    """Hwmon pwm value the kernel module maps back to exactly this level."""
+    return round(level * 255 / MAX_FAN_LEVEL)
+
+
+def fan_pwm_to_level(pwm):
+    """Level the kernel module derives from a pwm value (DIV_ROUND_CLOSEST(pwm * 10, 255))."""
+    return (pwm * MAX_FAN_LEVEL + 127) // 255
+
+
+def fan_rpm_to_level(rpm, point_id, table):
+    """Nearest level for an RPM value, clamped to the point's minimum and MAX_FAN_LEVEL.
+
+    An RPM exactly between two levels resolves to the lower (quieter) one.
+    Even a zero-RPM request must respect the point minimum: the kernel
+    rejects level 0. Native RPM curves do not use this conversion.
+    """
+    if not isfinite(rpm):
+        raise ValueError("Fan speed must be finite")
+    if not table or len(table) < LEVEL_POINT_MIN[point_id - 1]:
+        raise ValueError("Firmware RPM ladder does not cover this point's minimum level")
+    rpm = max(table[0], min(table[-1], rpm))
+    level = 1 + min(range(len(table)), key=lambda i: abs(table[i] - rpm))
+    return max(LEVEL_POINT_MIN[point_id - 1], min(MAX_FAN_LEVEL, level))
+
+
+def fan_level_to_rpm(level, table):
+    """Nominal RPM of a level (0 for level 0)."""
+    if level == 0:
+        return 0
+    if table and 1 <= level <= len(table):
+        return table[level - 1]
+    raise ValueError("Firmware RPM ladder does not cover the current fan level")
 
 
 class FanCurveIO(Feature):
@@ -1264,10 +1458,26 @@ class FanCurveIO(Feature):
     pwm3_temp = "pwm3_auto_point{}_temp"
     pwm1_accel = "pwm1_auto_point{}_accel"
     pwm1_decel = "pwm1_auto_point{}_decel"
+
+    # Ranges the driver enforces in fancurve_is_valid_min_temp /
+    # fancurve_is_valid_max_temp / fancurve_set_accel / fancurve_set_decel
+    # (kernel_module/legion-laptop.c). A store outside them is rejected there,
+    # so rejecting them here keeps a bad curve from being half applied.
+    KERNEL_TEMP_RANGE = (0, 127)
+    KERNEL_ACCEL_RANGE = (2, 5)
+    KERNEL_DECEL_RANGE = (2, 5)
     minifancurve = "minifancurve"
     fan1_max = "fan1_max"
     fan2_max = "fan2_max"
     auto_points_size = "auto_points_size"
+    temperature_files = {
+        "cpu_lower_temp": pwm1_temp_hyst,
+        "cpu_upper_temp": pwm1_temp,
+        "gpu_lower_temp": pwm2_temp_hyst,
+        "gpu_upper_temp": pwm2_temp,
+        "ic_lower_temp": pwm3_temp_hyst,
+        "ic_upper_temp": pwm3_temp,
+    }
 
     encoding = DEFAULT_ENCODING
 
@@ -1276,6 +1486,65 @@ class FanCurveIO(Feature):
         self.hwmon_path = self._find_hwmon_dir()
         if (not self.hwmon_path) and expect_hwmon:
             raise FileNotFoundError("hwmon dir not found")
+
+    @property
+    def speed_unit(self):
+        """Unit advertised by the active backend, or None for older modules."""
+        unit_path = os.path.join(LEGION_SYS_BASEPATH, FANCURVE_SPEED_UNIT_FILE)
+        try:
+            with open(unit_path, "r", encoding=DEFAULT_ENCODING) as filepointer:
+                unit = filepointer.read().strip()
+        except FileNotFoundError:
+            unit = None  # Older modules identify level curves by their ladder attrs.
+        if unit not in (None, "level", "rpm", "percent"):
+            raise ValueError(f"Unknown fan curve speed unit: {unit}")
+        return unit
+
+    @property
+    def level_tables(self):
+        """Read current-mode calibration, never guess a linear scale for level curves."""
+        unit = self.speed_unit
+        if unit in ("rpm", "percent"):
+            return None
+        tables = read_fan_level_rpm_tables()
+        has_ladder_attrs = any(
+            os.path.exists(os.path.join(LEGION_SYS_BASEPATH, name)) for name in FAN_LEVEL_RPM_TABLE_FILES
+        )
+        if unit is None and not has_ladder_attrs and all(table is None for table in tables):
+            return None
+        if tables[0] is None:
+            raise ValueError("Cannot edit RPM: the firmware fan 1 RPM ladder is unavailable")
+        return tables
+
+    def uses_fan_levels(self):
+        """True when the fan curve speeds are firmware level indices, not percentages."""
+        return self.level_tables is not None
+
+    def percent_unit_on_level_table(self):
+        """True when an older module reports percent for a firmware table that holds levels."""
+        return self.speed_unit == "percent" and read_bios_version().startswith(LEVEL_TABLE_BIOS_PREFIXES)
+
+    @staticmethod
+    def _is_level_safe_pwm(value):
+        """The kernel's percent setter stores pwm * 100 // 255; keep that a valid level."""
+        return int(value) * 100 // 255 <= MAX_FAN_LEVEL
+
+    @classmethod
+    def _is_level_safe_restore(cls, file_path, value):
+        """Only speed attributes carry level bytes; other values restore as before."""
+        return not str(file_path).endswith("_pwm") or cls._is_level_safe_pwm(value)
+
+    def _check_level_table_pwm(self, point_id, value, level_table=None):
+        """Refuse percent bytes the firmware would read as an out-of-range level."""
+        if level_table is None:
+            level_table = self.percent_unit_on_level_table()
+        if level_table and not self._is_level_safe_pwm(value):
+            raise ValueError(
+                f"Refusing fan curve point {point_id}: pwm {value} becomes {int(value) * 100 // 255} in a fan table "
+                f"that takes levels 0-{MAX_FAN_LEVEL} on this firmware and can power the laptop off; "
+                "update the legion_laptop kernel module"
+            )
+        return value
 
     def exists(self):
         if self.hwmon_path is not None:
@@ -1290,18 +1559,12 @@ class FanCurveIO(Feature):
     def has_fan_2_speed(self):
         return self._has_point_file(self.pwm2_fan_speed)
 
+    def temperature_fields(self):
+        """Supported temperature fields; EC2/EC4 support only part of the schema."""
+        return {name for name, pattern in self.temperature_files.items() if self._has_point_file(pattern)}
+
     def has_temperature_curve(self):
-        return all(
-            self._has_point_file(pattern)
-            for pattern in [
-                self.pwm1_temp_hyst,
-                self.pwm1_temp,
-                self.pwm2_temp_hyst,
-                self.pwm2_temp,
-                self.pwm3_temp_hyst,
-                self.pwm3_temp,
-            ]
-        )
+        return bool(self.temperature_fields())
 
     def has_acceleration_curve(self):
         return self._has_point_file(self.pwm1_accel) and self._has_point_file(self.pwm1_decel)
@@ -1311,6 +1574,10 @@ class FanCurveIO(Feature):
         if matches:
             return matches[0] + "/"
         return None
+
+    def _require_hwmon(self):
+        if self.hwmon_path is None:
+            raise RuntimeError("hwmon dir not found: is the legion-laptop kernel module loaded?")
 
     @staticmethod
     def _validate_point_id(point_id):
@@ -1347,27 +1614,92 @@ class FanCurveIO(Feature):
         file_path = self.hwmon_path + self.fan2_max
         return int(self._read_file(file_path))
 
+    def _count_point_files(self):
+        if self.hwmon_path is None:
+            return 0
+        return len(glob.glob(self.hwmon_path + self.pwm1_fan_speed.format("*")))
+
     def get_auto_points_size(self):
+        if self.hwmon_path is None:
+            return None
         file_path = self.hwmon_path + self.auto_points_size
-        if self.hwmon_path is None or not os.path.exists(file_path):
+        if not os.path.exists(file_path):
             return None
         return self._read_file(file_path)
 
+    def has_writable_auto_points_size(self):
+        """True when auto_points_size can resize the active curve (EC backend)."""
+        if self.hwmon_path is None:
+            return False
+        file_path = self.hwmon_path + self.auto_points_size
+        try:
+            mode = os.stat(file_path).st_mode
+        except OSError:
+            return False
+        return bool(mode & 0o222)
+
+    def get_active_point_count(self):
+        """Number of points currently active in hardware."""
+        count = self.get_auto_points_size()
+        if count is not None:
+            return count
+        return self._count_point_files()
+
+    def get_point_count(self):
+        """Maximum number of curve points this backend accepts."""
+        slot_count = self._count_point_files()
+        if self.has_writable_auto_points_size():
+            return slot_count
+        count = self.get_auto_points_size()
+        if count is not None:
+            return count
+        return slot_count
+
     def set_fan_1_speed_pwm(self, point_id, value):
         point_id = self._validate_point_id(point_id)
+        self._check_level_table_pwm(point_id, value)
         file_path = self.hwmon_path + self.pwm1_fan_speed.format(point_id)
         self._write_file(file_path, value)
 
     def set_fan_2_speed_pwm(self, point_id, value):
         point_id = self._validate_point_id(point_id)
+        self._check_level_table_pwm(point_id, value)
         file_path = self.hwmon_path + self.pwm2_fan_speed.format(point_id)
         self._write_file(file_path, value)
 
+    def _rpm_to_pwm_by_level(self, point_id, value, table):
+        point_id = self._validate_point_id(point_id)
+        level = fan_rpm_to_level(value, point_id, table)
+        nominal = fan_level_to_rpm(level, table)
+        if abs(nominal - value) >= 50:
+            log.info("Fan curve point %d: %s rpm becomes level %d (%d rpm)", point_id, value, level, nominal)
+        return fan_level_to_pwm(level)
+
+    def _get_max_rpm(self, fan_id):
+        max_rpm = (self.get_fan_1_max_rpm, self.get_fan_2_max_rpm)[fan_id]()
+        if max_rpm <= 0:
+            raise ValueError(f"fan{fan_id + 1}_max is not positive, cannot convert rpm to pwm")
+        return max_rpm
+
+    def _rpm_to_pwm(self, point_id, value, fan_id, tables):
+        self._validate_point_id(point_id)
+        if not isfinite(value):
+            raise ValueError("Fan speed must be finite")
+        if tables is not None:
+            return self._rpm_to_pwm_by_level(point_id, value, tables[fan_id])
+        max_rpm = self._get_max_rpm(fan_id)
+        value = max(0, min(max_rpm, value))
+        if self.speed_unit == "percent":
+            percent = round(value * 100 / max_rpm)
+            # Ceiling PWM avoids losing a percentage point in the kernel's floor.
+            return (percent * 255 + 99) // 100
+        return max(0, min(255, int(value // 100 * (100 * 255) / max_rpm)))
+
     def set_fan_1_speed_rpm(self, point_id, value):
-        return self.set_fan_1_speed_pwm(point_id, int(value // 100 * (100 * 255) / self.get_fan_1_max_rpm()))
+        return self.set_fan_1_speed_pwm(point_id, self._rpm_to_pwm(point_id, value, 0, self.level_tables))
 
     def set_fan_2_speed_rpm(self, point_id, value):
-        return self.set_fan_2_speed_pwm(point_id, int(value // 100 * (100 * 255) / self.get_fan_2_max_rpm()))
+        return self.set_fan_2_speed_pwm(point_id, self._rpm_to_pwm(point_id, value, 1, self.level_tables))
 
     def set_lower_cpu_temperature(self, point_id, value):
         point_id = self._validate_point_id(point_id)
@@ -1419,13 +1751,23 @@ class FanCurveIO(Feature):
         file_path = self.hwmon_path + self.pwm2_fan_speed.format(point_id)
         return self._read_file(file_path)
 
+    def _get_speed_rpm(self, point_id, fan_id, tables):
+        shared_speed = tables is not None and not self.has_fan_2_speed()
+        pwm_reader = (self.get_fan_1_speed_pwm, self.get_fan_2_speed_pwm)[0 if shared_speed else fan_id]
+        pwm = pwm_reader(point_id)
+        if tables is not None:
+            return fan_level_to_rpm(fan_pwm_to_level(pwm), tables[fan_id])
+        max_rpm = self._get_max_rpm(fan_id)
+        if self.speed_unit == "percent":
+            percent = (pwm * 100 + 254) // 255
+            return round(percent * max_rpm / 100, ndigits=2)
+        return round(((pwm * max_rpm + (100 * 255) - 1) // (100 * 255)) * 100, ndigits=2)
+
     def get_fan_1_speed_rpm(self, point_id):
-        pwm = self.get_fan_1_speed_pwm(point_id)
-        return round(((pwm * self.get_fan_1_max_rpm() + (100 * 255) - 1) // (100 * 255)) * 100, ndigits=2)
+        return self._get_speed_rpm(point_id, 0, self.level_tables)
 
     def get_fan_2_speed_rpm(self, point_id):
-        pwm = self.get_fan_2_speed_pwm(point_id)
-        return round(((pwm * self.get_fan_2_max_rpm() + (100 * 255) - 1) // (100 * 255)) * 100, ndigits=2)
+        return self._get_speed_rpm(point_id, 1, self.level_tables)
 
     def get_lower_cpu_temperature(self, point_id):
         point_id = self._validate_point_id(point_id)
@@ -1471,12 +1813,14 @@ class FanCurveIO(Feature):
         return self.exists() and self.hwmon_path is not None and os.path.exists(self.hwmon_path + self.minifancurve)
 
     def set_minifancuve(self, value):
+        self._require_hwmon()
         log.info("Setting minifancurve to: %s", str(value))
         file_path = self.hwmon_path + self.minifancurve
         outvalue = 1 if value else 0
         return self._write_file_or(file_path, outvalue)
 
     def get_minifancuve(self):
+        self._require_hwmon()
         file_path = self.hwmon_path + self.minifancurve
         invalue = self._read_file_or(file_path, False)
         return invalue != 0
@@ -1487,6 +1831,7 @@ class FanCurveIO(Feature):
 
     def write_fan_curve(self, fan_curve: FanCurve, _=False):
         """Writes a fan curve object to the file system and sets minifancurve if enabled"""
+        self._require_hwmon()
         entries = list(fan_curve.entries)
         while entries and entries[-1].is_empty():
             entries.pop()
@@ -1494,10 +1839,14 @@ class FanCurveIO(Feature):
             log.warning("Fan curve has no writable points, skipping")
             return
 
-        auto_points_size = self.get_auto_points_size()
-        if auto_points_size is not None and len(entries) > auto_points_size:
-            log.warning("Trimming fan curve from %d to %d points (hardware limit)", len(entries), auto_points_size)
-            entries = entries[:auto_points_size]
+        point_count = self.get_point_count()
+        if point_count <= 0:
+            raise RuntimeError("No writable fan curve points are available")
+        if len(entries) > point_count:
+            log.warning("Trimming fan curve from %d to %d points (hardware limit)", len(entries), point_count)
+            entries = entries[:point_count]
+        if not entries:
+            return
 
         if self.use_legion_cli_to_write:
             trimmed_curve = FanCurve(fan_curve.name, entries, fan_curve.enable_minifancurve)
@@ -1505,53 +1854,209 @@ class FanCurveIO(Feature):
             return
 
         has_fan_2_speed = self.has_fan_2_speed()
-        has_temperature_curve = self.has_temperature_curve()
+        temperature_fields = self.temperature_fields()
         has_acceleration_curve = self.has_acceleration_curve()
+        tables = self.level_tables
+        # Calibrate every speed before any write, so a missing ladder or invalid
+        # RPM in a later point cannot leave a partly changed curve.
+        speeds = [
+            (
+                self._rpm_to_pwm(index, entry.fan1_speed, 0, tables),
+                self._rpm_to_pwm(index, entry.fan2_speed, 1, tables) if has_fan_2_speed else None,
+            )
+            for index, entry in enumerate(entries, start=1)
+        ]
+        level_table = self.percent_unit_on_level_table()
+        for point_id, (fan1_pwm, fan2_pwm) in enumerate(speeds, start=1):
+            self._check_level_table_pwm(point_id, fan1_pwm, level_table)
+            if fan2_pwm is not None:
+                self._check_level_table_pwm(point_id, fan2_pwm, level_table)
+        point_plan = self._fancurve_write_plan(
+            entries,
+            speeds,
+            temperature_fields,
+            has_fan_2_speed,
+            has_acceleration_curve,
+        )
         try:
             log.info("Trying to set minifancurve using fancurve profile to: %s", str(fan_curve.enable_minifancurve))
             self.set_minifancuve(fan_curve.enable_minifancurve)
-        # pylint: disable=broad-except
-        except BaseException as error:
+        except Exception as error:  # pylint: disable=broad-exception-caught
             log.error(str(error))
+        plan, snapshot_paths, size_path, clobbered_paths = self._prepare_resize_plan(
+            point_plan,
+            len(entries),
+            point_count,
+            temperature_fields=temperature_fields,
+            has_fan_2_speed=has_fan_2_speed,
+            has_acceleration_curve=has_acceleration_curve,
+        )
+        try:
+            self._write_fancurve_plan(
+                plan,
+                restore_filter=self._is_level_safe_restore if level_table else None,
+                snapshot_paths=snapshot_paths,
+                size_path=size_path,
+                clobbered_paths=clobbered_paths,
+            )
+        except PermissionError:
+            log.error(
+                "The kernel module refused the fan curve write: fan curve writes are disabled on this model "
+                "until validated (see allow_unvalidated_fancurve in the README)"
+            )
+            raise
+
+    def _prepare_resize_plan(
+        self, point_plan, target_size, point_count, *, temperature_fields, has_fan_2_speed, has_acceleration_curve
+    ):
+        """Prepend an auto_points_size update and rollback metadata when resizing an EC curve."""
+        if not self.has_writable_auto_points_size():
+            return point_plan, None, None, ()
+        previous_active_size = self.get_auto_points_size()
+        if previous_active_size == target_size:
+            return point_plan, None, None, ()
+        size_path = self.hwmon_path + self.auto_points_size
+        plan = [(size_path, self._validate_point_id(target_size)), *point_plan]
+        old_count = max(0, min(previous_active_size or 0, point_count))
+        snapshot_paths = [size_path]
+        for point_id in range(1, old_count + 1):
+            snapshot_paths.extend(
+                self._point_attr_paths(point_id, temperature_fields, has_fan_2_speed, has_acceleration_curve)
+            )
+        clobbered_paths = (
+            [
+                path
+                for point_id in range(min(old_count, target_size), old_count + 1)
+                for path in self._point_attr_paths(
+                    point_id, temperature_fields, has_fan_2_speed, has_acceleration_curve
+                )
+            ]
+            if old_count >= 1
+            else ()
+        )
+        return plan, snapshot_paths, size_path, clobbered_paths
+
+    def _check_fancurve_range(self, label, value, limits):
+        """Return value if the driver would accept it, else raise."""
+        low, high = limits
+        if not low <= value <= high:
+            raise ValueError(f"{label}={value} is outside the range the driver accepts ({low}-{high})")
+        return value
+
+    def _point_attr_paths(self, point_id, temperature_fields, has_fan_2_speed, has_acceleration_curve):
+        point_id = self._validate_point_id(point_id)
+        paths = [self.hwmon_path + self.pwm1_fan_speed.format(point_id)]
+        if has_fan_2_speed:
+            paths.append(self.hwmon_path + self.pwm2_fan_speed.format(point_id))
+        for name, pattern in self.temperature_files.items():
+            if name in temperature_fields:
+                paths.append(self.hwmon_path + pattern.format(point_id))
+        if has_acceleration_curve:
+            paths.append(self.hwmon_path + self.pwm1_accel.format(point_id))
+            paths.append(self.hwmon_path + self.pwm1_decel.format(point_id))
+        return paths
+
+    def _fancurve_write_plan(
+        self, entries, speeds, temperature_fields, has_fan_2_speed, has_acceleration_curve, *, resize_points=False
+    ):
+        """Resolve every fan curve sysfs write before any of them reaches the hardware.
+
+        Returns an ordered list of (file_path, value) pairs for the whole curve.
+        Point ids are bounds-checked and every value the driver range-checks is
+        validated here, so a curve the driver would reject is refused before
+        point 1 is written rather than part way through.
+        """
+        plan = []
+        if resize_points:
+            plan.append((self.hwmon_path + self.auto_points_size, self._validate_point_id(len(entries))))
         for index, entry in enumerate(entries):
-            point_id = index + 1
-            self.set_fan_1_speed_rpm(point_id, entry.fan1_speed)
+            point_id = self._validate_point_id(index + 1)
+            plan.append((self.hwmon_path + self.pwm1_fan_speed.format(point_id), speeds[index][0]))
             if has_fan_2_speed:
-                self.set_fan_2_speed_rpm(point_id, entry.fan2_speed)
-            if has_temperature_curve:
-                self.set_lower_cpu_temperature(point_id, entry.cpu_lower_temp)
-                self.set_upper_cpu_temperature(point_id, entry.cpu_upper_temp)
-                self.set_lower_gpu_temperature(point_id, entry.gpu_lower_temp)
-                self.set_upper_gpu_temperature(point_id, entry.gpu_upper_temp)
-                self.set_lower_ic_temperature(point_id, entry.ic_lower_temp)
-                self.set_upper_ic_temperature(point_id, entry.ic_upper_temp)
+                plan.append((self.hwmon_path + self.pwm2_fan_speed.format(point_id), speeds[index][1]))
+            for name, pattern in self.temperature_files.items():
+                if name in temperature_fields:
+                    value = self._check_fancurve_range(name, getattr(entry, name), self.KERNEL_TEMP_RANGE)
+                    plan.append((self.hwmon_path + pattern.format(point_id), value))
             if has_acceleration_curve:
-                self.set_acceleration(point_id, entry.acceleration)
-                self.set_deceleration(point_id, entry.deceleration)
+                plan.append(
+                    (
+                        self.hwmon_path + self.pwm1_accel.format(point_id),
+                        self._check_fancurve_range("acceleration", entry.acceleration, self.KERNEL_ACCEL_RANGE),
+                    )
+                )
+                plan.append(
+                    (
+                        self.hwmon_path + self.pwm1_decel.format(point_id),
+                        self._check_fancurve_range("deceleration", entry.deceleration, self.KERNEL_DECEL_RANGE),
+                    )
+                )
+        return plan
+
+    @staticmethod
+    def _build_restore_paths(written, size_path=None, clobbered_paths=()):
+        if size_path is None or size_path not in written:
+            return list(reversed(written))
+        seen = {size_path}
+        ordered = [size_path]
+        for file_path in list(reversed(written)) + list(clobbered_paths):
+            if file_path not in seen:
+                seen.add(file_path)
+                ordered.append(file_path)
+        return ordered
+
+    def _write_fancurve_plan(
+        self, plan, restore_filter=None, *, snapshot_paths=None, size_path=None, clobbered_paths=()
+    ):
+        """Apply a whole fan curve, putting the previous values back if a write fails.
+
+        Each point is an independent sysfs attribute, so a failure part way
+        through used to leave the EC running a mixture of the old and the new
+        curve. Snapshot every file first, then restore the ones already written.
+        A previous value rejected by restore_filter (e.g. an out-of-range level
+        left by an older module) is not written back.
+        """
+        paths_to_snapshot = [file_path for file_path, _ in plan] if snapshot_paths is None else snapshot_paths
+        previous = {}
+        for file_path in paths_to_snapshot:
+            if file_path not in previous:
+                previous[file_path] = self._read_file_or(file_path, None)
+        written = []
+        try:
+            for file_path, value in plan:
+                self._write_file(file_path, value)
+                written.append(file_path)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            log.error("Fan curve write failed (%s), restoring %d previous values", error, len(written))
+            for file_path in self._build_restore_paths(written, size_path, clobbered_paths):
+                if previous.get(file_path) is None:
+                    continue
+                if restore_filter is not None and not restore_filter(file_path, previous[file_path]):
+                    log.error("Not restoring %s to unsafe value %s", file_path, previous[file_path])
+                    continue
+                try:
+                    self._write_file(file_path, previous[file_path])
+                except Exception as restore_error:  # pylint: disable=broad-exception-caught
+                    log.error("Could not restore %s: %s", file_path, restore_error)
+            raise
 
     def read_fan_curve(self) -> FanCurve:
         """Reads a fan curve object from the file system"""
+        self._require_hwmon()
         entries = []
         has_fan_2_speed = self.has_fan_2_speed()
-        has_temperature_curve = self.has_temperature_curve()
         has_acceleration_curve = self.has_acceleration_curve()
-        for point_id in range(1, 11):
-            fan1_speed = self.get_fan_1_speed_rpm(point_id)
-            fan2_speed = self.get_fan_2_speed_rpm(point_id) if has_fan_2_speed else fan1_speed
-            if has_temperature_curve:
-                cpu_lower_temp = self.get_lower_cpu_temperature(point_id)
-                cpu_upper_temp = self.get_upper_cpu_temperature(point_id)
-                gpu_lower_temp = self.get_lower_gpu_temperature(point_id)
-                gpu_upper_temp = self.get_upper_gpu_temperature(point_id)
-                ic_lower_temp = self.get_lower_ic_temperature(point_id)
-                ic_upper_temp = self.get_upper_ic_temperature(point_id)
-            else:
-                cpu_lower_temp = 0
-                cpu_upper_temp = 0
-                gpu_lower_temp = 0
-                gpu_upper_temp = 0
-                ic_lower_temp = 0
-                ic_upper_temp = 0
+        tables = self.level_tables
+        active_count = min(self.get_active_point_count(), self.get_point_count())
+        for point_id in range(1, active_count + 1):
+            fan1_speed = self._get_speed_rpm(point_id, 0, tables)
+            fan2_speed = (
+                self._get_speed_rpm(point_id, 1, tables) if (has_fan_2_speed or tables is not None) else fan1_speed
+            )
+            temperatures = {
+                name: self._read_file_or(self.hwmon_path + pattern.format(point_id), 0)
+                for name, pattern in self.temperature_files.items()
+            }
             if has_acceleration_curve:
                 acceleration = self.get_acceleration(point_id)
                 deceleration = self.get_deceleration(point_id)
@@ -1561,14 +2066,9 @@ class FanCurveIO(Feature):
             entry = FanCurveEntry(
                 fan1_speed=fan1_speed,
                 fan2_speed=fan2_speed,
-                cpu_lower_temp=cpu_lower_temp,
-                cpu_upper_temp=cpu_upper_temp,
-                gpu_lower_temp=gpu_lower_temp,
-                gpu_upper_temp=gpu_upper_temp,
-                ic_lower_temp=ic_lower_temp,
-                ic_upper_temp=ic_upper_temp,
                 acceleration=acceleration,
                 deceleration=deceleration,
+                **temperatures,
             )
             entries.append(entry)
         while entries and entries[-1].is_empty():
@@ -1576,8 +2076,7 @@ class FanCurveIO(Feature):
         fancurve = FanCurve(name="unknown", entries=entries)
         try:
             fancurve.enable_minifancurve = self.get_minifancuve()
-        # pylint: disable=broad-except
-        except BaseException as error:
+        except Exception as error:  # pylint: disable=broad-exception-caught
             log.error(str(error))
         return fancurve
 
@@ -1601,6 +2100,11 @@ class ApplicationModel:
 
         self.enable_gui_monitoring = BoolSettingFeature("enable_gui_monitoring")
         self.enable_gui_monitoring.set(False)
+
+        # Re-read the EC fan curve after an external power-mode change
+        # (e.g. Fn+Q), once legiond has re-applied its preset.
+        self.auto_refresh_fancurve = BoolSettingFeature("auto_refresh_fancurve")
+        self.auto_refresh_fancurve.set(True)
 
         icon_color_modes = [
             NamedValue("always-color", "Always use colorful color scheme"),
@@ -1648,10 +2152,13 @@ class SettingsManager(Feature):
 
     def apply_settings(self, preset: Settings):
         for name, value in preset.setting_entries.items():
-            log.error("Try seting %s from preset to %s", name, value)
-            has_set = Feature.set_feature_to_value(name, value)
-            if not has_set:
-                log.error("Cannot set %s from preset to %s", name, value)
+            try:
+                log.info("Try setting %s from preset to %s", name, value)
+                has_set = Feature.set_feature_to_value(name, value)
+                if not has_set:
+                    log.error("Cannot set %s from preset to %s", name, value)
+            except Exception as err:  # pylint: disable=broad-exception-caught
+                log.error("Failed to set %s from preset to %s: %s", name, value, err)
 
     def _name_to_filename(self, name):
         return os.path.join(self.preset_dir, name + ".yaml")
@@ -1682,10 +2189,12 @@ class FanCurveRepository(Feature):
             "balanced-battery": None,
             "performance-battery": None,
             "balanced-performance-battery": None,
+            "extreme-battery": None,
             "quiet-ac": None,
             "balanced-ac": None,
             "performance-ac": None,
             "balanced-performance-ac": None,
+            "extreme-ac": None,
         }
 
         self.preset_dir = preset_dir
@@ -1737,22 +2246,26 @@ class CustomConservationController:
     def run(self):
         battery_cap = self.battery_capacity_perc.get()
         if battery_cap > self.upper_limit:
-            print(
-                "Enabling conservation mode because battery"
-                + f" {battery_cap} is greater than upper limit {self.upper_limit}"
+            log.info(
+                "Enabling conservation mode because battery %s is greater than upper limit %s",
+                battery_cap,
+                self.upper_limit,
             )
             self.battery_conservation.set_if_not_set(True)
             return self.battery_conservation.get()
         if battery_cap < self.lower_limit:
-            print(
-                "Disabling conservation mode because battery"
-                + f" {battery_cap} is lower than lower limit {self.lower_limit}"
+            log.info(
+                "Disabling conservation mode because battery %s is lower than lower limit %s",
+                battery_cap,
+                self.lower_limit,
             )
             self.battery_conservation.set_if_not_set(False)
             return self.battery_conservation.get()
-        print(
-            "Keeping conservation mode because battery"
-            + f" {battery_cap} is within bounds of {self.lower_limit} and {self.upper_limit}"
+        log.info(
+            "Keeping conservation mode because battery %s is within bounds of %s and %s",
+            battery_cap,
+            self.lower_limit,
+            self.upper_limit,
         )
         return self.battery_conservation.get()
 
@@ -1893,7 +2406,9 @@ class NVIDIAGPUOnQuietMode(Monitor):
 
     def run(self) -> List[DiagnosticMsg]:
         is_gpu_running = self.gpu_is_running.get()
-        is_quiet_mode = self.platform_profile.get() == "low-power"
+        # Other drivers (fallback when legion-laptop is not loaded) may call
+        # the lowest platform profile "quiet" instead of "low-power".
+        is_quiet_mode = self.platform_profile.get() in ("low-power", "quiet")
         diag = DiagnosticMsg()
         if is_gpu_running and is_quiet_mode:
             diag.value = True
@@ -1948,7 +2463,7 @@ class NVIDIAGPUOnQuietMode(Monitor):
 #                 monitors_to_notify = []
 
 
-class NotifcationSender:
+class NotificationSender:
     disable_notifications: bool
 
     def __init__(self):
@@ -1961,7 +2476,7 @@ class NotifcationSender:
         raise NotImplementedError()
 
 
-class SystemNotificationSender(NotifcationSender):
+class SystemNotificationSender(NotificationSender):
 
     def _send_notification(self, _, msg):
         if is_root_user():
@@ -1969,18 +2484,20 @@ class SystemNotificationSender(NotifcationSender):
             # TODOs: find a better way
             # Code by user dvilela on stackoverflow
             # https://stackoverflow.com/a/54718205
+            sudo_user = os.environ.get("SUDO_USER")
+            if sudo_user is None:
+                log.warning("Cannot send notification: SUDO_USER not set")
+                return
             user_id = (
-                subprocess.run(
-                    ["id", "-u", os.environ["SUDO_USER"]], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
-                )
-                .stdout.decode("utf-8")
+                subprocess.run(["id", "-u", sudo_user], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                .stdout.decode("utf-8", errors="replace")
                 .replace("\n", "")
             )
             subprocess.run(
                 [
                     "sudo",
                     "-u",
-                    os.environ["SUDO_USER"],
+                    sudo_user,
                     f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{user_id}/bus",
                     "notify-send",
                     "-i",
@@ -2030,6 +2547,8 @@ class LegionModelFacade:
         self.platform_profile = PlatformProfileFeature()
         self.on_power_supply = IsOnPowerSupplyFeature()
         self.always_on_usb_charging = AlwaysOnUSBChargingFeature()
+        self.instant_boot_ac = InstantBootACFeature()
+        self.instant_boot_usb_pd = InstantBootUSBPDFeature()
         self.battery_capacity_perc = BatteryCurrentCapacityPercentage()
         self.battery_custom_conservation_controller = CustomConservationController(
             self.battery_conservation, self.battery_capacity_perc
@@ -2054,7 +2573,7 @@ class LegionModelFacade:
         self.ioport_light = IOPortLight()
 
         # services
-        self.power_profiles_deamon_service = PowerProfilesDeamonService()
+        self.power_profiles_deamon_service = PowerProfilesDaemonService()
         self.lenovo_legion_laptop_support_service = LenovoLegionLaptopSupportService()
         self.legion_gui_autostart = LegionGUIAutostart()
 
@@ -2073,6 +2592,7 @@ class LegionModelFacade:
         self.settings_manager.add_feature(self.app_model.close_to_tray)
         self.settings_manager.add_feature(self.app_model.open_closed_to_tray)
         self.settings_manager.add_feature(self.app_model.enable_gui_monitoring)
+        self.settings_manager.add_feature(self.app_model.auto_refresh_fancurve)
         self.settings_manager.add_feature(self.app_model.icon_color_mode)
 
     def _replace_efi_file(self, original_file, new_file):
@@ -2082,10 +2602,13 @@ class LegionModelFacade:
 
     def _backup_file(self, file_path, timestamp):
         base_name = os.path.basename(file_path)
-        tmp_path = os.path.join("/tmp", base_name)
+
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=f"{base_name}_", suffix=".tmp")
+        os.close(tmp_fd)
         shutil.copy(file_path, tmp_path)
 
-        backup_path = os.path.join("/tmp", f"{base_name}_{timestamp}.bak")
+        backup_fd, backup_path = tempfile.mkstemp(prefix=f"{base_name}_{timestamp}_", suffix=".bak")
+        os.close(backup_fd)
         shutil.copy(file_path, backup_path)
         log.info("Backup of %s created: %s", base_name, backup_path)
         return tmp_path, backup_path
@@ -2100,6 +2623,11 @@ class LegionModelFacade:
             return f.read()
 
     def _check_image_dimensions_and_format(self, image_path, expected_width, expected_height):
+        if not PIL_AVAILABLE:
+            raise ValueError(
+                "Pillow is not installed. Install it (e.g. the python-pillow package of your distribution) "
+                "to use boot logo features."
+            )
         with Image.open(image_path) as img:
             img_width, img_height = img.size
             img_format = img.format.lower()
@@ -2222,15 +2750,43 @@ class LegionModelFacade:
         self.read_fancurve_from_hw()
         self.fan_curve.save_to_file(filename)
 
-    def fancurve_write_preset_for_current_profile(self, write_minifancurve=False):
+    def fancurve_write_preset_for_current_profile(self, write_minifancurve=False) -> bool:
+        """Write the shipped fan curve preset matching the current power mode.
+
+        Returns True if a curve was written, False if the current power mode
+        has no preset. Callers need the difference: three of the five
+        platform profiles (low-power, custom, max-power) have no preset, and
+        reporting success there would mean silently doing nothing.
+        """
         is_on_powersupply = self.on_power_supply.get()
         profile = self.platform_profile.get()
         preset_name = self.fancurve_repo.get_preset_name(profile, is_on_powersupply)
-        print(f"Loading preset={preset_name} for profile={profile} and is_powersupply={is_on_powersupply}")
-        if preset_name in self.fancurve_repo.fancurve_presets:
-            fancurve = self.fancurve_repo.load_by_name_or_default(preset_name)
-            self.fancurve_io.write_fan_curve(fancurve, write_minifancurve)
-            print(fancurve)
+        log.info(
+            "Loading preset=%s for profile=%s and is_powersupply=%s",
+            preset_name,
+            profile,
+            is_on_powersupply,
+        )
+        if preset_name not in self.fancurve_repo.fancurve_presets:
+            log.warning(
+                "No fan curve preset for power mode '%s' on %s (looked for '%s');"
+                " nothing was written. Presets exist for: %s",
+                profile,
+                "AC" if is_on_powersupply else "battery",
+                preset_name,
+                ", ".join(sorted(self.fancurve_repo.get_names())),
+            )
+            return False
+        if not self.fancurve_repo.does_exists_by_name(preset_name):
+            # no battery preset shipped (e.g. extreme-battery): fall back
+            # to the AC twin, mirroring the legiond behavior
+            fallback = preset_name.replace("-battery", "-ac")
+            log.info("Preset %s not found, falling back to %s", preset_name, fallback)
+            preset_name = fallback
+        fancurve = self.fancurve_repo.load_by_name(preset_name)
+        self.fancurve_io.write_fan_curve(fancurve, write_minifancurve)
+        log.info("Fancurve: %s", fancurve)
+        return True
 
     def conservation_apply_mode_for_current_battery_capacity(self, lower_limit=None, upper_limit=None):
         if lower_limit is not None:
@@ -2240,13 +2796,17 @@ class LegionModelFacade:
         return self.battery_custom_conservation_controller.run()
 
     def load_settings(self):
-        if self.settings_manager.does_exists_by_name("settings"):
-            log.info("Settings file exists and will be loaded.")
+        if not self.settings_manager.does_exists_by_name("settings"):
+            log.info("Settings file does not exist.")
+            return
+        log.info("Settings file exists and will be loaded.")
+        try:
             settings = self.settings_manager.load_by_name("settings")
             log.info("Loaded settings:\n %s", settings.to_yaml())
-            self.settings_manager.apply_settings(settings)
-        else:
-            log.info("Settings file does not exist.")
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            log.error("Failed to load settings file: %s", err)
+            return
+        self.settings_manager.apply_settings(settings)
 
     def save_settings(self):
         log.info("Saving settings...")
@@ -2265,8 +2825,7 @@ class LegionModelFacade:
                 for mon in self.monitors:
                     try:
                         diag_msgs = diag_msgs + mon.run()
-                    # pylint: disable=broad-except
-                    except Exception as err:
+                    except Exception as err:  # pylint: disable=broad-exception-caught
                         log.error(str(err))
                 for msg in diag_msgs:
                     if msg.has_value and msg.filter_do_output:

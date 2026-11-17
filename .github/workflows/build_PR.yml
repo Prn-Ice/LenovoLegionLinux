@@ -46,7 +46,7 @@ jobs:
       run: ./deploy/dependencies/install_dependencies_ubuntu_24_04.sh
       shell: bash
     - name: Build
-      run: ./tests/test_kenel_dkms_install.sh || true
+      run: ./tests/test_kernel_dkms_install.sh
       shell: bash
 
   run-tests:
@@ -66,25 +66,56 @@ jobs:
         if: always()
         run: ./tests/test_python.sh
         shell: bash
+      - name: Build legiond
+        if: always()
+        run: ./tests/test_legiond_build.sh
+        shell: bash
       - name: Test python CLI
         if: always()
         run: ./tests/test_python_cli.sh
         shell: bash
-          #- name: Test python GUI
-          #if: always()
-          #run: ./tests/test_python_gui.sh
-          #shell: bash
+      - name: Test python GUI
+        if: always()
+        run: ./tests/test_python_gui.sh
+        shell: bash
+      - name: Test Python library and kernel fixtures
+        if: always()
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ./tests/test_python_unit.sh
+        shell: bash
       - name: Install python package
         if: always()
-        run: ./deploy/python_install_pip_pkg.sh
+        run: sudo ./deploy/python_install_pip_pkg.sh
         shell: bash
 
   test-in-docker-container:
-    needs: [build, run-tests]
+    # No `needs`: the container builds are self-contained, so start them
+    # immediately in parallel with the other jobs to keep wall time low.
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
     - name: Build containers and run tests inside them
-      run: ./deploy/build_containers.sh
-      shell: bash
+      # bake keeps the parallel compose targets and adds a persistent
+      # GitHub Actions layer cache so unchanged dependency layers
+      # (pacman/apt installs) are not rebuilt on every run.
+      uses: docker/bake-action@v7
+      with:
+        # Run bake from deploy/ so the compose build contexts ("..")
+        # resolve to the repository root, like docker compose does locally.
+        source: ./deploy
+        files: ./docker-compose.yaml
+        # Test-only builds; no registry push, so skip provenance attestations.
+        provenance: false
+        targets: legion-arch,legion-manjaro,legion-ubuntu-24-04
+        set: |
+          legion-arch.cache-from=type=gha,scope=lll-arch
+          legion-arch.cache-to=type=gha,mode=max,scope=lll-arch
+          legion-manjaro.cache-from=type=gha,scope=lll-manjaro
+          legion-manjaro.cache-to=type=gha,mode=max,scope=lll-manjaro
+          legion-ubuntu-24-04.cache-from=type=gha,scope=lll-ubuntu-24-04
+          legion-ubuntu-24-04.cache-to=type=gha,mode=max,scope=lll-ubuntu-24-04

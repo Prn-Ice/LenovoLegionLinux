@@ -1,13 +1,12 @@
 [Unit]
 Description=Smart Fan Control Daemon
-After=multi-user.target
-Wants=acpi_call.service
+After=multi-user.target systemd-modules-load.service
 
 [Service]
 Type=forking
-ExecStart=/usr/local/bin/smartfan start quiet
+ExecStart=/usr/local/bin/smartfan start balanced
 ExecStop=/usr/local/bin/smartfan stop
-PIDFile=/tmp/smartfan.pid
+PIDFile=/run/smartfan/pid
 Restart=on-failure
 RestartSec=5
 
