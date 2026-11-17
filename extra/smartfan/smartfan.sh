@@ -2,39 +2,105 @@
 # Smart Fan Daemon for Legion 7 Gen 10
 # Uses LECR(0xD1) via acpi_call for direct fan control
 
-MODEFILE="/tmp/smartfan_mode"
-PIDFILE="/tmp/smartfan.pid"
+RUNDIR="/run/smartfan"
+MODEFILE="$RUNDIR/mode"
+PIDFILE="$RUNDIR/pid"
 ACPI_CALL="/proc/acpi/call"
-STOPFILE="/tmp/smartfan_stop"
+# Overridable so the sensor detection can be exercised against a fake tree.
+HWMON_ROOT="${HWMON_ROOT:-/sys/class/hwmon}"
+STOPFILE="$RUNDIR/stop"
+PAUSEFILE="$RUNDIR/pause"
+LOG="$RUNDIR/log"
+#DEBUG=1  # Set to 1 for verbose logging
 
+# Runtime state lives in /run/smartfan (root-owned) instead of /tmp so an
+# unprivileged local user cannot plant a symlink for the root daemon to
+# append its log to, nor stop/pause the daemon by creating the control
+# files themselves.
+ensure_run_dir() {
+    install -d -m 0755 "$RUNDIR" 2>/dev/null || {
+        echo "Error: cannot create $RUNDIR (run as root)" >&2
+        return 1
+    }
+}
+
+log() {
+    # Best-effort: the log file is root-owned once the systemd-run daemon
+    # has created it, so a plain-user invocation (e.g. `smartfan status`)
+    # can't append to it - don't let that leak a "Permission denied" line.
+    { echo "$(date '+%Y-%m-%d %H:%M:%S'): $1" >> "$LOG"; } 2>/dev/null
+    [ "$DEBUG" = "1" ] && echo "$1"
+}
+
+# Existence check that doesn't depend on signal permissions: `kill -0`
+# fails with EPERM (not just ESRCH) when the daemon runs as root and the
+# caller doesn't, which looks identical to "not running" to a plain exit
+# code check. /proc/<pid> existence needs no special privilege to read.
+pid_running() {
+    [ -n "$1" ] && [ -d "/proc/$1" ]
+}
+
+# Check for acpi_call
 if [ ! -f "$ACPI_CALL" ]; then
     modprobe acpi_call 2>/dev/null
+    sleep 1
     if [ ! -f "$ACPI_CALL" ]; then
         echo "Error: acpi_call module not available"
+        echo "Try: sudo modprobe acpi_call"
         exit 1
     fi
 fi
 
+# Find correct hwmon path
+find_hwmon() {
+    for hwmon in "$HWMON_ROOT"/hwmon*; do
+        if [ -f "$hwmon/name" ]; then
+            name=$(cat "$hwmon/name")
+            if [[ "$name" == *"coretemp"* ]] || [[ "$name" == *"k10temp"* ]] || [[ "$name" == *"zenpower"* ]]; then
+                CPU_HWMON="$hwmon"
+                log "Found CPU hwmon: $hwmon ($name)"
+            fi
+            if [[ "$name" == *"amdgpu"* ]] || [[ "$name" == *"nouveau"* ]]; then
+                GPU_HWMON="$hwmon"
+                log "Found GPU hwmon: $hwmon ($name)"
+            fi
+        fi
+    done
+    
+    # No hardcoded fallback: hwmon9 is a guess that is wrong on most machines,
+    # and reading an unrelated sensor is indistinguishable from a working one.
+    # Leave the paths unset so get_max_temp reports the failure instead.
+    [ -z "$CPU_HWMON" ] && log "Warning: no CPU hwmon sensor found (looked for coretemp/k10temp/zenpower)"
+    [ -z "$GPU_HWMON" ] && log "Warning: no GPU hwmon sensor found (looked for amdgpu/nouveau)"
+}
+
 get_profile() {
     case "$1" in
         quiet)
-            TEMP_LOW=75; TEMP_MED=85; TEMP_HIGH=92
-            FAN_LOW=20; FAN_MED=35; FAN_HIGH=50; FAN_MAX=70
+            # 10 temperature points for smooth curve
+            TEMP_POINTS="40 50 60 65 70 75 80 85 90 95"
+            FAN_POINTS="20 20 20 25 30 35 40 50 60 70"
             RAMP_DOWN_DELAY=3
             ;;
         balanced)
-            TEMP_LOW=70; TEMP_MED=80; TEMP_HIGH=90
-            FAN_LOW=30; FAN_MED=45; FAN_HIGH=55; FAN_MAX=60
+            TEMP_POINTS="40 50 60 65 70 75 80 85 90 95"
+            FAN_POINTS="25 25 30 35 40 45 50 55 60 70"
             RAMP_DOWN_DELAY=3
             ;;
         performance)
-            TEMP_LOW=60; TEMP_MED=70; TEMP_HIGH=80
-            FAN_LOW=45; FAN_MED=60; FAN_HIGH=75; FAN_MAX=85
+            TEMP_POINTS="40 50 60 65 70 75 80 85 90 95"
+            FAN_POINTS="35 40 45 50 55 60 65 75 85 95"
             RAMP_DOWN_DELAY=3
             ;;
         extreme)
-            TEMP_LOW=50; TEMP_MED=60; TEMP_HIGH=70
-            FAN_LOW=60; FAN_MED=75; FAN_HIGH=90; FAN_MAX=100
+            TEMP_POINTS="40 50 60 65 70 75 80 85 90 95"
+            FAN_POINTS="50 60 65 70 75 80 85 90 95 100"
+            RAMP_DOWN_DELAY=3
+            ;;
+        *)
+            log "Invalid profile: $1, using performance"
+            TEMP_POINTS="40 50 60 65 70 75 80 85 90 95"
+            FAN_POINTS="35 40 45 50 55 60 65 75 85 95"
             RAMP_DOWN_DELAY=3
             ;;
     esac
@@ -42,208 +108,432 @@ get_profile() {
 
 set_fan_speed() {
     local pct=$1
-    if [ "$pct" -le 0 ]; then
-        pct=20
-    fi
+    # Ensure valid range
+    if [ "$pct" -lt 20 ]; then pct=20; fi
+    if [ "$pct" -gt 100 ]; then pct=100; fi
+    
     local val=$((pct * 100))
-    local b0=$(printf '0x%02x' $((val & 0xFF)))
-    local b1=$(printf '0x%02x' $(( (val >> 8) & 0xFF)))
-    local b2=$(printf '0x%02x' $(( (val >> 16) & 0xFF)))
-    local b3=$(printf '0x%02x' $(( (val >> 24) & 0xFF)))
-    echo "\_SB_.GZFD.WMAE 0 0x12 {0x01, 0x00, 0x03, 0x04, $b0, $b1, $b2, $b3}" > "$ACPI_CALL"
-    cat "$ACPI_CALL" > /dev/null 2>&1
-    echo "\_SB_.GZFD.WMAE 0 0x12 {0x02, 0x00, 0x03, 0x04, $b0, $b1, $b2, $b3}" > "$ACPI_CALL"
-    cat "$ACPI_CALL" > /dev/null 2>&1
+    local b0
+    b0=$(printf '0x%02x' $((val & 0xFF)))
+    local b1
+    b1=$(printf '0x%02x' $(((val >> 8) & 0xFF)))
+    local b2
+    b2=$(printf '0x%02x' $(((val >> 16) & 0xFF)))
+    local b3
+    b3=$(printf '0x%02x' $(((val >> 24) & 0xFF)))
+    
+    # Try both fan channels
+    echo "\_SB_.GZFD.WMAE 0 0x12 {0x01, 0x00, 0x03, 0x04, $b0, $b1, $b2, $b3}" > "$ACPI_CALL" 2>/dev/null
+    sleep 0.1
+    echo "\_SB_.GZFD.WMAE 0 0x12 {0x02, 0x00, 0x03, 0x04, $b0, $b1, $b2, $b3}" > "$ACPI_CALL" 2>/dev/null
 }
 
-TEMP_HISTORY=""
-TEMP_SAMPLES=8
-RAMP_UP_COUNT=0
-RAMP_UP_NEEDED=3
+# Map the current platform_profile to the WMAA power-mode argument used by
+# workmode.sh. Empty on unknown profiles so we never force one.
+platform_profile_to_wmi() {
+    local current
+    current=$(cat /sys/firmware/acpi/platform_profile 2>/dev/null)
+    case "$current" in
+        low-power) echo "0x01" ;;
+        balanced) echo "0x02" ;;
+        performance) echo "0x03" ;;
+        custom) echo "0xFF" ;;
+        high-performance) echo "0xE0" ;;
+        *) echo "" ;;
+    esac
+}
+
+# Hand control back to the EC: re-assert the current power mode (the same
+# WMAA write turbooff used to hardcode to quiet, which silently dropped a
+# performance user back to quiet) and leave a 30% baseline while the
+# firmware re-takes the fans.
+restore_ec_control() {
+    local wmi_arg
+    wmi_arg=$(platform_profile_to_wmi)
+    if [ -n "$wmi_arg" ]; then
+        echo "\_SB_.GZFD.WMAA 0 0x2C {$wmi_arg, 0x00, 0x00, 0x00}" > "$ACPI_CALL" 2>/dev/null
+    fi
+    set_fan_speed 30
+}
 
 get_max_temp() {
-    local cpu_temp=$(cat /sys/class/hwmon/hwmon9/temp1_input 2>/dev/null)
-    local gpu_temp=$(cat /sys/class/hwmon/hwmon9/temp2_input 2>/dev/null)
+    local cpu_temp=""
+    local gpu_temp=""
+    local cpu_file="$CPU_HWMON/temp1_input"
+    local gpu_file="$GPU_HWMON/temp1_input"
+    local got=0
+
+    # Try different temp files
+    if [ -f "$cpu_file" ]; then
+        cpu_temp=$(cat "$cpu_file" 2>/dev/null)
+        [ -n "$cpu_temp" ] && got=1
+    fi
+    if [ -z "$cpu_temp" ] && [ -f "$GPU_HWMON/temp2_input" ]; then
+        cpu_temp=$(cat "$GPU_HWMON/temp2_input" 2>/dev/null)
+        [ -n "$cpu_temp" ] && got=1
+    fi
+
+    if [ -f "$gpu_file" ]; then
+        gpu_temp=$(cat "$gpu_file" 2>/dev/null)
+        [ -n "$gpu_temp" ] && got=1
+    fi
+    if [ -z "$gpu_temp" ] && [ -f "$CPU_HWMON/temp2_input" ]; then
+        gpu_temp=$(cat "$CPU_HWMON/temp2_input" 2>/dev/null)
+        [ -n "$gpu_temp" ] && got=1
+    fi
+
+    # Nothing readable at all. Report the failure rather than a plausible 0,
+    # which would otherwise resolve to the coldest point of the curve.
+    [ "$got" -eq 0 ] && return 0
+
+    # Convert to Celsius
     cpu_temp=$((cpu_temp / 1000))
     gpu_temp=$((gpu_temp / 1000))
-    local raw
-    if [ "$cpu_temp" -gt "$gpu_temp" ]; then
-        raw=$cpu_temp
+
+    # Clamp to reasonable range
+    [ "$cpu_temp" -gt 100 ] && cpu_temp=100
+    [ "$gpu_temp" -gt 100 ] && gpu_temp=100
+    [ "$cpu_temp" -lt 0 ] && cpu_temp=0
+    [ "$gpu_temp" -lt 0 ] && gpu_temp=0
+
+    local raw=$cpu_temp
+    [ "$gpu_temp" -gt "$raw" ] && raw=$gpu_temp
+
+    echo "$raw"
+}
+
+# Hottest point of the active profile. Stand-in for a missing reading: a fan
+# daemon that loses its input must bias towards running the fans.
+profile_max_temp() {
+    echo "$TEMP_POINTS" | awk '{print $NF}'
+}
+
+# Decide which temperature to act on. last_temp is 0 until a usable reading
+# has been seen, which is the case that used to fall through to 0 degrees and
+# park the fans at the bottom of the curve.
+resolve_temp() {
+    local reading=$1
+    local last_temp=$2
+
+    if [ -n "$reading" ] && [ "$reading" -gt 0 ]; then
+        echo "$reading"
+    elif [ "$last_temp" -gt 0 ]; then
+        log "Warning: Could not read temperature, using last known: $last_temp"
+        echo "$last_temp"
     else
-        raw=$gpu_temp
+        log "Warning: No usable temperature reading, using profile maximum: $(profile_max_temp)"
+        profile_max_temp
     fi
-    if [ "$raw" -gt 90 ]; then
-        raw=90
-    fi
-    TEMP_HISTORY="$TEMP_HISTORY $raw"
-    local count=$(echo $TEMP_HISTORY | wc -w)
-    if [ "$count" -gt "$TEMP_SAMPLES" ]; then
-        TEMP_HISTORY=$(echo $TEMP_HISTORY | cut -d' ' -f2-)
-    fi
-    local sum=0
-    for t in $TEMP_HISTORY; do
-        sum=$((sum + t))
-    done
-    count=$(echo $TEMP_HISTORY | wc -w)
-    echo $((sum / count))
 }
 
 get_target_pct() {
     local temp=$1
-    if [ "$temp" -le "$TEMP_LOW" ]; then
-        echo "$FAN_LOW"
-    elif [ "$temp" -le "$TEMP_MED" ]; then
-        local range=$((TEMP_MED - TEMP_LOW))
-        local offset=$((temp - TEMP_LOW))
-        echo $(( FAN_LOW + (FAN_MED - FAN_LOW) * offset / range ))
-    elif [ "$temp" -le "$TEMP_HIGH" ]; then
-        local range=$((TEMP_HIGH - TEMP_MED))
-        local offset=$((temp - TEMP_MED))
-        echo $(( FAN_MED + (FAN_HIGH - FAN_MED) * offset / range ))
-    else
-        echo "$FAN_MAX"
+    local temps
+    read -ra temps <<< "$TEMP_POINTS"
+    local fans
+    read -ra fans <<< "$FAN_POINTS"
+    local target=${fans[0]}
+    
+    # If below first point, use first fan speed
+    if [ "$temp" -le "${temps[0]}" ]; then
+        echo "${fans[0]}"
+        return
     fi
-}
-
-stop_daemon() {
-    # Signal any running daemon to stop via stop file
-    touch "$STOPFILE"
-    # Also kill by PID file as backup
-    if [ -f "$PIDFILE" ]; then
-        local oldpid=$(cat "$PIDFILE")
-        kill "$oldpid" 2>/dev/null
-        sleep 1
-        kill -9 "$oldpid" 2>/dev/null
+    
+    # If above last point, use last fan speed
+    local last_idx=$((${#temps[@]} - 1))
+    if [ "$temp" -ge "${temps[$last_idx]}" ]; then
+        echo "${fans[$last_idx]}"
+        return
     fi
-    # Wait for it to actually die
-    sleep 1
-    rm -f "$PIDFILE" "$STOPFILE"
-    # Restore EC auto
-    set_fan_speed 0
+    
+    # Find which two points we're between and interpolate
+    for ((i=0; i<last_idx; i++)); do
+        local t1=${temps[$i]}
+        local t2=${temps[$((i+1))]}
+        local f1=${fans[$i]}
+        local f2=${fans[$((i+1))]}
+        
+        if [ "$temp" -ge "$t1" ] && [ "$temp" -le "$t2" ]; then
+            # Linear interpolation between points
+            local temp_range=$((t2 - t1))
+            local temp_offset=$((temp - t1))
+            local fan_range=$((f2 - f1))
+            
+            if [ "$temp_range" -gt 0 ]; then
+                target=$((f1 + (fan_range * temp_offset) / temp_range))
+            else
+                target=$f1
+            fi
+            break
+        fi
+    done
+    
+    echo "$target"
 }
 
 run_daemon() {
     local mode="$1"
-    echo "$$" > "$PIDFILE"
-    echo "$mode" > "$MODEFILE"
-    chmod 666 "$MODEFILE"
-    rm -f "$STOPFILE"
+    ensure_run_dir || exit 1
+    echo "$$" > "$PIDFILE" 2>/dev/null
+    echo "$mode" > "$MODEFILE" 2>/dev/null
+    # Let a plain user flip profiles and append to the log without giving
+    # away control: the directory stays root-owned so no one can replace
+    # these files with symlinks.
+    chmod 0666 "$MODEFILE" 2>/dev/null
+    chmod 0666 "$LOG" 2>/dev/null
+    rm -f "$STOPFILE" "$PAUSEFILE"
 
+    find_hwmon
     get_profile "$mode"
 
-    local current_pct=$FAN_LOW
+    local current_pct
+    current_pct=$(echo "$FAN_POINTS" | awk '{print $1}')
     local down_count=0
-    local LOG="/tmp/smartfan.log"
-    echo "$(date): daemon started, mode=$mode pid=$$" > "$LOG"
+    local ramp_up_count=0
+    local temp_history=""
+    local temp_samples=5
+    local last_temp=0
+
+    log "Daemon started: mode=$mode, PID=$$, CPU_HWMON=$CPU_HWMON, GPU_HWMON=$GPU_HWMON"
     set_fan_speed "$current_pct"
 
-    trap 'set_fan_speed 0; rm -f "$PIDFILE"; echo "$(date): stopped" >> "$LOG"; exit 0' TERM INT
+    trap 'log "Stopping daemon"; restore_ec_control; rm -f "$PIDFILE"; exit 0' TERM INT
 
+    local iteration=0
     while true; do
-        # Check if we should stop
+        # Check stop file
         if [ -f "$STOPFILE" ]; then
-            set_fan_speed 0
-            rm -f "$PIDFILE"
-            echo "$(date): stopped by signal" >> "$LOG"
+            log "Stop file detected"
+            restore_ec_control
+            rm -f "$PIDFILE" "$STOPFILE"
             exit 0
         fi
 
-        # Re-read mode in case it was changed
-        if [ -f "$MODEFILE" ]; then
-            local new_mode=$(cat "$MODEFILE")
-            if [ "$new_mode" != "$mode" ]; then
-                mode="$new_mode"
-                get_profile "$mode"
-                # Pre-fill history with current temp to avoid spike reaction
-                TEMP_HISTORY=""
-                local fill_temp=$(cat /sys/class/hwmon/hwmon9/temp1_input 2>/dev/null)
-                fill_temp=$((fill_temp / 1000))
-                if [ "$fill_temp" -gt 90 ]; then fill_temp=90; fi
-                for i in $(seq 1 $TEMP_SAMPLES); do
-                    TEMP_HISTORY="$TEMP_HISTORY $fill_temp"
-                done
-                current_pct=$FAN_LOW
-                down_count=0
-                RAMP_UP_COUNT=0
-                set_fan_speed "$current_pct"
-                echo "$(date): mode changed to $mode, reset fans" >> "$LOG"
-            fi
+        # While paused (e.g. turbo override) do not touch the fans
+        if [ -f "$PAUSEFILE" ]; then
+            sleep 2
+            continue
         fi
-
-        local temp=$(get_max_temp)
-        local target_pct=$(get_target_pct "$temp")
-
-        if [ "$target_pct" -gt "$current_pct" ]; then
-            RAMP_UP_COUNT=$((RAMP_UP_COUNT + 1))
-            if [ "$RAMP_UP_COUNT" -ge "$RAMP_UP_NEEDED" ]; then
-                current_pct=$target_pct
-                set_fan_speed "$current_pct"
-                echo "$(date): temp=${temp}C -> ${current_pct}%" >> "$LOG"
-                RAMP_UP_COUNT=0
-            fi
+        
+        # Check mode changes
+        local new_mode
+        new_mode=$(cat "$MODEFILE" 2>/dev/null)
+        if [ -n "$new_mode" ] && [ "$new_mode" != "$mode" ]; then
+            mode="$new_mode"
+            get_profile "$mode"
+            current_pct=$(echo "$FAN_POINTS" | awk '{print $1}')
             down_count=0
-        elif [ "$target_pct" -lt "$current_pct" ]; then
-            RAMP_UP_COUNT=0
-            down_count=$((down_count + 1))
-            if [ "$temp" -le "$((TEMP_LOW - 5))" ] && [ "$down_count" -ge 3 ]; then
-                current_pct=$target_pct
-                set_fan_speed "$current_pct"
-                echo "$(date): temp=${temp}C snap to ${current_pct}%" >> "$LOG"
-                down_count=0
-            elif [ "$down_count" -ge "$RAMP_DOWN_DELAY" ]; then
-                current_pct=$((current_pct - 10))
-                if [ "$current_pct" -lt "$target_pct" ]; then
+            ramp_up_count=0
+            temp_history=""
+            set_fan_speed "$current_pct"
+            log "Mode changed to $mode"
+        fi
+        
+        # Get temperature
+        local temp
+        temp=$(resolve_temp "$(get_max_temp)" "$last_temp")
+        last_temp=$temp
+        
+        # Apply smoothing
+        temp_history="$temp_history $temp"
+        local count
+        count=$(echo "$temp_history" | wc -w)
+        if [ "$count" -gt "$temp_samples" ]; then
+            temp_history=$(echo "$temp_history" | cut -d' ' -f2-)
+        fi
+        
+        # Calculate average
+        local sum=0
+        for t in $temp_history; do
+            sum=$((sum + t))
+        done
+        count=$(echo "$temp_history" | wc -w)
+        temp=$((sum / count))
+        
+        # Get target speed
+        local target_pct
+        target_pct=$(get_target_pct "$temp")
+        
+        # Fan control logic with smooth transitions
+        if [ "$target_pct" -gt "$current_pct" ]; then
+            # Temperature increased - ramp up faster
+            ramp_up_count=$((ramp_up_count + 1))
+            if [ "$ramp_up_count" -ge 2 ]; then
+                # Increase by up to 5% at a time for smoothness
+                local diff=$((target_pct - current_pct))
+                if [ "$diff" -gt 5 ]; then
+                    current_pct=$((current_pct + 5))
+                else
                     current_pct=$target_pct
                 fi
                 set_fan_speed "$current_pct"
-                echo "$(date): temp=${temp}C ramp DOWN to ${current_pct}%" >> "$LOG"
-                down_count=$((RAMP_DOWN_DELAY - 2))
+                log "Temp: ${temp}C, increasing fan to ${current_pct}%"
+                ramp_up_count=0
+            fi
+            down_count=0
+        elif [ "$target_pct" -lt "$current_pct" ]; then
+            # Temperature decreased - ramp down slower
+            ramp_up_count=0
+            down_count=$((down_count + 1))
+            
+            if [ "$temp" -le 45 ] && [ "$down_count" -ge 3 ]; then
+                # Snap to low if very cool
+                current_pct=$target_pct
+                set_fan_speed "$current_pct"
+                log "Temp: ${temp}C, dropping fan to ${current_pct}%"
+                down_count=0
+            elif [ "$down_count" -ge "$RAMP_DOWN_DELAY" ]; then
+                # Decrease by 3% at a time for smoothness
+                local diff=$((current_pct - target_pct))
+                if [ "$diff" -gt 3 ]; then
+                    current_pct=$((current_pct - 3))
+                else
+                    current_pct=$target_pct
+                fi
+                set_fan_speed "$current_pct"
+                log "Temp: ${temp}C, ramping down to ${current_pct}%"
+                down_count=0
             fi
         else
+            # Temperature stable
             down_count=0
-            RAMP_UP_COUNT=0
+            ramp_up_count=0
         fi
-
+        
+        # Debug info every 10 iterations
+        iteration=$((iteration + 1))
+        if [ $((iteration % 10)) -eq 0 ]; then
+            log "Status: temp=${temp}C, fan=${current_pct}%, mode=$mode"
+        fi
+        
         sleep 2
     done
+}
+
+stop_daemon() {
+    log "Stopping daemon..."
+    
+    # Create stop file
+    touch "$STOPFILE" 2>/dev/null
+    
+    # Kill by PID
+    if [ -f "$PIDFILE" ]; then
+        local pid
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        if pid_running "$pid"; then
+            kill -TERM "$pid" 2>/dev/null
+            # Wait for graceful shutdown
+            for i in {1..5}; do
+                pid_running "$pid" || break
+                sleep 1
+            done
+            # Force kill if still running
+            pid_running "$pid" && kill -9 "$pid" 2>/dev/null
+        fi
+    fi
+    
+    # Cleanup
+    rm -f "$PIDFILE" "$STOPFILE" "$MODEFILE" "$PAUSEFILE"
+    restore_ec_control
+    log "Daemon stopped"
 }
 
 case "$1" in
     start)
         mode="${2:-performance}"
         stop_daemon
+        sleep 1
         echo "Starting smart fan daemon in '$mode' mode..."
-        run_daemon "$mode" &
-        disown
-        echo "Smart fan running (PID: $!)"
+        nohup "$0" daemon "$mode" > /dev/null 2>&1 &
+        sleep 2
+        if [ -f "$PIDFILE" ] && pid_running "$(cat "$PIDFILE")"; then
+            echo "Smart fan running (PID: $(cat "$PIDFILE"))"
+        else
+            echo "Failed to start daemon. Check $LOG for details"
+        fi
+        ;;
+    daemon)
+        # Internal command for running as daemon
+        run_daemon "$2"
         ;;
     stop)
-        echo "Stopping smart fan daemon..."
         stop_daemon
-        echo "Fans restored to EC auto control"
+        ;;
+    pause)
+        ensure_run_dir || exit 1
+        touch "$PAUSEFILE" && echo "Daemon paused (fans left as-is, turbo can take over)"
+        ;;
+    resume)
+        rm -f "$PAUSEFILE" && echo "Daemon resumed"
+        ;;
+    restore)
+        restore_ec_control
+        echo "Fan control restored to EC"
         ;;
     mode)
         if [ -z "$2" ]; then
-            echo "Current mode: $(cat $MODEFILE 2>/dev/null || echo 'not running')"
+            if [ -f "$MODEFILE" ]; then
+                echo "Current mode: $(cat "$MODEFILE")"
+            else
+                echo "Not running"
+            fi
         else
-            echo "$2" > "$MODEFILE"
-            echo "Mode changed to: $2 (takes effect within 2s)"
+            case "$2" in
+                quiet|balanced|performance|extreme)
+                    echo "$2" > "$MODEFILE"
+                    echo "Mode changed to: $2"
+                    ;;
+                *)
+                    echo "Invalid mode. Use: quiet, balanced, performance, extreme"
+                    ;;
+            esac
         fi
         ;;
     status)
-        if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
-            echo "Smart fan: RUNNING (PID $(cat $PIDFILE))"
-            echo "Mode: $(cat $MODEFILE 2>/dev/null)"
-            echo "CPU: $(($(cat /sys/class/hwmon/hwmon9/temp1_input) / 1000))°C"
-            echo "GPU: $(($(cat /sys/class/hwmon/hwmon9/temp2_input) / 1000))°C"
-            echo "Fan1: $(cat /sys/class/hwmon/hwmon9/fan1_input) RPM"
-            echo "Fan2: $(cat /sys/class/hwmon/hwmon9/fan2_input) RPM"
+        if [ -f "$PIDFILE" ]; then
+            pid=$(cat "$PIDFILE" 2>/dev/null)
+            if pid_running "$pid"; then
+                echo "Smart fan: RUNNING (PID $pid)"
+                echo "Mode: $(cat "$MODEFILE" 2>/dev/null)"
+                if [ -f "$PAUSEFILE" ]; then
+                    echo "State: PAUSED (turbo override active)"
+                fi
+
+                find_hwmon
+                cpu_temp=$(cat "$CPU_HWMON/temp1_input" 2>/dev/null)
+                gpu_temp=$(cat "$GPU_HWMON/temp1_input" 2>/dev/null)
+
+                [ -n "$cpu_temp" ] && echo "CPU: $((cpu_temp / 1000))°C"
+                [ -n "$gpu_temp" ] && echo "GPU: $((gpu_temp / 1000))°C"
+
+                fan1=$(cat /sys/class/hwmon/hwmon*/fan1_input 2>/dev/null | head -1)
+                fan2=$(cat /sys/class/hwmon/hwmon*/fan2_input 2>/dev/null | head -1)
+
+                [ -n "$fan1" ] && echo "Fan1: $fan1 RPM"
+                [ -n "$fan2" ] && echo "Fan2: $fan2 RPM"
+
+                echo "Log: $LOG"
+            else
+                echo "Smart fan: NOT RUNNING (stale pid file)"
+            fi
         else
             echo "Smart fan: NOT RUNNING"
         fi
         ;;
+    debug)
+        echo "Debug information:"
+        echo "ACPI call file: $ACPI_CALL"
+        find_hwmon
+        echo "CPU HWMON: $CPU_HWMON"
+        echo "GPU HWMON: $GPU_HWMON"
+        echo "Available hwmon devices:"
+        for hwmon in /sys/class/hwmon/hwmon*; do
+            echo "  $hwmon: $(cat "$hwmon/name" 2>/dev/null)"
+        done
+        ;;
     *)
-        echo "Usage: smartfan {start [mode]|stop|mode [name]|status}"
+        echo "Usage: $0 {start [mode]|stop|pause|resume|mode [name]|status|debug}"
         echo "Modes: quiet, balanced, performance, extreme"
         ;;
 esac

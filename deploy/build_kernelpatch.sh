@@ -20,7 +20,7 @@ mkdir -p "${BUILD_DIR}"
 # Clone
 cd "${BUILD_DIR}"
 git clone --depth 1 --branch "v${KERNEL_VERSION}" https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
-cd ${BUILD_DIR}/linux
+cd "${BUILD_DIR}/linux"
 
 DRIVER_DIR="${BUILD_DIR}/linux/drivers/platform/x86"
 if [ -d "${DRIVER_DIR}/lenovo" ]; then
@@ -44,9 +44,10 @@ config LEGION_LAPTOP
 	  This is a driver for Lenovo Legion laptops and contains drivers for
 	  hotkey, fan control, and power mode.
 EOF
+# shellcheck disable=SC2016
 printf '\nobj-$(CONFIG_LEGION_LAPTOP) += legion-laptop.o\n' >> "${DRIVER_DIR}/Makefile"
 
-cd ${BUILD_DIR}/linux
+cd "${BUILD_DIR}/linux"
 git config user.name "John Martens"
 git config user.email "john.martens4@proton.me"
 git add --all
@@ -66,6 +67,13 @@ make clean && make mrproper
 make defconfig
 # cp -v /boot/config-$(uname -r) .config
 echo "CONFIG_LEGION_LAPTOP=m" >>.config
+make olddefconfig
 
-# Build
-make -j 8
+# Only compile our kmod instead of the whole kernel: prepare the tree for
+# module builds, then build the patched-in module. A full make -j verifies
+# nothing extra for the patch and took 25+ minutes on CI.
+# KBUILD_MODPOST_WARN=1: without a full kernel build there is no
+# Module.symvers, so modpost would fail on every kernel symbol; unresolved
+# symbols are expected here and the compile check is what matters.
+make -j "$(nproc)" modules_prepare
+make -j "$(nproc)" M="${DRIVER_DIR}" KBUILD_MODPOST_WARN=1

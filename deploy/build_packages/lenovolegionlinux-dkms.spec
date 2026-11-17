@@ -7,7 +7,7 @@ Name:         dkms-%{srcname}
 License:      GPL-2.0
 Group:        System/Kernel
 Summary:      LenovoLegionLinux Kernel Module Package
-Version:      0.0.22
+Version:      0.1.8
 Release:      0
 Source0:      https://github.com/johnfanv2/LenovoLegionLinux/archive/refs/tags/v%{version}.tar.gz
 
@@ -39,6 +39,50 @@ dkms remove -m %{dkms_name} -v %{version} -q --all || :
 %{_usrsrc}/%{dkms_name}-%{version}
 
 %changelog
+* Mon Nov 16 2026 github-actions <actions@github.com> - 0.1.8-0
+- 0.1.8 release of LenovoLegionLinux DKMS module.
+* Fri Nov 13 2026 github-actions <actions@github.com> - 0.1.7-0
+- 0.1.7 release of LenovoLegionLinux DKMS module.
+* Fri Nov 13 2026 github-actions <actions@github.com> - 0.1.6-0
+- 0.1.6 release of LenovoLegionLinux DKMS module.
+* Fri Oct 30 2026 github-actions <actions@github.com> - 0.1.5-0
+- 0.1.5 release of LenovoLegionLinux DKMS module.
+* Mon Oct 19 2026 github-actions <actions@github.com> - 0.1.4-0
+- 0.1.4 release of LenovoLegionLinux DKMS module.
+* Wed Oct 14 2026 github-actions <actions@github.com> - 0.1.3-0
+- 0.1.3 release of LenovoLegionLinux DKMS module.
+* Mon Oct 12 2026 github-actions <actions@github.com> - 0.1.2-0
+- 0.1.2 release of LenovoLegionLinux DKMS module.
+* Mon Oct 12 2026 github-actions <actions@github.com> - 0.1.1-0
+- 0.1.1 release of LenovoLegionLinux DKMS module.
+* Sat Oct 10 2026 github-actions <actions@github.com> - 0.1.0-0
+- 0.1.0 release of LenovoLegionLinux DKMS module.
+* Thu Oct 08 2026 github-actions <actions@github.com> - 0.0.35-0
+- 0.0.35 release of LenovoLegionLinux DKMS module.
+* Fri Oct 02 2026 github-actions <actions@github.com> - 0.0.34-0
+- 0.0.34 release of LenovoLegionLinux DKMS module.
+* Mon Sep 28 2026 github-actions <actions@github.com> - 0.0.33-0
+- 0.0.33 release of LenovoLegionLinux DKMS module.
+* Wed Sep 23 2026 github-actions <actions@github.com> - 0.0.32-0
+- 0.0.32 release of LenovoLegionLinux DKMS module.
+* Mon Sep 21 2026 github-actions <actions@github.com> - 0.0.31-0
+- 0.0.31 release of LenovoLegionLinux DKMS module.
+* Thu Sep 17 2026 github-actions <actions@github.com> - 0.0.30-0
+- 0.0.30 release of LenovoLegionLinux DKMS module.
+* Wed Sep 16 2026 github-actions <actions@github.com> - 0.0.29-0
+- 0.0.29 release of LenovoLegionLinux DKMS module.
+* Mon Sep 14 2026 github-actions <actions@github.com> - 0.0.28-0
+- 0.0.28 release of LenovoLegionLinux DKMS module.
+* Mon Sep 14 2026 github-actions <actions@github.com> - 0.0.27-0
+- 0.0.27 release of LenovoLegionLinux DKMS module.
+* Fri Sep 11 2026 github-actions <actions@github.com> - 0.0.26-0
+- 0.0.26 release of LenovoLegionLinux DKMS module.
+* Mon Sep 07 2026 github-actions <actions@github.com> - 0.0.25-0
+- 0.0.25 release of LenovoLegionLinux DKMS module.
+* Thu Sep 03 2026 github-actions <actions@github.com> - 0.0.24-0
+- 0.0.24 release of LenovoLegionLinux DKMS module.
+* Tue Sep 01 2026 github-actions <actions@github.com> - 0.0.23-0
+- 0.0.23 release of LenovoLegionLinux DKMS module.
 * Sat Aug 15 2026 github-actions <actions@github.com> - 0.0.22-0
 - 0.0.22 release of LenovoLegionLinux DKMS module.
 * Fri Aug 07 2026 Gonçalo Negrier Duarte <gonegrier.duarte@gmail.com> - 0.0.21-0

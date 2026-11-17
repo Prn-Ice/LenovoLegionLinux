@@ -49,6 +49,10 @@ int main(int argc, char *argv[])
 			// for example "legiond-ctl fanset 3" means 3 seconds delay
 			if (sscanf(argv[2], "%d", &request.delay_s) != 1)
 				request.delay_s = 0;
+			if (request.delay_s < 0) {
+				printf("invalid delay: must be >= 0\n");
+				return 1;
+			}
 		}
 	}
 
@@ -60,13 +64,28 @@ int main(int argc, char *argv[])
 	struct sockaddr_un addr = {
 		.sun_family = AF_UNIX,
 	};
-	strcpy(addr.sun_path, socket_path);
+	if (snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path) >=
+	    (int)sizeof(addr.sun_path))
+		return 2;
 
 	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1)
 		return 2;
 
-	if (send(fd, &request, sizeof(request), 0) != -1)
-		printf("successfully sent cmd\n");
+	/*
+	 * Report a failed or partial send: callers such as
+	 * legiond-cpuset.service (Type=oneshot) and the OpenRC
+	 * legiond.initd script only look at the exit status, and
+	 * swallowing this made a command that never reached the
+	 * daemon look like it had succeeded.
+	 */
+	ssize_t sent = send(fd, &request, sizeof(request), 0);
+
+	if (sent != (ssize_t)sizeof(request)) {
+		fprintf(stderr, "legiond-ctl: failed to send cmd\n");
+		return 1;
+	}
+
+	printf("successfully sent cmd\n");
 
 	return 0;
 }

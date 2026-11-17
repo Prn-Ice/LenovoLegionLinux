@@ -1,6 +1,9 @@
 #!/bin/bash
 set -ex
+DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 
-DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-PYTHONPATH="${DIR}/../python/legion_linux" python3 -m unittest discover \
-  -s "${DIR}/../python/legion_linux/tests" -v
+export PYTHONPATH="${DIR}/../python/legion_linux${PYTHONPATH:+:${PYTHONPATH}}"
+export QT_QPA_PLATFORM=offscreen
+python3 -m unittest discover -s "${DIR}/../python/legion_linux/tests" -v
+python3 -m unittest discover -s "${DIR}" -p 'test_*.py' -v
+bash "${DIR}/test_kernel_m1cn.sh"

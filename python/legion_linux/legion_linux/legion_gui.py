@@ -4,13 +4,15 @@
 import sys
 import os
 import os.path
+import glob
 import traceback
 import logging
 import random
 import time
+from math import isfinite
 from typing import List, Optional
 from PyQt6 import QtGui, QtCore
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QRunnable, QThreadPool
+from PyQt6.QtCore import Qt, QTimer, QFileSystemWatcher, pyqtSlot, QRunnable, QThreadPool
 from PyQt6.QtGui import QAction, QGuiApplication
 from PyQt6.QtWidgets import (
     QApplication,
@@ -36,19 +38,31 @@ from PyQt6.QtWidgets import (
 )
 
 # Make it possible to run without installation
-# pylint: disable=# pylint: disable=wrong-import-position
+# pylint: disable=wrong-import-position
 sys.path.insert(0, os.path.dirname(__file__) + "/..")
 import legion_linux.legion
+from legion_linux.fan_curve_plot import FanCurvePlot
 from legion_linux.legion import (
     LegionModelFacade,
     FanCurve,
     FanCurveEntry,
+    FanCurveIO,
     FileFeature,
     IntFileFeature,
     GsyncFeature,
     SystemNotificationSender,
     DiagnosticMsg,
 )
+
+# ACPI platform profile: the file legiond watches to detect power-mode
+# changes (see extra/service/legiond/modules/powerstate.h). A change here
+# (e.g. Fn+Q) makes legiond re-apply its fan-curve preset.
+PLATFORM_PROFILE_PATH = "/sys/firmware/acpi/platform_profile"
+
+# legiond applies its preset a fixed 3 s after the profile changes
+# (set_timer(3, 0) in extra/service/legiond/legiond.c). Wait a little longer
+# before re-reading so the EC has actually been updated.
+LEGIOND_PROFILE_APPLY_DELAY_MS = 3500
 
 
 def get_color_mode():
@@ -118,17 +132,19 @@ class MonitorWorker(QRunnable):
             for mon in self.model.monitors:
                 try:
                     diag_msgs = diag_msgs + mon.run()
-                # pylint: disable=broad-except
-                except Exception as err:
+                except Exception as err:  # pylint: disable=broad-exception-caught
                     log.error(str(err))
-            for msg in diag_msgs:
-                if msg.has_value and msg.filter_do_output:
-                    log.info(str(msg.msg))
-                    self.notification_sender.notify("Legion", msg.msg)
-                elif msg.has_value:
-                    log.info("FILTERED: %s", msg.msg)
-                else:
-                    log.info("FILTERED2: %s", msg.msg)
+            try:
+                for msg in diag_msgs:
+                    if msg.has_value and msg.filter_do_output:
+                        log.info(str(msg.msg))
+                        self.notification_sender.notify("Legion", msg.msg)
+                    elif msg.has_value:
+                        log.info("FILTERED: %s", msg.msg)
+                    else:
+                        log.info("FILTERED2: %s", msg.msg)
+            except Exception as err:  # pylint: disable=broad-exception-caught
+                log.error("Error while sending notification: %s", str(err))
             time.sleep(10.0)
 
         log.info("Finishing monitoring thread")
@@ -151,8 +167,13 @@ def mark_error_combobox(combobox: QComboBox):
 
 
 def log_error(ex: Exception):
-    print("Error occured", ex)
+    print("Error occurred", ex)
     print(traceback.format_exc())
+
+
+def report_fancurve_write_error(error, parent=None):
+    """Report a failed curve operation without letting an exception escape a Qt callback."""
+    QMessageBox.warning(parent, "Fan Curve Write Failed", f"Could not apply the fan curve: {error}")
 
 
 def log_ui_feature_action(widget, feature):
@@ -202,21 +223,21 @@ class EnumFeatureController:
                         value = val.value
 
                 if value is not None:
-                    print(f"Set to value: {value}")
+                    log.info("Set to value: %s", value)
                     self.feature.set(value)
                 else:
-                    print(f"Value for gui_value {gui_value} not found")
+                    log.info("Value for gui_value %s not found", gui_value)
             else:
                 self.widget.setDisabled(True)
-        # pylint: disable=broad-except
-        except Exception as ex:
+        except Exception as ex:  # pylint: disable=broad-exception-caught
             mark_error_combobox(self.widget)
             log_error(ex)
-        time.sleep(0.200)
+        QtCore.QTimer.singleShot(200, self._deferred_readback)
+
+    def _deferred_readback(self):
         self.update_view_from_feature()
 
         if self.dependent_controllers:
-            time.sleep(self.check_after_set_time)
             for contr in self.dependent_controllers:
                 contr.update_view_from_feature()
 
@@ -243,8 +264,7 @@ class EnumFeatureController:
                 self.widget.setDisabled(False)
             else:
                 self.widget.setDisabled(True)
-        # pylint: disable=broad-except
-        except Exception as ex:
+        except Exception as ex:  # pylint: disable=broad-exception-caught
             mark_error_combobox(self.widget)
             log_error(ex)
 
@@ -271,19 +291,25 @@ class BoolFeatureController:
             if self.feature.exists():
                 gui_value = self.checkbox.isChecked()
                 self.feature.set(gui_value)
-                time.sleep(0.100)
-                feature_value = self.feature.get()
-                self.checkbox.setChecked(feature_value)
                 self.checkbox.setDisabled(False)
             else:
                 self.checkbox.setDisabled(True)
-        # pylint: disable=broad-except
-        except Exception as ex:
+        except Exception as ex:  # pylint: disable=broad-exception-caught
+            mark_error(self.checkbox)
+            log_error(ex)
+
+        QtCore.QTimer.singleShot(100, self._deferred_readback)
+
+    def _deferred_readback(self):
+        try:
+            if self.feature.exists():
+                feature_value = self.feature.get()
+                self.checkbox.setChecked(feature_value)
+        except Exception as ex:  # pylint: disable=broad-exception-caught
             mark_error(self.checkbox)
             log_error(ex)
 
         if self.dependent_controllers:
-            time.sleep(self.check_after_set_time)
             for contr in self.dependent_controllers:
                 contr.update_view_from_feature()
 
@@ -295,8 +321,7 @@ class BoolFeatureController:
                 self.checkbox.setDisabled(False)
             else:
                 self.checkbox.setDisabled(True)
-        # pylint: disable=broad-except
-        except Exception as ex:
+        except Exception as ex:  # pylint: disable=broad-exception-caught
             mark_error(self.checkbox)
             log_error(ex)
 
@@ -322,19 +347,24 @@ class BoolFeatureTrayController:
             if self.feature.exists():
                 gui_value = self.action.isChecked()
                 self.feature.set(gui_value)
-                time.sleep(0.100)
-                hw_value = self.feature.get()
-                self.action.setChecked(hw_value)
                 self.action.setDisabled(False)
                 self.action.setCheckable(True)
             else:
                 self.action.setDisabled(True)
                 self.action.setCheckable(False)
-        # pylint: disable=broad-except
-        except Exception as ex:
+        except Exception as ex:  # pylint: disable=broad-exception-caught
+            log_error(ex)
+
+        QtCore.QTimer.singleShot(100, self._deferred_readback)
+
+    def _deferred_readback(self):
+        try:
+            if self.feature.exists():
+                hw_value = self.feature.get()
+                self.action.setChecked(hw_value)
+        except Exception as ex:  # pylint: disable=broad-exception-caught
             log_error(ex)
         if self.dependent_controllers:
-            time.sleep(0.100)
             for contr in self.dependent_controllers:
                 contr.update_view_from_feature()
 
@@ -348,8 +378,7 @@ class BoolFeatureTrayController:
             else:
                 self.action.setDisabled(True)
                 self.action.setCheckable(False)
-        # pylint: disable=broad-except
-        except Exception as ex:
+        except Exception as ex:  # pylint: disable=broad-exception-caught
             log_error(ex)
 
 
@@ -376,11 +405,19 @@ class PresetTrayController:
             def callback(_, pname=name):
                 self.on_action_click(pname)
 
+            try:
+                action.triggered.disconnect()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
             action.triggered.connect(callback)
 
     def on_action_click(self, name):
         log.info("Setting preset %s from tray action", name)
-        self.model.fancurve_write_preset_to_hw(name)
+        try:
+            self.model.fancurve_write_preset_to_hw(name)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            log_error(error)
+            report_fancurve_write_error(error)
 
 
 class EnumFeatureTrayController:
@@ -426,8 +463,7 @@ class EnumFeatureTrayController:
                 for action in self.actions:
                     action.setChecked(False)
                     action.setDisabled(True)
-        # pylint: disable=broad-except
-        except Exception as ex:
+        except Exception as ex:  # pylint: disable=broad-exception-caught
             log_error(ex)
 
     def on_action_click(self, value):
@@ -435,14 +471,14 @@ class EnumFeatureTrayController:
         try:
             if self.feature.exists():
                 self.feature.set(value)
-        # pylint: disable=broad-except
-        except Exception as ex:
+        except Exception as ex:  # pylint: disable=broad-exception-caught
             log_error(ex)
-        time.sleep(0.200)
         log.info("Update view after setting inEnumFeatureTrayController ")
+        QtCore.QTimer.singleShot(200, self._deferred_readback)
+
+    def _deferred_readback(self):
         self.update_view_from_feature()
         if self.dependent_controllers:
-            time.sleep(0.100)
             for contr in self.dependent_controllers:
                 log.info("Update dependent view %s in EnumFeatureTrayController", str(contr))
                 contr.update_view_from_feature()
@@ -474,22 +510,25 @@ class IntFeatureController:
                 gui_value = self.widget.value()
                 low, upper, _ = self.feature.get_limits_and_step()
                 if low <= gui_value <= upper:
-                    print(f"Set to value: {gui_value}")
+                    log.info("Set to value: %s", gui_value)
                     self.feature.set(gui_value)
                 else:
-                    print(f"Value for gui_value {gui_value} not ignored with limits {low} and {upper}")
+                    log.info("Value for gui_value %s not ignored with limits %s and %s", gui_value, low, upper)
             else:
                 self.widget.setDisabled(True)
-        # pylint: disable=broad-except
-        except Exception as ex:
+        except Exception as ex:  # pylint: disable=broad-exception-caught
             mark_error_combobox(self.widget)
             log_error(ex)
         if wait:
-            time.sleep(0.200)
+            QtCore.QTimer.singleShot(200, self._deferred_readback)
+        else:
+            self.update_view_from_feature()
+
+    def _deferred_readback(self):
         self.update_view_from_feature()
 
     def update_view_from_feature(self, k=0, update_bounds=False):
-        print("update_view_from_feature", k)
+        log.info("update_view_from_feature: %s", k)
         try:
             if self.feature.exists():
                 # possible values
@@ -508,8 +547,7 @@ class IntFeatureController:
                 self.widget.setDisabled(False)
             else:
                 self.widget.setDisabled(True)
-        # pylint: disable=broad-except
-        except Exception as ex:
+        except Exception as ex:  # pylint: disable=broad-exception-caught
             mark_error_combobox(self.widget)
             log_error(ex)
 
@@ -558,8 +596,7 @@ class HybridGsyncController:
                     current_val_str = "current: active"
                 else:
                     current_val_str = "current: inactive"
-        # pylint: disable=broad-except
-        except Exception as ex:
+        except Exception as ex:  # pylint: disable=broad-exception-caught
             current_val_str = "error"
             log_error(ex)
 
@@ -586,6 +623,8 @@ class LegionController:
     hybrid_gsync_controller: HybridGsyncController
     batteryconservation_controller: BoolFeatureController
     always_on_usb_controller: BoolFeatureController
+    instant_boot_ac_controller: BoolFeatureController
+    instant_boot_usb_pd_controller: BoolFeatureController
     rapid_charging_controller: BoolFeatureController
     power_mode_controller: EnumFeatureController
     # OC/Power
@@ -610,6 +649,7 @@ class LegionController:
     close_to_tray_controller: BoolFeatureController
     open_closed_to_tray: BoolFeatureController
     enable_gui_monitoring_controller: BoolFeatureController
+    auto_refresh_fancurve_controller: BoolFeatureController
     icon_color_mode_controller: EnumFeatureController
 
     # tray
@@ -630,9 +670,17 @@ class LegionController:
         self.log_view = None
         self.tray = None
         self.view_automation = None
+        self.fancurve_error = None
         self.show_root_dialog = (not self.model.is_root_user()) and (not use_legion_cli_to_write)
         self.monitoring_threadpool = QThreadPool()
         self.monitoring_worker = MonitorWorker(None)
+        self.platform_profile_path = PLATFORM_PROFILE_PATH
+        self.platform_profile_watcher = QFileSystemWatcher()
+        self.platform_profile_watcher.fileChanged.connect(self.on_platform_profile_changed)
+        self.fancurve_refresh_timer = QTimer()
+        self.fancurve_refresh_timer.setSingleShot(True)
+        self.fancurve_refresh_timer.setInterval(LEGIOND_PROFILE_APPLY_DELAY_MS)
+        self.fancurve_refresh_timer.timeout.connect(self.refresh_fancurve_after_profile_change)
 
     def init(self, read_from_hw=True):
         # connect logger output to GUI
@@ -663,6 +711,12 @@ class LegionController:
         self.rapid_charging_controller.dependent_controllers.append(self.batteryconservation_controller)
         self.always_on_usb_controller = BoolFeatureController(
             self.view_otheroptions.always_on_usb_check, self.model.always_on_usb_charging
+        )
+        self.instant_boot_ac_controller = BoolFeatureController(
+            self.view_otheroptions.instant_boot_ac_check, self.model.instant_boot_ac
+        )
+        self.instant_boot_usb_pd_controller = BoolFeatureController(
+            self.view_otheroptions.instant_boot_usb_pd_check, self.model.instant_boot_usb_pd
         )
         self.power_mode_controller = EnumFeatureController(
             self.view_otheroptions.power_mode_combo, self.model.platform_profile
@@ -731,16 +785,20 @@ class LegionController:
             self.view_automation.enable_gui_monitoring_check, self.model.app_model.enable_gui_monitoring
         )
         self.model.app_model.enable_gui_monitoring.add_callback(self.on_enable_monitoring_change)
+        self.auto_refresh_fancurve_controller = BoolFeatureController(
+            self.view_automation.auto_refresh_fancurve_check, self.model.app_model.auto_refresh_fancurve
+        )
         self.icon_color_mode_controller = EnumFeatureController(
             self.view_automation.icon_color_mode_combobox, self.model.app_model.icon_color_mode
         )
         self.icon_color_mode_controller.update_view_from_feature(0, True)
 
-        if read_from_hw:
-            self.model.read_fancurve_from_hw()
+        if read_from_hw and self.model.fancurve_io.exists():
+            self._read_fancurve_from_hw()
             # fan controller
         # fan
         self.update_fancurve_gui()
+        self.watch_platform_profile()
         self.update_fan_additional_gui()
         self.update_other_gui()
         self.update_power_gui(True)
@@ -817,6 +875,8 @@ class LegionController:
         self.batteryconservation_controller.update_view_from_feature()
         self.rapid_charging_controller.update_view_from_feature()
         self.always_on_usb_controller.update_view_from_feature()
+        self.instant_boot_ac_controller.update_view_from_feature()
+        self.instant_boot_usb_pd_controller.update_view_from_feature()
         self.cpu_overclock.update_view_from_feature()
         self.gpu_overclock.update_view_from_feature()
         self.overdrive_controller.update_view_from_feature()
@@ -845,14 +905,41 @@ class LegionController:
         self.update_power_gui()
 
     def update_fancurve_gui(self):
+        exists = self.model.fancurve_io.exists()
+        point_count = 0
+        level_tables = None
+        if exists and not self.fancurve_error:
+            try:
+                point_count = self.model.fancurve_io.get_point_count()
+                level_tables = self.model.fancurve_io.level_tables
+                if level_tables and level_tables[1] is None:
+                    raise ValueError("Cannot edit RPM: the firmware fan 2 RPM ladder is unavailable")
+            except (OSError, ValueError) as error:
+                self.fancurve_error = str(error)
+        self.view_fancurve.note_label2.setText(self.view_fancurve.default_note_text)
+        self.view_fancurve.note_label2.setStyleSheet(self.view_fancurve.default_note_style)
+        if self.fancurve_error:
+            self.view_fancurve.note_label2.setText(
+                f"Cannot read the fan curve: {self.fancurve_error}. "
+                "Writing is disabled. Use Read from HW to retry; sensor monitoring remains available."
+            )
+        elif self.model.fancurve_io.hwmon_path and not exists:
+            self.view_fancurve.note_label2.setText(
+                "Custom fan curves are not supported on this laptop. "
+                "Sensor monitoring is available. See Other Options for supported settings."
+            )
+            self.view_fancurve.note_label2.setStyleSheet("")
         self.view_fancurve.set_fancurve(
             self.model.fan_curve,
             self.model.fancurve_io.has_minifancurve(),
-            self.model.fancurve_io.exists(),
+            exists and not self.fancurve_error,
             has_fan_2_speed=self.model.fancurve_io.has_fan_2_speed(),
-            has_temperature_curve=self.model.fancurve_io.has_temperature_curve(),
+            temperature_fields=self.model.fancurve_io.temperature_fields(),
             has_acceleration_curve=self.model.fancurve_io.has_acceleration_curve(),
+            point_count=point_count,
+            level_tables=level_tables,
         )
+        self.view_fancurve.load_button.setEnabled(exists)
 
     def update_automation(self):
         self.power_profiles_deamon_service_controller.update_view_from_feature()
@@ -861,27 +948,120 @@ class LegionController:
         self.open_closed_to_tray.update_view_from_feature()
         self.legion_gui_autstart_controller.update_view_from_feature()
         self.enable_gui_monitoring_controller.update_view_from_feature()
+        self.auto_refresh_fancurve_controller.update_view_from_feature()
         self.icon_color_mode_controller.update_view_from_feature()
 
+    def _read_fancurve_from_hw(self):
+        try:
+            self.model.read_fancurve_from_hw()
+            self.fancurve_error = None
+        except (OSError, RuntimeError, ValueError) as error:
+            self.fancurve_error = str(error)
+
+    def watch_platform_profile(self):
+        """Watch the ACPI platform profile for external power-mode changes.
+
+        A change there (e.g. Fn+Q) makes legiond re-apply its fan-curve preset
+        after a fixed delay, so the GUI schedules a deferred re-read to pick up
+        the curve the daemon actually applied.
+        """
+        if not self.model.fancurve_io.exists():
+            return
+        if not os.path.exists(self.platform_profile_path):
+            return
+        if self.platform_profile_path not in self.platform_profile_watcher.files():
+            log.info("Watching %s for power-mode changes", self.platform_profile_path)
+            self.platform_profile_watcher.addPath(self.platform_profile_path)
+
+    def on_platform_profile_changed(self, path):
+        """Schedule a fan-curve re-read once legiond has re-applied its preset."""
+        if not self.model.app_model.auto_refresh_fancurve.get():
+            return
+        log.info("Platform profile changed (%s); scheduling a fan-curve refresh", path)
+        # Restarting the single-shot timer collapses a burst of writes into one
+        # refresh, mirroring how legiond debounces its own apply.
+        self.fancurve_refresh_timer.start()
+        # inotify drops a watch whose file was replaced; re-add defensively.
+        if os.path.exists(path) and path not in self.platform_profile_watcher.files():
+            self.platform_profile_watcher.addPath(path)
+
+    def refresh_fancurve_after_profile_change(self):
+        """Re-read the EC fan curve after a power-mode change.
+
+        Read-only: this never writes. It is skipped when the curve is
+        unsupported or unreadable, and when the table holds unsaved edits that a
+        refresh would silently discard.
+        """
+        if not self.model.fancurve_io.exists() or self.fancurve_error:
+            return
+        if self._fancurve_view_has_unsaved_edits():
+            log.info("Skipping the deferred fan-curve refresh: the table has unsaved edits")
+            return
+        log.info("Refreshing the fan curve after a power-mode change")
+        self._read_fancurve_from_hw()
+        self.update_fancurve_gui()
+
+    def _fancurve_view_has_unsaved_edits(self) -> bool:
+        """Whether the table differs from the last curve read from HW or loaded.
+
+        Trailing all-zero rows are EC padding and are ignored, since
+        get_raw_fancurve() always returns a full table.
+        """
+        try:
+            viewed = self.view_fancurve.get_raw_fancurve()
+        except ValueError:
+            # Unparseable entries are unsaved work; never overwrite them.
+            return True
+        return self._trim_fancurve_padding(viewed) != self._trim_fancurve_padding(self.model.fan_curve)
+
+    @staticmethod
+    def _trim_fancurve_padding(fan_curve: FanCurve):
+        entries = list(fan_curve.entries)
+        while entries and entries[-1].is_empty():
+            entries.pop()
+        return entries, fan_curve.enable_minifancurve
+
     def on_read_fan_curve_from_hw(self):
-        self.model.read_fancurve_from_hw()
+        self._read_fancurve_from_hw()
         self.update_fancurve_gui()
 
     def on_write_fan_curve_to_hw(self):
-        self.model.fan_curve = self.view_fancurve.get_fancurve()
-        self.model.write_fancurve_to_hw()
-        self.model.read_fancurve_from_hw()
+        if not self._read_fancurve_from_view():
+            return
+        try:
+            self.model.write_fancurve_to_hw()
+        except (OSError, RuntimeError, ValueError) as ex:
+            report_fancurve_write_error(ex, self.main_window)
+            return
+        self._read_fancurve_from_hw()
         self.update_fancurve_gui()
+
+    def _read_fancurve_from_view(self) -> bool:
+        try:
+            self.model.fan_curve = self.view_fancurve.get_fancurve()
+        except ValueError as ex:
+            QMessageBox.warning(self.main_window, "Invalid Fan Curve", str(ex))
+            return False
+        return True
 
     def on_load_from_preset(self):
         name = self.view_fancurve.preset_combobox.currentText()
-        self.model.fan_curve = self.view_fancurve.get_fancurve()
-        self.model.load_fancurve_from_preset(name)
+        try:
+            self.model.load_fancurve_from_preset(name)
+        except FileNotFoundError:
+            QMessageBox.warning(
+                self.main_window,
+                "Preset Not Found",
+                f"The preset '{name}' does not exist yet.\n\n"
+                "To create it, configure your desired fan curve and click 'Save to Preset'.",
+            )
+            return
         self.update_fancurve_gui()
 
     def on_save_to_preset(self):
         name = self.view_fancurve.preset_combobox.currentText()
-        self.model.fan_curve = self.view_fancurve.get_fancurve()
+        if not self._read_fancurve_from_view():
+            return
         self.model.save_fancurve_to_preset(name)
 
     def on_new_log_msg(self, msg):
@@ -937,6 +1117,18 @@ class FanCurveEntryView:
         self.ic_upper_temp_edit = QLineEdit()
         self.accel_edit = QLineEdit()
         self.decel_edit = QLineEdit()
+        self.edits = (
+            self.fan_speed1_edit,
+            self.fan_speed2_edit,
+            self.cpu_lower_temp_edit,
+            self.cpu_upper_temp_edit,
+            self.gpu_lower_temp_edit,
+            self.gpu_upper_temp_edit,
+            self.ic_lower_temp_edit,
+            self.ic_upper_temp_edit,
+            self.accel_edit,
+            self.decel_edit,
+        )
 
         layout.addWidget(self.point_id_label, 0, point_id)
         layout.addWidget(self.fan_speed1_edit, 1, point_id)
@@ -962,32 +1154,40 @@ class FanCurveEntryView:
         self.accel_edit.setText(str(entry.acceleration))
         self.decel_edit.setText(str(entry.deceleration))
 
-    def set_disabled(
-        self, value: bool, has_fan_2_speed: bool, has_temperature_curve: bool, has_acceleration_curve: bool
-    ):
+    def set_disabled(self, value: bool, has_fan_2_speed: bool, temperature_fields, has_acceleration_curve: bool):
         self.fan_speed1_edit.setDisabled(value)
         self.fan_speed2_edit.setDisabled(value or not has_fan_2_speed)
-        self.cpu_lower_temp_edit.setDisabled(value or not has_temperature_curve)
-        self.cpu_upper_temp_edit.setDisabled(value or not has_temperature_curve)
-        self.gpu_lower_temp_edit.setDisabled(value or not has_temperature_curve)
-        self.gpu_upper_temp_edit.setDisabled(value or not has_temperature_curve)
-        self.ic_lower_temp_edit.setDisabled(value or not has_temperature_curve)
-        self.ic_upper_temp_edit.setDisabled(value or not has_temperature_curve)
+        for name in FanCurveIO.temperature_files:
+            getattr(self, f"{name}_edit").setDisabled(value or name not in temperature_fields)
         self.accel_edit.setDisabled(value or not has_acceleration_curve)
         self.decel_edit.setDisabled(value or not has_acceleration_curve)
 
     def get(self) -> FanCurveEntry:
-        fan1_speed = float(self.fan_speed1_edit.text())
-        fan2_speed = float(self.fan_speed2_edit.text())
-        cpu_lower_temp = int(self.cpu_lower_temp_edit.text())
-        cpu_upper_temp = int(self.cpu_upper_temp_edit.text())
-        gpu_lower_temp = int(self.gpu_lower_temp_edit.text())
-        gpu_upper_temp = int(self.gpu_upper_temp_edit.text())
-        ic_lower_temp = int(self.ic_lower_temp_edit.text())
-        ic_upper_temp = int(self.ic_upper_temp_edit.text())
-        acceleration = int(self.accel_edit.text())
-        deceleration = int(self.decel_edit.text())
-        entry = FanCurveEntry(
+        try:
+            fan1_speed = float(self.fan_speed1_edit.text())
+            fan2_speed = float(self.fan_speed2_edit.text())
+            cpu_lower_temp = int(self.cpu_lower_temp_edit.text())
+            cpu_upper_temp = int(self.cpu_upper_temp_edit.text())
+            gpu_lower_temp = int(self.gpu_lower_temp_edit.text())
+            gpu_upper_temp = int(self.gpu_upper_temp_edit.text())
+            ic_lower_temp = int(self.ic_lower_temp_edit.text())
+            ic_upper_temp = int(self.ic_upper_temp_edit.text())
+            acceleration = int(self.accel_edit.text())
+            deceleration = int(self.decel_edit.text())
+        except (ValueError, OverflowError) as ex:
+            raise ValueError(
+                f"Invalid value in fan curve point {self.point_id_label.text()}: all fields must be numbers."
+            ) from ex
+        if not (isfinite(fan1_speed) and isfinite(fan2_speed)):
+            raise ValueError(
+                f"Invalid value in fan curve point {self.point_id_label.text()}: fan speeds must be finite numbers."
+            )
+        # The acceleration/deceleration range is checked in
+        # FanCurveTab.get_fancurve() instead: trailing all-zero entries
+        # are EC padding (issue #493) that is never written to hardware
+        # (trimmed in FanCurveIO.write_fan_curve, issue #511), so their
+        # unused acceleration/deceleration values must not be validated.
+        return FanCurveEntry(
             fan1_speed=fan1_speed,
             fan2_speed=fan2_speed,
             cpu_lower_temp=cpu_lower_temp,
@@ -999,7 +1199,6 @@ class FanCurveEntryView:
             acceleration=acceleration,
             deceleration=deceleration,
         )
-        return entry
 
 
 class FanCurveTab(QWidget):
@@ -1007,6 +1206,7 @@ class FanCurveTab(QWidget):
         super().__init__()
         self.controller = controller
         self.entry_edits = []
+        self._updating_preview = False
         self.init_ui()
 
         self.controller.view_fancurve = self
@@ -1018,26 +1218,61 @@ class FanCurveTab(QWidget):
         enabled: bool,
         *,
         has_fan_2_speed: bool,
-        has_temperature_curve: bool,
+        temperature_fields,
         has_acceleration_curve: bool,
+        point_count: int,
+        level_tables,
     ):
-        self.minfancurve_check.setDisabled(not has_minifancurve)
-        for i, entry in enumerate(fancurve.entries):
-            self.entry_edits[i].set(entry)
-            self.entry_edits[i].set_disabled(
-                not enabled, has_fan_2_speed, has_temperature_curve, has_acceleration_curve
+        self._updating_preview = True
+        self.minfancurve_check.setDisabled(not has_minifancurve or not enabled)
+        empty_entry = FanCurveEntry(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        for index, entry_view in enumerate(self.entry_edits):
+            entry_view.set(empty_entry)
+            entry_view.set_disabled(
+                not enabled or index >= point_count, has_fan_2_speed, temperature_fields, has_acceleration_curve
             )
+        for i, entry in enumerate(fancurve.entries):
+            if i >= len(self.entry_edits):
+                break
+            self.entry_edits[i].set(entry)
         self.load_button.setDisabled(not enabled)
-        self.write_button.setDisabled(not enabled)
+        self.write_button.setDisabled(not enabled or point_count <= 0)
 
         self.minfancurve_check.setChecked(fancurve.enable_minifancurve)
+        self._updating_preview = False
+        self.curve_plot.set_capabilities(
+            point_count, temperature_fields, has_fan_2_speed, level_tables, enabled and point_count > 0
+        )
+
+    def on_entry_changed(self):
+        if not self._updating_preview:
+            self.curve_plot.update()
+
+    def get_raw_fancurve(self) -> FanCurve:
+        entries = [entry_view.get() for entry_view in self.entry_edits]
+        return FanCurve(name="unknown", entries=entries, enable_minifancurve=self.minfancurve_check.isChecked())
 
     def get_fancurve(self) -> FanCurve:
-        entries = []
-        for entry_view in self.entry_edits:
-            entry = entry_view.get()
-            entries.append(entry)
-        return FanCurve(name="unknown", entries=entries, enable_minifancurve=self.minfancurve_check.isChecked())
+        fancurve = self.get_raw_fancurve()
+        entries = fancurve.entries
+        # Trailing all-zero entries are EC padding (issue #493) and are
+        # never written to hardware (trimmed in FanCurveIO.write_fan_curve,
+        # issue #511). Only range-check acceleration/deceleration on the
+        # writable prefix, otherwise padding entries with
+        # acceleration/deceleration = 0 block every write of a preset or
+        # hardware read that ships padding rows.
+        writable_size = len(entries)
+        while writable_size > 0 and entries[writable_size - 1].is_empty():
+            writable_size -= 1
+        if self.controller.model.fancurve_io.has_acceleration_curve():
+            for index, entry in enumerate(entries[:writable_size]):
+                if not 2 <= entry.acceleration <= 5 or not 2 <= entry.deceleration <= 5:
+                    raise ValueError(
+                        f"Invalid value in fan curve point {index + 1}: "
+                        "acceleration and deceleration time must be between 2 and 5 "
+                        "(the fan controller rejects other values)."
+                    )
+        return fancurve
 
     def create_fancurve_entry_view(self, layout, point_id):
         self.entry_edits.append(FanCurveEntryView(point_id, layout))
@@ -1063,6 +1298,11 @@ class FanCurveTab(QWidget):
         self.accel_label = QLabel("Acceleration  Time [s]")
         self.decel_label = QLabel("Deceleration Time [s]")
         self.minfancurve_check = QCheckBox("Minifancurve if too cold")
+        self.minfancurve_check.setToolTip(
+            "When enabled, the embedded controller switches to a built-in 4-point fan curve "
+            "after staying cool for several minutes. Uncheck and click Apply to HW to keep "
+            "your full fan curve active at all temperatures."
+        )
         self.lockfancontroller_check = QCheckBox(
             "Lock fan controller, lock temperature sensors, and lock current fan speed"
         )
@@ -1086,6 +1326,21 @@ class FanCurveTab(QWidget):
         for i in range(1, 11):
             self.create_fancurve_entry_view(self.layout, i)
         self.fancurve_group.setLayout(self.layout)
+        self.curve_plot = FanCurvePlot(self.entry_edits, self)
+        for entry_view in self.entry_edits:
+            for field in entry_view.edits:
+                field.textChanged.connect(self.on_entry_changed)
+        self.plot_group = QGroupBox("Fan Curve Preview")
+        plot_layout = QVBoxLayout()
+        plot_layout.addWidget(self.curve_plot)
+        plot_hint = QLabel(
+            "Drag a dot vertically for speed or horizontally to shift both temperature bounds. "
+            "Drag a square to edit only the lower bound; hover for exact values, Esc cancels. "
+            "Shared-level curves use one line for both fans. Only Apply to HW writes hardware."
+        )
+        plot_hint.setWordWrap(True)
+        plot_layout.addWidget(plot_hint)
+        self.plot_group.setLayout(plot_layout)
 
         self.button1_group = QGroupBox("Fancurve Hardware")
         self.button1_layout = QGridLayout()
@@ -1113,16 +1368,19 @@ class FanCurveTab(QWidget):
         self.button2_layout.addWidget(self.load_from_preset_button, 1, 1)
 
         self.main_layout = QVBoxLayout()
-        self.main_layout.addWidget(self.fancurve_group, 0)
+        self.main_layout.addWidget(self.plot_group, 0)
+        self.main_layout.addWidget(self.fancurve_group, 1)
         self.main_layout.addWidget(self.button1_group, 1)
         self.main_layout.addWidget(self.button2_group, 2)
 
         self.note_label2 = QLabel(
             "Greyed out features are not available. If most features are greyed out, "
             "the driver is not loaded properly or hwmon directory not found.\nIf features are marked "
-            "red, an unexpected error has occured while accessing the hardware and you should notify the maintainer."
+            "red, an unexpected error has occurred while accessing the hardware and you should notify the maintainer."
         )
         self.note_label2.setStyleSheet("color: red;")
+        self.default_note_text = self.note_label2.text()
+        self.default_note_style = self.note_label2.styleSheet()
         self.note_label2.setWordWrap(True)
         self.main_layout.addWidget(self.note_label2, 3)
 
@@ -1134,10 +1392,20 @@ class OtherOptionsTab(QWidget):
         super().__init__()
         self.controller = controller
         self.init_power_ui()
+        self.init_option_checks()
+        self.init_hybrid_ui()
         self.init_ui()
+        self.init_bootlogo_ui()
         self.controller.view_otheroptions = self
 
     def init_ui(self):
+        self.main_layout = QVBoxLayout()
+        self.main_layout.addWidget(self.options_group, 0)
+        self.main_layout.addWidget(self.power_group, 1)
+        self.main_layout.addStretch()
+        self.setLayout(self.main_layout)
+
+    def init_option_checks(self):
         self.options_group = QGroupBox("Options")
         self.options_layout = QVBoxLayout()
         self.options_group.setLayout(self.options_layout)
@@ -1167,6 +1435,12 @@ class OtherOptionsTab(QWidget):
         self.always_on_usb_check = QCheckBox("Charge Output from USB always on")
         self.options_layout.addWidget(self.always_on_usb_check, 4)
 
+        self.instant_boot_ac_check = QCheckBox("Instant Boot: power on when the AC adapter is connected")
+        self.options_layout.addWidget(self.instant_boot_ac_check, 4)
+
+        self.instant_boot_usb_pd_check = QCheckBox("Instant Boot: power on when a USB-PD charger is connected")
+        self.options_layout.addWidget(self.instant_boot_usb_pd_check, 4)
+
         self.overdrive_check = QCheckBox("Display Overdrive Enabled")
         self.options_layout.addWidget(self.overdrive_check, 5)
 
@@ -1176,6 +1450,7 @@ class OtherOptionsTab(QWidget):
         self.ioport_light_check = QCheckBox("IO-Port/Rear LEDs light")
         self.options_layout.addWidget(self.ioport_light_check, 5)
 
+    def init_hybrid_ui(self):
         self.hybrid_label = QLabel("Hybrid Mode (sometimes also GSync):")
         self.hybrid_state_label = QLabel("")
         self.hybrid_activate_button = QPushButton("Activate")
@@ -1188,12 +1463,7 @@ class OtherOptionsTab(QWidget):
 
         self.options_layout.addLayout(self.hybrid_layout, 6)
 
-        self.main_layout = QVBoxLayout()
-        self.main_layout.addWidget(self.options_group, 0)
-        self.main_layout.addWidget(self.power_group, 1)
-        self.main_layout.addStretch()
-        self.setLayout(self.main_layout)
-
+    def init_bootlogo_ui(self):
         self.bootlogo_group = QGroupBox("Boot Logo")
         self.bootlogo_layout = QVBoxLayout()
         self.bootlogo_group.setLayout(self.bootlogo_layout)
@@ -1342,6 +1612,11 @@ class AutomationTab(QWidget):
 
         self.enable_gui_monitoring_check = QCheckBox("Enable Monitoring while GUI is Running")
         self.options_layout.addWidget(self.enable_gui_monitoring_check, 3)
+
+        self.auto_refresh_fancurve_check = QCheckBox(
+            "Refresh Fan Curve when the Power Mode Changes (after legiond applies it)"
+        )
+        self.options_layout.addWidget(self.auto_refresh_fancurve_check, 3)
 
         self.note_label = QLabel(
             'These are Experimental Features.\n To apply and save the Settings Press "Save" or "Save and Quit"'
@@ -1503,7 +1778,7 @@ class MainWindow(QMainWindow):
         msgs = [
             'Show your appreciation for this tool by giving a star on github <a href="https://github.com/johnfanv2/LenovoLegionLinux" >https://github.com/johnfanv2/LenovoLegionLinux</a>',
             'Help by giving a star to the github repository <a href="https://github.com/johnfanv2/LenovoLegionLinux" >https://github.com/johnfanv2/LenovoLegionLinux</a>',
-            'Please give a star on github to support. My goal is to merge the driver into the main Linux kernel,<br> so no recompilation is required after a Linux update <a href="https://github.com/johnfanv2/LenovoLegionLinux" >https://github.com/johnfanv2/LenovoLegionLinux</a>'
+            'Please give a star on github to support. My goal is to merge the driver into the main Linux kernel,<br> so no recompilation is required after a Linux update <a href="https://github.com/johnfanv2/LenovoLegionLinux" >https://github.com/johnfanv2/LenovoLegionLinux</a>',
             'Please give star on github the repository if this is useful or might be useful in the future <a href="https://github.com/johnfanv2/LenovoLegionLinux" >https://github.com/johnfanv2/LenovoLegionLinux</a>',
             'Please give a star on github to show that this it useful to me and the Linux community,<br> so hopefully the driver can be merged to the Linux kernel <a href="https://github.com/johnfanv2/LenovoLegionLinux" >https://github.com/johnfanv2/LenovoLegionLinux</a>',
         ]
@@ -1530,6 +1805,9 @@ class MainWindow(QMainWindow):
             event.accept()
 
     def close_after(self, milliseconds: int):
+        # single shot: if the close is ignored (close to tray) retrying
+        # every interval would only log forever and never exit
+        self.close_timer.setSingleShot(True)
         self.close_timer.timeout.connect(self.close)
         self.close_timer.start(milliseconds)
 
@@ -1623,7 +1901,7 @@ class LegionTray:
         self.tray.show()
 
 
-def get_ressource_path(name):
+def get_resource_path(name):
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), name)
     return path
 
@@ -1661,14 +1939,29 @@ def get_icon_path(controller):
     log.info("Using icon_color %s", icon_color)
     if icon_color == "dark":
         log.info("Using icon legion_logo_dark")
-        icon_path = get_ressource_path("legion_logo_dark.png")
+        icon_path = get_resource_path("legion_logo_dark.png")
     elif icon_color == "light":
         log.info("Using icon legion_logo_light")
-        icon_path = get_ressource_path("legion_logo_light.png")
+        icon_path = get_resource_path("legion_logo_light.png")
     else:
         log.info("Using icon legion_logo")
-        icon_path = get_ressource_path("legion_logo.png")
+        icon_path = get_resource_path("legion_logo.png")
     return icon_path
+
+
+def apply_commandline_settings(app_model, argv):
+    """Apply the GUI command line flags on top of the loaded settings."""
+    if "--automaticclose" in argv:
+        app_model.automatic_close.set(True)
+        # the whole point of this flag is to terminate on its own, so a
+        # saved "close to tray" setting must not be able to defeat it:
+        # closeEvent() would otherwise ignore the close and the process
+        # would never exit, hanging the smoke test
+        app_model.close_to_tray.set(False)
+    if "--close_to_tray" in argv:
+        app_model.close_to_tray.set(True)
+    if "--open_closed_to_tray" in argv:
+        app_model.open_closed_to_tray.set(True)
 
 
 def main():
@@ -1679,21 +1972,14 @@ def main():
     app = QApplication(sys.argv)
 
     use_legion_cli_to_write = "--use_legion_cli_to_write" in sys.argv
-    do_not_excpect_hwmon = True
-    controller = LegionController(
-        app, expect_hwmon=not do_not_excpect_hwmon, use_legion_cli_to_write=use_legion_cli_to_write
-    )
+    expect_hwmon = bool(glob.glob(legion_linux.legion.FanCurveIO.hwmon_dir_pattern))
+    controller = LegionController(app, expect_hwmon=expect_hwmon, use_legion_cli_to_write=use_legion_cli_to_write)
 
     # Load savable settings from file if exists
     controller.model.load_settings()
 
     # Overwrite settings from commandline args
-    if "--automaticclose" in sys.argv:
-        controller.model.app_model.automatic_close.set(True)
-    if "--close_to_tray" in sys.argv:
-        controller.model.app_model.close_to_tray.set(True)
-    if "--open_closed_to_tray" in sys.argv:
-        controller.model.app_model.open_closed_to_tray.set(True)
+    apply_commandline_settings(controller.model.app_model, sys.argv)
 
     # Overwrite settings by rules
     if controller.model.is_root_user():
@@ -1718,7 +2004,12 @@ def main():
 
     # Main Windows
     main_window = MainWindow(controller, icon)
-    controller.init(read_from_hw=not do_not_excpect_hwmon)
+    controller.init(read_from_hw=expect_hwmon)
+
+    # Monitoring callback is registered in init(), which runs after
+    # load_settings(), so start the worker now if the setting is enabled
+    if controller.model.app_model.enable_gui_monitoring.get():
+        controller.start_monitoring()
 
     # Tray
     tray = LegionTray(icon, main_window, controller)

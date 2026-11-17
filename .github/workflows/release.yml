@@ -9,7 +9,6 @@ on:
         type: string
 
 permissions:
-  actions: write
   contents: write
 
 jobs:
@@ -20,6 +19,13 @@ jobs:
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
+
+    - name: Check release branch
+      run: |
+        if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+          echo "Releases may only be created from the main branch (ref: ${{ github.ref }})"
+          exit 1
+        fi
 
     - name: Validate version
       run: |
@@ -32,6 +38,23 @@ jobs:
           echo "Tag v$VERSION already exists"
           exit 1
         fi
+
+    - name: Generate release notes
+      # git-cliff walks the actual commit history (grouped by conventional
+      # type, with GitHub @usernames/PR links), so direct commits are
+      # included; gh's --generate-notes only lists merged PRs.
+      uses: orhun/git-cliff-action@v4
+      id: git-cliff
+      with:
+        version: v2.14.2
+        config: cliff.toml
+        args: --unreleased --tag "v${{ inputs.version }}"
+      env:
+        OUTPUT: release_notes.md
+        GITHUB_REPO: ${{ github.repository }}
+
+    - name: Show release notes
+      run: cat release_notes.md
 
     - name: Bump versions
       env:
@@ -72,20 +95,25 @@ jobs:
         VERSION: ${{ inputs.version }}
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        gh release create "v$VERSION" --title "v$VERSION" --generate-notes --draft
+        gh release create "v$VERSION" --title "v$VERSION" \
+          --notes-file release_notes.md --draft
 
-    - name: Build, test and publish
+    - name: Build kernel patch
+      run: ./deploy/build_kernelpatch.sh
+      shell: bash
+
+    - name: Upload kernel patch to draft release
       env:
+        VERSION: ${{ inputs.version }}
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        SHA=$(git rev-parse HEAD)
-        gh workflow run build.yml --ref main -f logLevel=warning
-        for _ in {1..30}; do
-          RUN_ID=$(gh run list --workflow build.yml --event workflow_dispatch \
-            --commit "$SHA" --limit 1 --json databaseId \
-            --jq '.[0].databaseId // empty')
-          [ -n "$RUN_ID" ] && break
-          sleep 2
-        done
-        test -n "$RUN_ID"
-        gh run watch "$RUN_ID" --compact --exit-status
+        gh release upload "v$VERSION" \
+          "/tmp/linux/linux/0001-Add-legion-laptop-v${VERSION}.patch" \
+          --clobber
+
+    - name: Publish release
+      env:
+        VERSION: ${{ inputs.version }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release edit "v$VERSION" --draft=false
