@@ -336,6 +336,7 @@ struct model_config {
 	bool restore_fancurve_on_resume;
 	bool has_single_fan;
 	u16 fan_max_rpm;
+	bool use_firmware_fan_max;
 	bool fanfullspeed_requires_custom_powermode;
 	bool skip_ylogo_light;
 	bool skip_ioport_light;
@@ -1270,6 +1271,7 @@ static const struct model_config model_m0cn = {
 };
 
 static const struct model_config model_m1cn = {
+	.use_firmware_fan_max = true,
 	.registers = &ec_register_offsets_v0,
 	.check_embedded_controller_id = true,
 	.embedded_controller_id = 0x5507,
@@ -11039,18 +11041,23 @@ static ssize_t fan_max_show(struct device *dev,
 	 * the row's current_fan_max_speed is the fan's real maximum.
 	 */
 	ladder = channel == 1 ? &priv->fantable_fan2 : &priv->fantable_fan1;
-	if (priv->conf->has_fancurve_defaults &&
-	    priv->conf->access_method_fancurve == ACCESS_METHOD_WMI3) {
+	if (priv->conf->use_firmware_fan_max ||
+	    (priv->conf->has_fancurve_defaults &&
+	     priv->conf->access_method_fancurve == ACCESS_METHOD_WMI3)) {
+		int err;
+
 		mutex_lock(&priv->fancurve_mutex);
-		if (!fantable_ensure(priv) &&
-		    (channel == 1 ? priv->fantable_fan2_valid :
-				    priv->fantable_fan1_valid)) {
+		err = fantable_ensure(priv);
+		if (!err && (channel == 1 ? priv->fantable_fan2_valid :
+					    priv->fantable_fan1_valid)) {
 			int max_rpm = ladder->max_rpm;
 
 			mutex_unlock(&priv->fancurve_mutex);
 			return sysfs_emit(buf, "%d\n", max_rpm);
 		}
 		mutex_unlock(&priv->fancurve_mutex);
+		if (priv->conf->use_firmware_fan_max)
+			return err ? err : -ENODATA;
 	}
 
 	if (priv && priv->conf->fan_max_rpm)
@@ -11744,7 +11751,8 @@ static umode_t legion_hwmon_fancurve_is_visible(struct kobject *kobj,
 	if (priv->conf->wmi_fancurve_speed_only &&
 	    (attr == &sensor_dev_attr_minifancurve.dev_attr.attr ||
 	     attr == &sensor_dev_attr_fancurve_defaults_powermode.dev_attr.attr ||
-	     attr == &sensor_dev_attr_fan2_max.dev_attr.attr))
+	     (attr == &sensor_dev_attr_fan2_max.dev_attr.attr &&
+	      !priv->conf->use_firmware_fan_max)))
 		return 0;
 	if (container_of(attr, struct device_attribute, attr)->show ==
 	    autopoint_show) {

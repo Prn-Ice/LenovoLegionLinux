@@ -68,6 +68,7 @@ static bool ec_readonly;
                     "FANTABLE_MAX_LEVELS",
                     "FANTABLE_SENSOR_",
                     "MAX_FAN_LEVEL",
+                    "MAX_RPM",
                     "TEMP_REGISTER_",
                     "JYCN_",
                     "WMI_METHOD_ID_FAN_SET_TABLE",
@@ -105,6 +106,9 @@ struct device_attribute {
 };
 struct sensor_device_attribute_2 { struct device_attribute dev_attr; int nr; int index; };
 #define to_sensor_dev_attr_2(attr) container_of(attr, struct sensor_device_attribute_2, dev_attr)
+#define to_sensor_dev_attr(attr) to_sensor_dev_attr_2(attr)
+#define mutex_lock(lock) ((void)0)
+#define mutex_unlock(lock) ((void)0)
 struct ecram { int unused; };
 struct legion_private {
     const struct model_config *conf;
@@ -204,6 +208,7 @@ static void ecram_write(struct ecram *ram, u16 offset, u8 value) {
             "fantable_refresh",
             "sync_powermode_locked",
             "fantable_ensure",
+            "fan_max_show",
             "wmi_write_fancurve_custom",
             "wmi_write_fancurve_defaults",
             "minifancurve_supported",
@@ -730,7 +735,6 @@ int main(void) {
     power_reads = thermal_reads = 0;
     assert(wmi_fancurve_mode(&priv) == 0 && power_reads == 0 && thermal_reads == 0);
 
-    /* T2CN calibration must use the same live mode as its SFAN payload. */
     firmware_rows[0] = valid_row;
     firmware_rows[0].mode = 0x100;
     firmware_rows[0].fan_id = 1;
@@ -744,6 +748,27 @@ int main(void) {
         firmware_rows[i].fan_id = 2;
         firmware_rows[i].sensor_id = FANTABLE_SENSOR_GPU;
     }
+    {
+        struct sensor_device_attribute_2 cpu = { .index = 0 }, gpu = { .index = 1 };
+        struct legion_private m1cn = { .conf = &model_m1cn };
+        struct device laptop = { &m1cn };
+        struct kobject hwmon = { &laptop };
+        char rpm[16];
+
+        power_mode = LEGION_WMI_POWERMODE_CUSTOM;
+        firmware_rows[0].current_fan_max_speed = 4800;
+        firmware_rows[2].current_fan_max_speed = 4900;
+        assert(legion_hwmon_fancurve_is_visible(&hwmon, &sensor_dev_attr_fan2_max.dev_attr.attr, 0));
+        failed_row = 2;
+        assert(fan_max_show(&laptop, &cpu.dev_attr, rpm) > 0 && strcmp(rpm, "4800\n") == 0);
+        assert(fan_max_show(&laptop, &gpu.dev_attr, rpm) == -ENODATA);
+        failed_row = -1;
+        assert(fan_max_show(&laptop, &gpu.dev_attr, rpm) > 0 && strcmp(rpm, "4900\n") == 0);
+        m1cn.conf = &model_nrcn;
+        assert(!legion_hwmon_fancurve_is_visible(&hwmon, &sensor_dev_attr_fan2_max.dev_attr.attr, 0));
+        assert(fan_max_show(&laptop, &cpu.dev_attr, rpm) > 0 && strcmp(rpm, "10000\n") == 0);
+    }
+    /* T2CN calibration must use the same live mode as its SFAN payload. */
     priv.conf = &model_t2cn;
     power_mode = LEGION_WMI_POWERMODE_CUSTOM;
     thermal_mode = LEGION_WMI_POWERMODE_BALANCED;

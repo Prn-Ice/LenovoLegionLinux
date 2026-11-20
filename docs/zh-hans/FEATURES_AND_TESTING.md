@@ -107,6 +107,12 @@ Q7CN/RLCN/QNCN 依据其 DSDT 推断）；`fan_control.sh` 在该属性缺失时
 忽略后续写入（issue #429）；请使用模式 255，并在写入后检查
 `/sys/kernel/debug/legion/ecmemory` 的 0x1F0..0x1F9 偏移。
 
+## Legion Slim 7 16APH8（82Y4，M1CN）
+
+运行 `cat /sys/devices/platform/legion/hwmon/hwmon*/fan{1,2}_max` 可读取两个风扇的最高转速。
+每行显示一个风扇在当前电源模式下的最高转速（RPM）。驱动从各风扇的固件表中读取该值。
+若最高转速字段为零，则使用最高档位的转速。若缺少对应的表，读取会返回错误。
+
 ---
 
 > 之后的章节（从 “Legion Pro 7 16IAX10H (83F5, Q7CN)” 开始）尚未翻译，请参阅[英文原文](../FEATURES_AND_TESTING.md#legion-pro-7-16iax10h-83f5-q7cn)。

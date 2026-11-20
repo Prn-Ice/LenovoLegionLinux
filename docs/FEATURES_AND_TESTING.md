@@ -109,6 +109,13 @@ On the Legion Pro 7 16IRX8H with the same BIOS the EC resets the table to 1..10 
 mode 0xE0 is entered and ignores later writes (issue #429); use mode 255 and check
 `/sys/kernel/debug/legion/ecmemory` offset 0x1F0..0x1F9 after a write.
 
+## Legion Slim 7 16APH8 (82Y4, M1CN)
+
+Read both fan maxima with `cat /sys/devices/platform/legion/hwmon/hwmon*/fan{1,2}_max`.
+Each line gives one fan's maximum RPM for the active power mode. The driver
+uses the maximum from that fan's firmware table, or its highest speed step
+when the maximum field is zero. A missing table gives a read error.
+
 ## Legion Pro 7 16IAX10H (83F5, Q7CN)
 
 BIOS Q7CN78WW, EC 0x5508 (fw 1.78), Intel Arrow Lake-HX + RTX 50. DMI entry
