@@ -209,6 +209,11 @@ sudo systemctl enable legion-graphics.service
 systemd 会等命令完成或超时后启动登录界面。在 NixOS 上，请将两个程序加入
 `environment.systemPackages`，让单元能够找到它们。
 
+也可以在终端运行 `sudo legion_cli graphics-mode boot-support enable`，为 AppImage
+启用启动支持。CLI 会安装单元，供 systemd 在下次启动时运行。将 `enable` 换成
+`disable` 即可移除该设置，包括在删除 AppImage 之后。移除最后一份启动支持时，
+CLI 会取消待执行的显卡切换。
+
 ## 启用或禁用迷你风扇曲线
 
 如果笔记本长时间保持低温，嵌入式控制器（EC）可能会切换到内置的 4 节点“迷你风扇曲线”（此时 `auto_points_size` 变为 4，且 `/sys/kernel/debug/legion/fancurve` 显示 `EC minifancurve on cool: true`）。如果你希望在低温下也始终保持完整的自定义风扇曲线，请禁用迷你风扇曲线。并非所有机型都支持此功能（不支持的机型会隐藏 `minifancurve`，或在运行 `cat /sys/kernel/debug/legion/fancurve` 时报告错误）。

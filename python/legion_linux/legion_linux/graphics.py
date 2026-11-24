@@ -9,6 +9,7 @@ import subprocess
 import time
 
 from legion_linux.legion import LEGION_SYS_BASEPATH
+from legion_linux.graphics_boot import BootSupportAction, GraphicsBoot
 
 
 class Mode(str, Enum):
@@ -33,6 +34,7 @@ class GraphicsMode:
         self.sysfs = sysfs
         self.devices = devices
         self.pending = state / "igpu-only-request"
+        self.boot = GraphicsBoot()
 
     @contextmanager
     def _lock_request(self):
@@ -104,17 +106,42 @@ class GraphicsMode:
                 "attached" if display and all((device / "driver").is_symlink() for device in functions) else "partial"
             )
         return {
+            "schema_version": 2,
             "selected_mode": self.selected().value,
             "pending_mode": Mode.IGPU_ONLY.value if self.pending.is_file() else None,
             "dgpu_state": state,
+            "available_modes": [mode.value for mode in self.choices()],
+            "boot_support": self.boot.status(self._supports_igpu_disconnect()),
         }
 
-    def _check_model(self):
+    def _supports_igpu_disconnect(self):
         dmi = self.sysfs / "class/dmi/id"
-        model = (dmi / "product_name").read_text(encoding="ascii").strip()
-        bios = (dmi / "bios_version").read_text(encoding="ascii").strip()
-        if model != "82Y4" or not bios.startswith("M1CN"):
+        try:
+            model = (dmi / "product_name").read_text(encoding="ascii").strip()
+            bios = (dmi / "bios_version").read_text(encoding="ascii").strip()
+        except FileNotFoundError:
+            return False
+        return model == "82Y4" and bios.startswith("M1CN") and self._supports("igpumode")
+
+    def _check_model(self):
+        if not self._supports_igpu_disconnect():
             raise RuntimeError("iGPU-only disconnection has been verified on the Legion Slim 7 16APH8 (82Y4).")
+
+    def configure_boot_support(self, action):
+        with self._lock_request():
+            if action == BootSupportAction.ENABLE:
+                self._check_model()
+                unavailable = self.boot.status(True)["setup_unavailable"]
+                if unavailable == "missing-systemd":
+                    raise RuntimeError("Graphics boot support requires systemd.")
+                if unavailable == "missing-lsof":
+                    raise RuntimeError("Install lsof system-wide before enabling graphics boot support.")
+                self.boot.configure(enable=True)
+            elif action == BootSupportAction.DISABLE:
+                self.boot.configure(enable=False)
+            if not self.boot.enabled() and self.pending.is_file():
+                self.pending.unlink()
+            self.boot.reload()
 
     @staticmethod
     def _check_attached(functions):
@@ -156,7 +183,7 @@ class GraphicsMode:
             raise RuntimeError("Could not find NVIDIA device files to check.")
         try:
             result = subprocess.run(
-                ["lsof", "-nP", "-Q", "-f", "--", *map(str, nodes)],
+                ["lsof", "-nP", "-f", "--", *map(str, nodes)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -165,10 +192,11 @@ class GraphicsMode:
             )
         except (FileNotFoundError, subprocess.TimeoutExpired) as error:
             raise RuntimeError("Could not inspect NVIDIA clients. Install lsof and run before sign-in.") from error
-        if result.returncode != 0:
-            raise RuntimeError(f"Could not inspect NVIDIA clients. {result.stderr.strip()}")
         if result.stdout.strip():
             raise RuntimeError("Processes are using NVIDIA. Run the disconnect before the sign-in screen starts.")
+        # Older lsof versions return 1 with no output when no process matches.
+        if result.returncode not in (0, 1) or result.stderr.strip():
+            raise RuntimeError(f"Could not inspect NVIDIA clients. {result.stderr.strip()}")
 
     def _wait_for_idle(self):
         for _ in range(30):

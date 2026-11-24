@@ -2,12 +2,14 @@ from contextlib import redirect_stdout
 from io import StringIO
 import os
 from pathlib import Path
+from subprocess import CompletedProcess
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
 from legion_linux import legion_cli
 from legion_linux.graphics import GraphicsMode, Mode
+from legion_linux.graphics_boot import BootSupportAction, GraphicsBoot, UNIT_NAME
 
 
 class GraphicsModeTest(unittest.TestCase):
@@ -19,6 +21,8 @@ class GraphicsModeTest(unittest.TestCase):
         self.pci = self.root / "bus/pci/devices"
         self.pci.mkdir(parents=True)
         self.graphics = GraphicsMode(legion=self.legion, sysfs=self.root, state=self.root / "state")
+        self.vendor_units = self.root / "vendor"
+        self.graphics.boot = GraphicsBoot(local=self.root / "local", system=(self.vendor_units,))
         root_user = patch("legion_linux.graphics.os.geteuid", return_value=0)
         root_user.start()
         self.addCleanup(root_user.stop)
@@ -55,10 +59,10 @@ class GraphicsModeTest(unittest.TestCase):
     def test_firmware_modes_and_pci_state_are_separate(self):
         self.add_nvidia()
         self.assertEqual(self.graphics.choices(), list(Mode))
-        self.assertEqual(
-            self.graphics.status(),
-            {"selected_mode": "hybrid-igpu-only", "pending_mode": None, "dgpu_state": "attached"},
-        )
+        status = self.graphics.status()
+        self.assertEqual(status["selected_mode"], "hybrid-igpu-only")
+        self.assertEqual(status["dgpu_state"], "attached")
+        self.assertEqual(status["available_modes"], [mode.value for mode in Mode])
 
     def test_desktop_request_disconnects_at_next_boot(self):
         self.write(self.legion / "igpumode", 0)
@@ -97,10 +101,48 @@ class GraphicsModeTest(unittest.TestCase):
         ):
             self.graphics.apply()
         write.assert_called_once_with("igpumode", 1)
-        self.assertEqual(
-            self.graphics.status(),
-            {"selected_mode": "hybrid-igpu-only", "pending_mode": None, "dgpu_state": "detached"},
-        )
+        status = self.graphics.status()
+        self.assertEqual(status["selected_mode"], "hybrid-igpu-only")
+        self.assertEqual(status["dgpu_state"], "detached")
+        self.assertIsNone(status["pending_mode"])
+
+    def test_removing_last_boot_installation_clears_the_request(self):
+        vendor_link = self.vendor_units / "display-manager.service.wants" / UNIT_NAME
+        self.write(self.vendor_units / UNIT_NAME, "[Unit]\n")
+        vendor_link.parent.mkdir()
+        vendor_link.symlink_to(Path("..", UNIT_NAME))
+        boot = self.graphics.boot
+        with (
+            patch.object(boot, "_check_local_paths"),
+            patch.object(boot, "status", return_value={"setup_unavailable": None}),
+            patch.object(boot, "reload"),
+        ):
+            self.graphics.configure_boot_support(BootSupportAction.ENABLE)
+            self.assertTrue(boot.unit.is_file())
+            self.assertTrue(boot.link.is_symlink())
+            self.graphics.set(Mode.IGPU_ONLY)
+            self.graphics.configure_boot_support(BootSupportAction.DISABLE)
+            self.assertFalse(boot.unit.exists())
+            self.assertFalse(boot.link.is_symlink())
+            self.assertTrue(vendor_link.is_file())
+            self.assertTrue(self.graphics.pending.is_file())
+            vendor_link.unlink()
+            self.graphics.configure_boot_support(BootSupportAction.CLEANUP)
+            self.assertFalse(self.graphics.pending.exists())
+        self.assertEqual(self.graphics.selected(), Mode.IGPU_ONLY)
+
+    def test_package_cleanup_preserves_appimage_switch(self):
+        boot = self.graphics.boot
+        with (
+            patch.object(boot, "_check_local_paths"),
+            patch.object(boot, "status", return_value={"setup_unavailable": None}),
+            patch.object(boot, "reload"),
+        ):
+            self.graphics.configure_boot_support(BootSupportAction.ENABLE)
+            self.graphics.set(Mode.IGPU_ONLY)
+            self.graphics.configure_boot_support(BootSupportAction.CLEANUP)
+        self.assertTrue(boot.link.is_file())
+        self.assertTrue(self.graphics.pending.is_file())
 
     def test_failed_startup_keeps_request_until_it_is_canceled(self):
         self.write(self.legion / "igpumode", 0)
@@ -155,6 +197,20 @@ class GraphicsModeTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Processes are using NVIDIA"):
                 self.graphics.apply()
         write.assert_not_called()
+
+    def test_empty_lsof_result_and_inspection_failure(self):
+        gpu, audio = self.add_nvidia()
+        self.write(self.root / "dev/nvidia0", "")
+        self.graphics.devices = self.root / "dev"
+        with (
+            patch.object(Path, "is_char_device", return_value=True),
+            patch("legion_linux.graphics.subprocess.run") as run,
+        ):
+            run.return_value = CompletedProcess([], 1, "", "")
+            self.graphics._check_clients(gpu, audio)
+            run.return_value = CompletedProcess([], 1, "", "Permission denied")
+            with self.assertRaisesRegex(RuntimeError, "Permission denied"):
+                self.graphics._check_clients(gpu, audio)
 
     def test_no_retry_after_a_partial_removal(self):
         _, audio = self.add_nvidia()

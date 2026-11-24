@@ -212,6 +212,12 @@ The unit asks systemd to start the sign-in screen after the command finishes
 or times out. On NixOS, include both programs in `environment.systemPackages`
 so the unit can find them.
 
+To enable the AppImage's boot support from a terminal, run
+`sudo legion_cli graphics-mode boot-support enable`. The CLI installs the unit
+where systemd can find it on the next boot. Use `disable` in place of `enable`
+to remove that setup, including after deleting the AppImage. The CLI clears a
+pending switch when the last installation that provides boot support is removed.
+
 ## Enable or disable the mini fan curve
 
 If the laptop stays cool for a longer time, the embedded controller can switch to a built-in "mini fan curve" with only 4 points (`auto_points_size` drops to 4 and `EC minifancurve on cool: true` appears in `/sys/kernel/debug/legion/fancurve`). If you want the EC to keep using your configured full fan curve even when cool, disable the mini fan curve. Not all models support this feature (unsupported models either hide `minifancurve` or report an error in `cat /sys/kernel/debug/legion/fancurve`).
