@@ -6,6 +6,7 @@ try:
 except ImportError:
     argcomplete = None
 import argparse
+import json
 import logging
 import sys
 import os
@@ -14,6 +15,7 @@ import os
 # pylint: disable=wrong-import-position
 sys.path.insert(0, os.path.dirname(__file__) + "/..")
 import legion_linux.legion
+from legion_linux.graphics import GraphicsMode, Mode
 from legion_linux.legion import LegionModelFacade
 
 logging.basicConfig()
@@ -445,6 +447,26 @@ def set_feature(legion: LegionModelFacade, name, values, **_) -> int:
     return EXIT_FEATURE_NOT_FOUND
 
 
+def graphics_mode(args):
+    graphics = GraphicsMode()
+    try:
+        if not graphics.choices():
+            print("The firmware does not expose graphics modes.", file=sys.stderr)
+            return EXIT_FEATURE_UNAVAILABLE
+        if args.graphics_action == "choices":
+            print("\n".join(mode.value for mode in graphics.choices()))
+        elif args.graphics_action == "status":
+            print(json.dumps(graphics.status()))
+        elif args.graphics_action == "set":
+            print(graphics.set(Mode(args.mode)))
+        else:
+            print(graphics.apply())
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"Graphics mode: {error}", file=sys.stderr)
+        return 1
+    return EXIT_OK
+
+
 def create_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Legion CLI")
     parser.add_argument(
@@ -510,6 +532,14 @@ def create_argparser() -> argparse.ArgumentParser:
     set_feature_cmd.add_argument("name", type=str, help="Name of feature")
     set_feature_cmd.add_argument("values", type=str, help="Value of feature", nargs="+")
     set_feature_cmd.set_defaults(func=set_feature)
+
+    graphics_parser = subcommands.add_parser("graphics-mode", help="Read, select, or apply a firmware graphics mode")
+    graphics_actions = graphics_parser.add_subparsers(dest="graphics_action", required=True)
+    graphics_actions.add_parser("choices", help="List the graphics modes advertised by firmware")
+    graphics_actions.add_parser("status", help="Show the selected mode and actual NVIDIA PCI state as JSON")
+    mode_parser = graphics_actions.add_parser("set", help="Select a graphics mode")
+    mode_parser.add_argument("mode", choices=[Mode.HYBRID.value, Mode.IGPU_ONLY.value, Mode.DISCRETE.value])
+    graphics_actions.add_parser("apply", help="Apply the saved iGPU-only selection before sign-in")
 
     bootlogo_parser = subcommands.add_parser("boot-logo", help="Custom Boot Logo")
     bootlogo_sub = bootlogo_parser.add_subparsers(dest="bootlogo_cmd")
@@ -579,6 +609,8 @@ def main():
     if args.subcommand is None:
         parser.print_help()
         return 0
+    if args.subcommand == "graphics-mode":
+        return graphics_mode(args)
     legion = LegionModelFacade(expect_hwmon=not args.donotexpecthwmon)
     for cmd in cmd_group:
         cmd.set_model(legion)

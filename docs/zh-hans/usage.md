@@ -180,6 +180,34 @@ echo balanced-performance > /sys/firmware/acpi/platform_profile
 
 遗憾的是，目前 `power-profile-deamon` 或 `powerprofilesctl` 还不支持该模式。
 
+## 显卡模式
+
+`legion_cli graphics-mode choices` 列出固件报告支持的模式。
+`legion_cli graphics-mode status` 显示当前选择和 NVIDIA 设备是否仍在总线上。
+空闲的 GPU 可以在保持连接的情况下休眠。
+
+运行 `sudo legion_cli graphics-mode set hybrid` 选择混合模式，也可以用
+`set discrete` 选择独显模式。内置屏幕的显卡线路切换在重启后生效。
+
+在 Legion Slim 7 16APH8（82Y4）上，注销并停止登录界面后，在文本控制台运行
+`sudo legion_cli graphics-mode set hybrid-igpu-only`。NVIDIA 必须处于 D3cold，
+且没有进程占用设备文件。请安装 `lsof` 供 CLI 检查。模式列表也会显示 Hybrid Auto。
+交流电源状态变化时，固件可能再次请求断开独显，因此 CLI 暂缓提供此模式的切换。
+
+固件可以记住纯核显选择，而 NVIDIA 设备仍可能在重启时重新出现。
+`sudo legion_cli graphics-mode apply` 在登录前读取保存的模式并重试断开请求。
+如果断开失败，命令会返回错误。可选的
+[systemd 单元](../../extra/service/legion-graphics.service)会在每次启动时运行一次。
+如果系统全局安装了 `legion_cli` 和 `lsof`，可以从源码目录安装该单元并在下次启动时运行：
+
+```bash
+sudo install -m 644 extra/service/legion-graphics.service /etc/systemd/system/
+sudo systemctl enable legion-graphics.service
+```
+
+systemd 会等命令完成或超时后启动登录界面。在 NixOS 上，请将两个程序加入
+`environment.systemPackages`，让单元能够找到它们。
+
 ## 启用或禁用迷你风扇曲线
 
 如果笔记本长时间保持低温，嵌入式控制器（EC）可能会切换到内置的 4 节点“迷你风扇曲线”（此时 `auto_points_size` 变为 4，且 `/sys/kernel/debug/legion/fancurve` 显示 `EC minifancurve on cool: true`）。如果你希望在低温下也始终保持完整的自定义风扇曲线，请禁用迷你风扇曲线。并非所有机型都支持此功能（不支持的机型会隐藏 `minifancurve`，或在运行 `cat /sys/kernel/debug/legion/fancurve` 时报告错误）。

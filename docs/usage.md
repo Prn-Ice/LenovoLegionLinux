@@ -178,6 +178,39 @@ echo balanced-performance > /sys/firmware/acpi/platform_profile
 
 Unfortunately, the `power-profile-deamon` or `powerprofilesctl` currently do not support this mode.
 
+## Graphics modes
+
+`legion_cli graphics-mode choices` lists the modes the firmware advertises.
+`legion_cli graphics-mode status` reports the selected mode and whether NVIDIA
+is still attached. An idle GPU can remain attached while it sleeps.
+
+`sudo legion_cli graphics-mode set hybrid` selects Hybrid. Use `set discrete`
+for Discrete Graphics. Changes to the built-in display routing take effect
+after a restart.
+
+On the Legion Slim 7 16APH8 (82Y4), you can select iGPU-only from a text
+console after logging out and stopping the sign-in screen. Run
+`sudo legion_cli graphics-mode set hybrid-igpu-only`. NVIDIA must be in D3cold
+and its device files must be free. Install `lsof` so the CLI can check for open
+device files. Hybrid Auto appears in the mode list. Its firmware can request
+removal on AC power changes, so selecting it through the CLI is deferred.
+
+The firmware can remember iGPU-only across a restart while NVIDIA comes back.
+`sudo legion_cli graphics-mode apply` checks the saved selection and retries
+the firmware request before sign-in. It exits with an error if removal stalls.
+Use the optional [systemd unit](../extra/service/legion-graphics.service) to
+run the command once per boot. On systems with a system-wide `legion_cli`
+and `lsof`, install it from this source tree and enable it for the next boot:
+
+```bash
+sudo install -m 644 extra/service/legion-graphics.service /etc/systemd/system/
+sudo systemctl enable legion-graphics.service
+```
+
+The unit asks systemd to start the sign-in screen after the command finishes
+or times out. On NixOS, include both programs in `environment.systemPackages`
+so the unit can find them.
+
 ## Enable or disable the mini fan curve
 
 If the laptop stays cool for a longer time, the embedded controller can switch to a built-in "mini fan curve" with only 4 points (`auto_points_size` drops to 4 and `EC minifancurve on cool: true` appears in `/sys/kernel/debug/legion/fancurve`). If you want the EC to keep using your configured full fan curve even when cool, disable the mini fan curve. Not all models support this feature (unsupported models either hide `minifancurve` or report an error in `cat /sys/kernel/debug/legion/fancurve`).
