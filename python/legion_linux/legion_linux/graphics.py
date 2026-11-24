@@ -1,4 +1,4 @@
-"""Read Lenovo graphics modes and apply iGPU-only before sign-in."""
+"""Read and change Lenovo graphics modes and check whether NVIDIA is connected."""
 
 from contextlib import contextmanager
 from enum import Enum
