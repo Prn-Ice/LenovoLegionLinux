@@ -113,9 +113,10 @@ Q7CN/RLCN/QNCN 依据其 DSDT 推断）；`fan_control.sh` 在该属性缺失时
 每行显示一个风扇在当前电源模式下的最高转速（RPM）。驱动从各风扇的固件表中读取该值。
 若最高转速字段为零，则使用最高档位的转速。若缺少对应的表，读取会返回错误。
 
-测试启动时的显卡切换时，请先注销并停止登录界面，再选择纯核显模式。
-运行 `legion_cli graphics-mode status`，确认选择为 `hybrid-igpu-only`，
-独显状态为 `detached`。启用[启动单元](usage.md#显卡模式)后重启，并再次检查。
+启用[启动单元](usage.md#显卡模式)，从桌面使用 `legion_cli` 选择纯核显模式。
+用 `graphics-mode status` 确认 `pending_mode` 为 `hybrid-igpu-only`，然后重启。
+再次检查，确认 `selected_mode` 为 `hybrid-igpu-only`，`dgpu_state` 为 `detached`，
+且 `pending_mode` 为 `null`。
 如果 NVIDIA 仍然连接，请查看 `journalctl -b -u legion-graphics.service`。
 断开独显需要 NVIDIA 的 D3cold 功能可用。
 

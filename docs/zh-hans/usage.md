@@ -183,22 +183,23 @@ echo balanced-performance > /sys/firmware/acpi/platform_profile
 ## 显卡模式
 
 `legion_cli graphics-mode choices` 列出固件报告支持的模式。
-`legion_cli graphics-mode status` 显示当前选择和 NVIDIA 设备是否仍在总线上。
-空闲的 GPU 可以在保持连接的情况下休眠。
+`legion_cli graphics-mode status` 显示当前模式、待执行的切换以及 NVIDIA 设备是否仍连接。
 
 运行 `sudo legion_cli graphics-mode set hybrid` 选择混合模式，也可以用
 `set discrete` 选择独显模式。内置屏幕的显卡线路切换在重启后生效。
 
-在 Legion Slim 7 16APH8（82Y4）上，注销并停止登录界面后，在文本控制台运行
-`sudo legion_cli graphics-mode set hybrid-igpu-only`。NVIDIA 必须处于 D3cold，
-且没有进程占用设备文件。请安装 `lsof` 供 CLI 检查。模式列表也会显示 Hybrid Auto。
-交流电源状态变化时，固件可能再次请求断开独显，因此 CLI 暂缓提供此模式的切换。
+在 Legion Slim 7 16APH8（82Y4）上，从桌面运行
+`sudo legion_cli graphics-mode set hybrid-igpu-only`，然后重启。CLI 会保存请求，
+启动单元会在登录前应用该模式。运行 `sudo legion_cli graphics-mode set hybrid`
+可以取消待执行的切换。
 
-固件可以记住纯核显选择，而 NVIDIA 设备仍可能在重启时重新出现。
-`sudo legion_cli graphics-mode apply` 在登录前读取保存的模式并重试断开请求。
-如果断开失败，命令会返回错误。可选的
-[systemd 单元](../../extra/service/legion-graphics.service)会在每次启动时运行一次。
-如果系统全局安装了 `legion_cli` 和 `lsof`，可以从源码目录安装该单元并在下次启动时运行：
+[systemd 单元](../../extra/service/legion-graphics.service)会在启动时运行
+`legion_cli graphics-mode apply`。它会等待 NVIDIA 进入 D3cold，并通过 `lsof`
+检查设备文件的占用情况，再请求固件断开 NVIDIA。如果 NVIDIA 在后续启动时重新出现，
+该单元会重新应用已保存的纯核显模式。模式列表也会显示 Hybrid Auto。交流电源状态变化时，
+固件可能请求断开独显，因此 CLI 暂缓提供此模式的切换。
+
+如果系统全局安装了 `legion_cli` 和 `lsof`，可以从源码目录安装该单元并在下次启动时运行。
 
 ```bash
 sudo install -m 644 extra/service/legion-graphics.service /etc/systemd/system/

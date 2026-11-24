@@ -181,26 +181,27 @@ Unfortunately, the `power-profile-deamon` or `powerprofilesctl` currently do not
 ## Graphics modes
 
 `legion_cli graphics-mode choices` lists the modes the firmware advertises.
-`legion_cli graphics-mode status` reports the selected mode and whether NVIDIA
-is still attached. An idle GPU can remain attached while it sleeps.
+`legion_cli graphics-mode status` reports the selected mode, any scheduled
+switch, and whether NVIDIA is still attached.
 
 `sudo legion_cli graphics-mode set hybrid` selects Hybrid. Use `set discrete`
 for Discrete Graphics. Changes to the built-in display routing take effect
 after a restart.
 
-On the Legion Slim 7 16APH8 (82Y4), you can select iGPU-only from a text
-console after logging out and stopping the sign-in screen. Run
-`sudo legion_cli graphics-mode set hybrid-igpu-only`. NVIDIA must be in D3cold
-and its device files must be free. Install `lsof` so the CLI can check for open
-device files. Hybrid Auto appears in the mode list. Its firmware can request
-removal on AC power changes, so selecting it through the CLI is deferred.
+On the Legion Slim 7 16APH8 (82Y4), run
+`sudo legion_cli graphics-mode set hybrid-igpu-only` from your desktop, then
+restart. The CLI saves the request. The startup unit applies it before sign-in.
+Run `sudo legion_cli graphics-mode set hybrid` to cancel a pending switch.
 
-The firmware can remember iGPU-only across a restart while NVIDIA comes back.
-`sudo legion_cli graphics-mode apply` checks the saved selection and retries
-the firmware request before sign-in. It exits with an error if removal stalls.
-Use the optional [systemd unit](../extra/service/legion-graphics.service) to
-run the command once per boot. On systems with a system-wide `legion_cli`
-and `lsof`, install it from this source tree and enable it for the next boot:
+The [systemd unit](../extra/service/legion-graphics.service) runs
+`legion_cli graphics-mode apply` at boot. It waits for NVIDIA to enter D3cold
+and uses `lsof` to check for open device files before asking the firmware to
+disconnect NVIDIA. It also reapplies a saved iGPU-only choice when NVIDIA
+returns on later boots. Hybrid Auto appears in the mode list. Its firmware can
+request removal on AC power changes, so CLI selection is deferred.
+
+On systems with a system-wide `legion_cli` and `lsof`, install the unit from
+this source tree and enable it for the next boot.
 
 ```bash
 sudo install -m 644 extra/service/legion-graphics.service /etc/systemd/system/

@@ -116,12 +116,12 @@ Each line gives one fan's maximum RPM for the active power mode. The driver
 uses the maximum from that fan's firmware table, or its highest speed step
 when the maximum field is zero. A missing table gives a read error.
 
-For the startup graphics test, select iGPU-only with the desktop and sign-in
-screen closed. Run `legion_cli graphics-mode status` and check that the selected
-mode is `hybrid-igpu-only` and the dGPU state is `detached`. Enable the
-[startup unit](usage.md#graphics-modes) and repeat the status check after
-restarting. Inspect `journalctl -b -u legion-graphics.service` if NVIDIA is
-still attached. The disconnect requires working NVIDIA D3cold support.
+Enable the [startup unit](usage.md#graphics-modes) and select iGPU-only with
+`legion_cli` from the desktop. Check that `graphics-mode status` reports
+`pending_mode` as `hybrid-igpu-only`. Restart. Check that `selected_mode` is
+`hybrid-igpu-only`, `dgpu_state` is `detached`, and `pending_mode` is `null`.
+Inspect `journalctl -b -u legion-graphics.service` if NVIDIA is still attached.
+The disconnect requires working NVIDIA D3cold support.
 
 ## Legion Pro 7 16IAX10H (83F5, Q7CN)
 

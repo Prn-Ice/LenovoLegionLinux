@@ -1,6 +1,8 @@
 """Read Lenovo graphics modes and apply iGPU-only before sign-in."""
 
+from contextlib import contextmanager
 from enum import Enum
+import fcntl
 import os
 from pathlib import Path
 import subprocess
@@ -20,10 +22,30 @@ IGPU_MODES = (Mode.HYBRID, Mode.IGPU_ONLY, Mode.AUTO)
 
 
 class GraphicsMode:
-    def __init__(self, legion=Path(LEGION_SYS_BASEPATH), sysfs=Path("/sys"), devices=Path("/dev")):
+    def __init__(
+        self,
+        legion=Path(LEGION_SYS_BASEPATH),
+        sysfs=Path("/sys"),
+        devices=Path("/dev"),
+        state=Path("/var/lib/legion-graphics"),
+    ):
         self.legion = legion
         self.sysfs = sysfs
         self.devices = devices
+        self.pending = state / "igpu-only-request"
+
+    @contextmanager
+    def _lock_request(self):
+        if os.geteuid() != 0:
+            raise RuntimeError("Run graphics mode changes as root.")
+        self.pending.parent.mkdir(parents=True, exist_ok=True)
+        with (self.pending.parent / "lock").open("a", encoding="ascii") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+    @staticmethod
+    def _boot_id():
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
 
     def _read(self, attribute):
         return (self.legion / attribute).read_text(encoding="ascii").strip()
@@ -81,7 +103,11 @@ class GraphicsMode:
             state = (
                 "attached" if display and all((device / "driver").is_symlink() for device in functions) else "partial"
             )
-        return {"selected_mode": self.selected().value, "dgpu_state": state}
+        return {
+            "selected_mode": self.selected().value,
+            "pending_mode": Mode.IGPU_ONLY.value if self.pending.is_file() else None,
+            "dgpu_state": state,
+        }
 
     def _check_model(self):
         dmi = self.sysfs / "class/dmi/id"
@@ -158,8 +184,6 @@ class GraphicsMode:
 
     def _detach(self, select):
         self._check_model()
-        if os.geteuid() != 0:
-            raise RuntimeError("Run the iGPU-only disconnect as root before sign-in.")
         for attempt in range(5):
             functions = self._wait_for_idle() if attempt == 0 else self._nvidia_functions()
             if not functions:
@@ -182,22 +206,43 @@ class GraphicsMode:
             raise RuntimeError("The firmware request did not disconnect NVIDIA.")
 
     def apply(self):
-        if self.selected() == Mode.IGPU_ONLY:
-            self._detach(select=False)
+        with self._lock_request():
+            selected = self.selected()
+            if self.pending.is_file():
+                if self.pending.read_text(encoding="ascii").strip() == self._boot_id():
+                    return "iGPU-only is scheduled for the next boot."
+                if selected not in (Mode.HYBRID, Mode.IGPU_ONLY):
+                    raise RuntimeError("iGPU-only requires Hybrid. Select Hybrid and restart.")
+                self._detach(select=selected == Mode.HYBRID)
+                self.pending.unlink()
+            elif selected == Mode.IGPU_ONLY:
+                self._detach(select=False)
+            else:
+                return "The selected graphics mode does not need a startup disconnect."
             return "NVIDIA graphics and audio are disconnected."
-        return "The selected graphics mode does not need a startup disconnect."
 
     def set(self, mode):
-        selected = self.selected()
         if mode not in self.choices():
             raise RuntimeError(f"The firmware does not advertise {mode.value}.")
         if mode == Mode.AUTO:
             raise RuntimeError("Hybrid Auto can eject NVIDIA after an AC power change. Automatic switching is pending.")
-        if mode == Mode.IGPU_ONLY:
-            if selected not in (Mode.HYBRID, Mode.IGPU_ONLY):
-                raise RuntimeError("Select hybrid and restart before switching to iGPU-only.")
-            self._detach(select=selected == Mode.HYBRID)
-            return "iGPU-only is active. NVIDIA graphics and audio are disconnected."
+        with self._lock_request():
+            selected = self.selected()
+            if mode == Mode.IGPU_ONLY:
+                self._check_model()
+                if selected not in (Mode.HYBRID, Mode.IGPU_ONLY):
+                    raise RuntimeError("Select Hybrid and restart before switching to iGPU-only.")
+                request = self.pending.with_suffix(".tmp")
+                request.write_text(f"{self._boot_id()}\n", encoding="ascii")
+                request.replace(self.pending)
+                return "iGPU-only is scheduled. Restart to disconnect NVIDIA before sign-in."
+            result = self._set_hybrid_or_discrete(mode, selected)
+            if self.pending.is_file():
+                self.pending.unlink()
+                return f"Canceled the scheduled iGPU-only switch. {result}"
+            return result
+
+    def _set_hybrid_or_discrete(self, mode, selected):
         if mode == selected:
             return f"{mode.value} is already selected."
         if selected in (Mode.IGPU_ONLY, Mode.AUTO):

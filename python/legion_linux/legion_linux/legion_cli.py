@@ -536,10 +536,10 @@ def create_argparser() -> argparse.ArgumentParser:
     graphics_parser = subcommands.add_parser("graphics-mode", help="Read, select, or apply a firmware graphics mode")
     graphics_actions = graphics_parser.add_subparsers(dest="graphics_action", required=True)
     graphics_actions.add_parser("choices", help="List the graphics modes advertised by firmware")
-    graphics_actions.add_parser("status", help="Show the selected mode and actual NVIDIA PCI state as JSON")
+    graphics_actions.add_parser("status", help="Show the selected mode, pending request, and NVIDIA state as JSON")
     mode_parser = graphics_actions.add_parser("set", help="Select a graphics mode")
     mode_parser.add_argument("mode", choices=[Mode.HYBRID.value, Mode.IGPU_ONLY.value, Mode.DISCRETE.value])
-    graphics_actions.add_parser("apply", help="Apply the saved iGPU-only selection before sign-in")
+    graphics_actions.add_parser("apply", help="Apply iGPU-only at startup before sign-in")
 
     bootlogo_parser = subcommands.add_parser("boot-logo", help="Custom Boot Logo")
     bootlogo_sub = bootlogo_parser.add_subparsers(dest="bootlogo_cmd")
