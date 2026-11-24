@@ -534,6 +534,41 @@ verify locally with `sudo dmesg | grep -i legion` (no "not in allowlist",
 EC id 0x5508), `sensors`, and `sudo cat /sys/kernel/debug/legion/fancurve`
 (`u` = 5, speed1 in 1..10).
 
+## Legion 5 15IAX10 (83N2, S2CN)
+
+BIOS S2CN26WW, EC 0x5508 (fw 2b0, EC firmware 1.22), Intel Core Ultra 7
+255HX + RTX 5070 Laptop. DMI entry `S2CN`, config `model_s2cn` in
+`kernel_module/legion-laptop.c`. Validated on an 83N2 with kernel 7.3.5
+(CachyOS), on AC.
+
+- Everything goes through WMI, as on Q7CN/Q6CN: fan RPM and CPU/GPU
+  temperature through Other Method `WMAE`, the fan table through Fan
+  Method `WMAB` 5/6 (`F9F0..F9F9`, ten levels; `fan1_level_rpm_table`
+  reads 1800 2000 2100 2300 2500 3000 3300 3500 4000 4600 RPM).
+- The GameZone WMI block is left to `lenovo-wmi-gamezone`
+  (`leave_gamezone_wmi_unbound`). With `legion_laptop` loaded before it,
+  `legion_wmi` took 887B54E3 and `ppt_pl1_spl`, `ppt_pl2_sppt`,
+  `gpu_nv_ac_offset` and `gpu_temp` returned `EINVAL`; with the flag both
+  platform-profile providers list the same five choices and the
+  attributes read 70/125/55/87.
+- GPU temperature: `WMAE 0x05050000` returns the EC byte `GPUT`
+  (`ERAX + 0xB4`). It is 0 while the dGPU idles and nothing has queried
+  it, and follows `nvidia-smi` for about 20 s after a query, so
+  `temp2_input` reports `ENODATA` (N/A in `sensors`) in between
+  (issue #668). Use `nvidia-smi`/`nvtop` for a continuous GPU reading.
+- Fan curve: in balanced mode `F9F0..F9F9` are all 0. Entering custom
+  mode loads the firmware table `1 2 3 4 5 6 7 8 8 8`. At idle (CPU
+  about 55 degC) the EC sits on point 3 (2100 RPM). Writing
+  `pwm1_auto_point{1..5}_pwm` = 153 (level 6) landed in `F9F0..F9F4`,
+  read back, and ramped both fans 2300 -> 3000 RPM (level 6). Writing
+  the saved values back and returning to balanced restored the fans.
+  Only raising the curve was tested.
+- The EC RAM window is `ERAX @0xFE500400` (`F9FT`/`ECB2` at
+  +0x100/+0x200, `ramio_size` 0x300); the `ecmemoryram` dump matches
+  `/dev/mem` byte for byte. It is only used by that debugfs dump.
+- The power button LED shows the power mode; it turns purple in custom
+  mode.
+
 ## LOQ 15IRX10 (83JE, R3CN)
 
 BIOS R3CN, EC 0x5508, Intel + RTX 50. DMI entry `R3CN` matches the BIOS
@@ -1115,16 +1150,24 @@ cross-checked against the N0CN32WW and N0CN35WW runtime dumps:
   EC `F9F0..F9F9` (`F9FT` @`0xFE0B05C0 + 0x30`, L28033/28063), committed via
   `NCMD(0x8C, 0)` (L43502) with no range check and ignoring the `FSTM` mode
   byte; `Fan_Get_Table` returns a static `1..10` placeholder while `EXMF == 1`
-  (extreme mode). The factory custom-mode table read on N0CN35WW is
-  `1,2,3,4,5,6,7,8,8,8` (all zeros before custom mode is initialized on
-  N0CN32WW). Earlier `model_g8cn` mapped those level bytes as
-  `FAN_SPEED_UNIT_PERCENT` (`pwm = 2..20`), and because points 7..10 cap at
-  level 8 (3400/3500 RPM at 80/65 °C, 3700 RPM max), custom mode stayed around
-  3400–3500 RPM under load unless raised to levels 9–10. Because `F9F0..F9F9` +
+  (extreme mode). On N0CN32WW the table reads ten zeros in `low-power`,
+  `balanced` and `performance` until custom mode is first entered, which loads
+  the factory table `1,2,3,4,5,6,7,8,8,8` (the same table read on N0CN35WW).
+  The EC follows the table only in custom mode: on N0CN35WW, with `1..8,8,8`
+  loaded, performance mode still ramped to level 9 (4400–4600 RPM). The driver
+  sends zeros as the default `1..10` and clamps every point into
+  `fancurve_level_min..10` before writing. Earlier `model_g8cn` mapped those
+  level bytes as `FAN_SPEED_UNIT_PERCENT` (`pwm = 2..20`), and because points
+  7..10 cap at level 8 (3400/3500 RPM at 80/65 °C, 3700 RPM max), custom mode
+  stayed around 3400–3500 RPM under load unless raised to levels 9–10. The
+  83DF config first shipped with
+  writes gated behind `fancurve_write_unvalidated` because `F9F0..F9F9` +
   `NCMD(0x8C)` is the same EC 0x5507 transport where percent bytes caused a
-  hard power-off on `model_lpcn` and persisted in EC RAM on `model_m0cn`, fan
-  curve writes stay gated behind `fancurve_write_unvalidated`
-  (`allow_unvalidated_fancurve=1`) until a level write is confirmed on 83DF.
+  hard power-off on `model_lpcn`. A level write (`1..10` through the
+  `legion_hwmon` `pwm1_auto_point*_pwm` attributes, custom mode on AC) was
+  then confirmed on N0CN32WW: the fans ramped past 3500 RPM to levels 9/10
+  under load ([#497](https://github.com/johnfanv2/LenovoLegionLinux/issues/497)),
+  so fan curve writes are enabled by default on `model_n0cn`.
 - `LENOVO_FAN_TABLE_DATA` (`WQA3`, L35785–36026, 15 rows across modes
   `1/2/3/0xFF/0xE0`) exports static 10-level ladders ending at 5400 RPM:
   `1700, 1900, 2100, 2300, 2500, 2900, 3400, 3700, 4400, 5400` RPM on fan 1
@@ -1169,18 +1212,21 @@ cross-checked against the N0CN32WW and N0CN35WW runtime dumps:
   (`0x03010001`/`2` `EACS`/`ETCS`) are implemented in `WMAE` and exposed.
 
 Validation status: WMI power mode, `platform_profile`, and WMI3 fan RPM and
-CPU/GPU temperatures are confirmed on N0CN32WW/N0CN35WW hardware; WMI3 level
-table calibration, `fan_fullspeed`, `VPC0` rapid charge / conservation / Fn
-lock, flip to start and instant boot are DSDT-validated. Verify read-only first
+CPU/GPU temperatures are confirmed on N0CN32WW/N0CN35WW hardware, and a WMI3
+level fan curve write in custom mode is confirmed on N0CN32WW; the level RPM
+ladders, `fan_fullspeed`, `VPC0` rapid charge / conservation / Fn lock, flip
+to start and instant boot are DSDT-validated. Verify read-only first
 with `sudo dmesg | grep -i legion` (`Using configuration for system: N0CN`),
 `cat /sys/devices/platform/legion/fancurve_speed_unit` (`level`),
 `cat /sys/devices/platform/legion/fan1_level_rpm_table`, `sensors` (`fan1_max`
 / `fan2_max` = `5400`), and `sudo cat /sys/kernel/debug/legion/fancurve` (`ACPI
 CFG error: 0`, `ACPI rapidcharge error: 0`, matching EC and WMI3 readings). To
-test level writes on AC in custom mode, reload with
-`sudo modprobe legion_laptop allow_unvalidated_fancurve=1`, raise points 8–10
-from level 8 to level 9 or 10, check `sensors` and readback, and report the
-result in [#497](https://github.com/johnfanv2/LenovoLegionLinux/issues/497).
+raise the custom-mode ceiling, switch to custom mode (Fn+Q, purple) on AC,
+raise points 8–10 from level 8 to level 9 or 10 (pwm `level * 255 / 10`, e.g.
+`echo 255 | sudo tee /sys/class/hwmon/hwmonN/pwm1_auto_point10_pwm` on the
+`legion_hwmon` device), then check the readback in the debugfs dump and the
+fan RPM in `sensors` under load. Report results on N0CN35WW or other BIOS
+revisions in [#497](https://github.com/johnfanv2/LenovoLegionLinux/issues/497).
 
 ## Legion 5 15AHP11 (83Q7, T2CN)
 
@@ -1272,6 +1318,84 @@ an on-device round trip. Verify with `sudo dmesg | grep -i legion` (config
 1..10). To test curve writes: on AC, switch to custom mode, back up the curve,
 apply one small conservative change, check the level/RPM readback and
 `sensors`, and restore the backup; do not write in extreme mode.
+
+## LOQ 15ARP10E (83S0, SUCN)
+
+BIOS SUCN15WW ([#666](https://github.com/johnfanv2/LenovoLegionLinux/issues/666)),
+EC 0x5508 (fw 2b0), AMD Ryzen 7 7735HS + NVIDIA RTX 4050. DMI entry `SUCN`
+is qualified on product name `83S0`; config `model_sucn` in
+`kernel_module/legion-laptop.c`. The DSDT from the acpidump attached in #666
+has SHA-256
+`6cab1909c8383bf2c1e402d5c0580f6e243a1ffb1783ba827da8c98f355ec373`; all
+`\_SB.GZFD` methods live in the DSDT (the SSDTs only reference it).
+
+This model has the same EC chip as the LOQ 15AHP10 (83JG, R8CN) above, but
+its GameZone firmware is different. The fan table is the `F9F0` level table
+of the Legion Pro 5 16IRX9 (83DF, N0CN), not the R8CN `GFAN`/`SFAN` ladder.
+A config copied from `model_r8cn` is wrong here: the driver picks the fan
+speed unit by model, so a copied struct falls back to percent (debugfs
+`speed1[pwm]` reads `2 5 7 10 ...` for levels `1 2 3 4 ...`).
+
+- Fan Method `WMAB` implements only 5/6: ten shared fan **levels** in EC
+  `F9F0..F9F9` (`F9FT` @`0xFEEC2500 + 0x80`). `Fan_Set_Table` copies
+  `FSS0..FSS9` with no range check, ignores `FSTM`/`FSID`, and commits with
+  EC command `LECR(0xD0, 1, 1)`. `Fan_Get_Table` returns a static 1..10
+  placeholder in extreme mode (`ODV1 == 4`). Hence `FAN_SPEED_UNIT_LEVEL`,
+  speed-only attributes, and a payload mode byte of 0. `WMAB` 1..4 are
+  absent, so `fan_maxspeed` is hidden.
+- `LENOVO_FAN_TABLE_DATA` (`WQA3`, 15 static rows, modes `1/2/3/0xFF/0xE0`)
+  holds one ladder for fan 1 (sensors `0x01`/`0x04`) and fan 2 (`0x05`) in
+  every mode: 2000, 2100, 2300, 2500, 2900, 3300, 3900, 4300, 4600, 5000 RPM.
+  This is the `fan table data: ... 10 levels, 2000..5000 RPM` line in the
+  #666 `dmesg`.
+- Power mode goes through GameZone `WMAA` `0x2C`/`0x2D`/`0x37`: quiet,
+  balanced, performance, custom `0xFF` and extreme `0xE0`. The firmware
+  enters custom and extreme only on AC. On battery it keeps running balanced
+  and remembers the request, so `0x2D` reports custom/extreme while `0x37`
+  reports balanced. There is no fan unlock (`0x0D`).
+- Other Method `WMAE`: fan RPM `0x04030001` and `0x04030002` **both** return
+  `FANS * 100`, so hwmon `fan2_input` mirrors `fan1_input` on this firmware.
+  `fan_fullspeed` (`0x04020000` -> EC `FNST`) is gated behind custom power
+  mode, like R8CN. CPU/GPU temperatures `0x05040000`/`0x05050000` read
+  `CPUT`/`GPUT`. `0x05010000` is the CPU socket temperature (`CPUS`), so hwmon
+  `temp3` is hidden. `WMAC` handles only AMD tuning ids and there is no GPU
+  Method GUID, so power-limit and OC attributes stay hidden.
+- Keyboard: KBBACKLIGHT `WMAF` sends EC command `0xDA` for the white
+  backlight. On the #666 unit neither that call nor writing EC RAM `0xC48A`
+  changes the light, which follows only Fn+Space, and the keyboard is PS/2
+  (no HID fallback). The module leaves the backlight alone
+  (`ACCESS_METHOD_NO_ACCESS`) and hides the Y-logo and IO-port light
+  attributes.
+- `VPC0` is `\_SB.PCI0.LPC0.EC0.VPC0` (`_STA`, `_CFG`, and `GBMD`/`SBMC` with
+  rapid-charge bit `0x04` and conservation bit `0x20`). Read-only `debugfs`
+  `ecmemoryram` maps `ERAX` at `0xFEEC2400` for `0x300` bytes, so the `F9F0`
+  table is at offset `0x180`. `minifancurve` and `lockfancontroller` have no
+  mapped registers and are hidden.
+
+Validation status: probe, EC id, WMI fan RPM and temperatures, power mode,
+and the factory level table (`1 2 3 4 5 6 7 8 8 8` in custom mode) were read
+on hardware in #666. A level write was confirmed on SUCN15WW: on AC in custom
+mode, `echo 230` to `pwm1_auto_point8_pwm` read back as level 9 (pwm 229) from
+the EC table, the fans ramped from 1100 to 4300 RPM under a CPU load, and
+writing 204 restored the factory table. Fan curve writes are therefore not
+gated (no `allow_unvalidated_fancurve` needed); the module still clamps every
+byte into the level range. Rapid charge, battery conservation and
+`fan_fullspeed` are DSDT-validated only.
+
+Verify with `sudo dmesg | grep -i legion` (config `SUCN`, EC ID `0x5508`,
+`2000..5000 RPM` fan table), `sensors`, and
+`sudo cat /sys/kernel/debug/legion/fancurve` (`ACPI CFG error: 0`,
+`ACPI rapidcharge error: 0`, `u` = 5, and in custom mode `speed1[pwm]`
+`25 51 76 ...` for levels `1 2 3 ...`). To repeat the write check:
+
+1. On AC, set custom mode (`powermode` 255) and save the
+   `sudo cat /sys/kernel/debug/legion/fancurve` output.
+2. Raise one point by one level through the `legion_hwmon` device (pwm is
+   rounded to `level * 255 / 10`), for example point 8 from level 8 to 9:
+   `echo 230 | sudo tee /sys/class/hwmon/hwmonN/pwm1_auto_point8_pwm`.
+3. Read the table again (level 9 at point 8) and watch `sensors` under load.
+4. Write the saved level back (`echo 204`) and return to balanced mode. Do
+   not write in extreme mode.
 
 ## LOQ 15APH8 (82XT, LYCN)
 

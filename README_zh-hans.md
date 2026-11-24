@@ -142,11 +142,22 @@ sudo make reloadmodule
 | [兼容型号](docs/zh-hans/compatible-models.md) | 已确认的型号及其支持的功能 |
 | [常见问题解答](docs/zh-hans/faq.md) | 温度、风扇行为、电源模式、BIOS/EC 重置、故障排查 |
 | [已知问题](docs/zh-hans/known-issues.md) | 风扇曲线接口的固件限制 |
-| [Features and Testing](docs/FEATURES_AND_TESTING.md)（英文） | 各机型、各功能的说明与硬件测试步骤 |
+| [功能与测试](docs/zh-hans/FEATURES_AND_TESTING.md)（部分翻译） | 各机型、各功能的说明与硬件测试步骤 |
 | [开发者概览](docs/zh-hans/developers.md) | 本项目的组成部分 |
-| [Reverse Engineering](docs/REVERSE_ENGINEER.md)（英文） | 为新机型收集 WMI/ACPI/EC 数据 |
-| [Test Plan](docs/TESTPLAN.md)（英文） | 手动测试计划 |
+| [逆向工程指南](docs/zh-hans/REVERSE_ENGINEER.md) | 为新机型收集 WMI/ACPI/EC 数据 |
+| [测试计划](docs/zh-hans/TESTPLAN.md) | 手动测试计划 |
 | [鸣谢](docs/zh-hans/credits.md) | 本项目基础、贡献者及基于 LLL 的工具 |
+
+## :art: 社区前端
+
+以下是基于 LLL 的第三方图形前端。它们由各自的作者独立维护，相关问题请到对应仓库反馈。
+
+- **[Legion Linux Frontend](https://github.com/Prn-Ice/LenovoLegionLinuxFrontend)**
+  是一个 Flutter 桌面应用，提供 AppImage 和 Nix 包。它包含显示电源模式、温度和风扇转速的仪表盘，
+  以及风扇曲线编辑器、电池与 Fn 锁开关、键盘灯光（Spectrum HID 或 OpenRGB）和 NVIDIA 独显监控。
+  它通过 Polkit 辅助程序调用 `legion_cli`。目前是 alpha 预发布版本，只在一款机型上测试过，欢迎参与测试。
+- **PlasmaVantage**（KDE）和 **CinnamonVantage**（Cinnamon）是面板小部件，详见
+  [鸣谢](docs/zh-hans/credits.md#基于-lenovo-legion-linux-的工具)。
 
 ## :handshake: 参与贡献
 

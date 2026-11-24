@@ -390,9 +390,10 @@ int main(void) {
     assert(legion_sysfs_is_visible(&kobj, &dev_attr_fan_fullspeed.attr, 0));
     assert(legion_sysfs_is_visible(&kobj, &dev_attr_rapidcharge.attr, 0));
     /* N0CN (Legion Pro 5 16IRX9 83DF, EC 0x5507, #497): 83DF DSDT confirms
-     * WMAB 5/6 -> F9F0..F9F9 + NCMD(0x8C) level table (gated behind
-     * fancurve_write_unvalidated), WQA3 ladders, PC00.LPCB VPC0 paths, ERAX
-     * @0xFE0B0400 EC sensor map, and WMI3 fan_fullspeed / power limits. */
+     * WMAB 5/6 -> F9F0..F9F9 + NCMD(0x8C) level table, WQA3 ladders,
+     * PC00.LPCB VPC0 paths, ERAX @0xFE0B0400 EC sensor map, and WMI3
+     * fan_fullspeed / power limits. A level write was confirmed on N0CN32WW
+     * hardware, so writes are not gated. */
     priv.conf = &model_n0cn;
     assert(priv.conf->registers == &ec_register_offsets_n0cn);
     assert(priv.conf->registers->EXT_FAN1_RPM_LSB == 0xC406);
@@ -417,11 +418,8 @@ int main(void) {
     assert(strcmp(priv.conf->acpi_paths[ACPI_PATH_WRITE_FNLOCK], "\\_SB.PC00.LPCB.EC0.VPC0.SALS") == 0);
     fancurve_speed_unit_show(&dev, NULL, unit);
     assert(strcmp(unit, "level\n") == 0);
-    assert(fancurve_write_allowed(priv.conf) == -EPERM);
-    assert(wmi_write_fancurve_defaults(&priv, LEGION_WMI_POWERMODE_CUSTOM) == -EPERM);
-    allow_unvalidated_fancurve = true;
+    assert(!priv.conf->fancurve_write_unvalidated);
     assert(fancurve_write_allowed(priv.conf) == 0);
-    allow_unvalidated_fancurve = false;
     assert(legion_sysfs_is_visible(&kobj, &dev_attr_fan1_level_rpm_table.attr, 0));
     assert(legion_sysfs_is_visible(&kobj, &dev_attr_fan2_level_rpm_table.attr, 0));
     assert(legion_hwmon_sensor_is_visible(&kobj, &sensor_dev_attr_temp2_input.dev_attr.attr, 0));
@@ -544,6 +542,53 @@ int main(void) {
         for (i = 0; i < MAXFANCURVESIZE; i++)
             assert(last_payload[0x06 + 2 * i] >= 1 && last_payload[0x06 + 2 * i] <= MAX_FAN_LEVEL);
         allow_unvalidated_fancurve = false;
+        wmi_calls = calls;
+        memset(last_payload, 0, sizeof(last_payload));
+    }
+
+    /* SUCN (LOQ 15ARP10E 83S0, EC 0x5508, #666): the SUCN15WW DSDT has
+     * WMAB 5/6 -> F9F0..F9F9 + LECR(0xD0) like N0CN (FSTM ignored, no
+     * extreme-mode drop), not the R8CN GFAN/SFAN path. A config copied
+     * from model_r8cn fell back to percent (pwm 2 5 7 ... for levels
+     * 1 2 3 ...), so the unit must be level; PCI0.LPC0 VPC0 paths, ERAX
+     * @0xFEEC2400 and a firmware-only keyboard backlight. A level write
+     * (point 8 -> level 9, read back from the EC) was confirmed on SUCN15WW
+     * hardware, so writes are not gated. */
+    priv.conf = &model_sucn;
+    assert(priv.conf->embedded_controller_id == 0x5508);
+    assert(priv.conf->access_method_fancurve == ACCESS_METHOD_WMI3);
+    assert(priv.conf->access_method_keyboard == ACCESS_METHOD_NO_ACCESS);
+    assert(priv.conf->access_method_fanfullspeed == ACCESS_METHOD_WMI3);
+    assert(priv.conf->fanfullspeed_requires_custom_powermode);
+    assert(priv.conf->wmi_fancurve_speed_only && priv.conf->has_fancurve_defaults);
+    assert(!wmi_sfan_uses_thermal_mode(priv.conf));
+    assert(!minifancurve_supported(priv.conf) && !lockfancontroller_supported(priv.conf));
+    assert(priv.conf->skip_ic_temp && priv.conf->skip_oc_controls && priv.conf->skip_fan_maxspeed);
+    assert(priv.conf->skip_ylogo_light && priv.conf->skip_ioport_light);
+    assert(priv.conf->ramio_physical_start == 0xFEEC2400 && priv.conf->ramio_size == 0x300);
+    assert(strcmp(priv.conf->acpi_paths[ACPI_PATH_CFG], "\\_SB.PCI0.LPC0.EC0.VPC0._CFG") == 0);
+    assert(strcmp(priv.conf->acpi_paths[ACPI_PATH_READ_RAPIDCHARGE], "\\_SB.PCI0.LPC0.EC0.VPC0.GBMD") == 0);
+    assert(strcmp(priv.conf->acpi_paths[ACPI_PATH_WRITE_RAPIDCHARGE], "\\_SB.PCI0.LPC0.EC0.VPC0.SBMC") == 0);
+    fancurve_speed_unit_show(&dev, NULL, unit);
+    assert(strcmp(unit, "level\n") == 0);
+    assert(legion_sysfs_is_visible(&kobj, &dev_attr_fan1_level_rpm_table.attr, 0));
+    assert(!priv.conf->fancurve_write_unvalidated);
+    assert(fancurve_write_allowed(&model_sucn) == 0);
+    {
+        struct fancurve tested = { .fan_speed_unit = FAN_SPEED_UNIT_LEVEL };
+        int calls = wmi_calls;
+        size_t i;
+
+        /* The #666 hardware test: factory 1..8,8,8 with point 8 raised to 9. */
+        for (i = 0; i < MAXFANCURVESIZE; i++)
+            tested.points[i].speed1 = i < 8 ? i + 1 : 8;
+        tested.points[7].speed1 = 9;
+        assert(wmi_write_fancurve_custom(&priv, &tested) == 0);
+        assert(wmi_calls == calls + 1);
+        /* FSTM stays 0 (WMAB 6 ignores it); the levels go out as is. */
+        assert(last_payload[0] == 0);
+        for (i = 0; i < MAXFANCURVESIZE; i++)
+            assert(last_payload[0x06 + 2 * i] == tested.points[i].speed1);
         wmi_calls = calls;
         memset(last_payload, 0, sizeof(last_payload));
     }
